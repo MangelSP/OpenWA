@@ -103,7 +103,7 @@ curl -s 'http://localhost:2785/api/infra/export-data' \
 #       POSTGRES_BUILTIN=true
 
 # Step 3: Restart with new configuration
-docker compose --profile with-dashboard --profile with-proxy up -d
+docker compose --profile postgres up -d
 
 # Step 4: Import data to new database
 curl -X POST 'http://localhost:2785/api/infra/import-data' \
@@ -156,7 +156,9 @@ curl -s 'http://localhost:2785/api/infra/storage/files/count' \
 # Step 2: Export all files as tar.gz
 curl -s 'http://localhost:2785/api/infra/storage/export' \
   -H 'X-API-Key: YOUR_KEY'
-# Response: { "message": "Storage export completed", "download": "/app/data/storage-export-xxx.tar.gz" }
+# Response: { "message": "Storage export completed", "download": "/app/data/exports/storage-export-xxx.tar.gz" }
+# The archive is auto-removed after STORAGE_EXPORT_TTL_MS (default 1h), so re-import it before then.
+# It is written under data/ so it survives the restart in Step 4 and stays import-able.
 
 # Step 3: Change storage configuration
 # From: STORAGE_TYPE=local
@@ -170,7 +172,7 @@ docker compose up -d
 curl -X POST 'http://localhost:2785/api/infra/storage/import' \
   -H 'X-API-Key: YOUR_KEY' \
   -H 'Content-Type: application/json' \
-  -d '{"filePath": "/app/data/storage-export-xxx.tar.gz"}'
+  -d '{"filePath": "/app/data/exports/storage-export-xxx.tar.gz"}'
 ```
 
 | Scenario                     | Support | Method                   |
@@ -192,6 +194,7 @@ REDIS_ENABLED=true
 REDIS_BUILTIN=false      # false = external Redis
 REDIS_HOST=your-redis-host.com
 REDIS_PORT=6379
+REDIS_USERNAME=optional
 REDIS_PASSWORD=optional
 ```
 
@@ -247,6 +250,15 @@ docker compose up -d
 | **BullMQ**   | Drain then config    | N/A (wait for empty queues)                              |
 
 ### Migration Script (Legacy)
+
+> **Note:** This example uses the standalone `sqlite3` npm package, which is no longer part of
+> OpenWA's dependencies (the app itself uses `better-sqlite3`). Install it ad hoc before running:
+> `npm install --no-save sqlite3`.
+>
+> The `SQLITE_PATH` / `DATABASE_URL` variables below are inputs to this standalone script only —
+> they are **not** OpenWA configuration. The application itself reads `DATABASE_TYPE` plus
+> `DATABASE_NAME` / `DATABASE_HOST` / `DATABASE_PORT` / `DATABASE_USERNAME` / `DATABASE_PASSWORD`
+> (see `src/config/configuration.ts`).
 
 ```typescript
 // scripts/migrate-sqlite-to-postgres.ts
@@ -399,7 +411,7 @@ function getSqliteTables(db: sqlite3.Database): Promise<string[]> {
 
 // CLI Entry point
 const config: MigrationConfig = {
-  sqlitePath: process.env.SQLITE_PATH || './data/openwa.db',
+  sqlitePath: process.env.SQLITE_PATH || './data/openwa.sqlite',
   postgresUrl: process.env.DATABASE_URL || 'postgresql://user:pass@localhost:5432/openwa',
   batchSize: parseInt(process.env.BATCH_SIZE || '1000'),
 };
@@ -436,12 +448,16 @@ docker compose -f docker-compose.postgres.yml up -d postgres
 npx ts-node scripts/migrate-sqlite-to-postgres.ts
 
 # Step 5: Update environment
-export DATABASE_ADAPTER=postgresql
-export DATABASE_URL=postgresql://user:pass@localhost:5432/openwa
+export DATABASE_TYPE=postgres
+export DATABASE_HOST=localhost
+export DATABASE_PORT=5432
+export DATABASE_NAME=openwa
+export DATABASE_USERNAME=user
+export DATABASE_PASSWORD=pass
 
 # Step 6: Verify migration
-psql $DATABASE_URL -c "SELECT COUNT(*) FROM sessions;"
-psql $DATABASE_URL -c "SELECT COUNT(*) FROM messages;"
+psql -h "$DATABASE_HOST" -U "$DATABASE_USERNAME" -d "$DATABASE_NAME" -c "SELECT COUNT(*) FROM sessions;"
+psql -h "$DATABASE_HOST" -U "$DATABASE_USERNAME" -d "$DATABASE_NAME" -c "SELECT COUNT(*) FROM messages;"
 
 # Step 7: Start with PostgreSQL
 docker compose -f docker-compose.postgres.yml up -d
@@ -526,13 +542,13 @@ rsync -avz --progress \
 
 # Copy database record
 echo "📄 Exporting session record..."
-ssh old-server "sqlite3 /data/openwa.db \
+ssh old-server "sqlite3 /data/openwa.sqlite \
     \"SELECT * FROM sessions WHERE id='${SESSION_ID}'\" \
     -csv" > session_record.csv
 
 # Import to new database
 echo "📥 Importing session record..."
-ssh new-server "sqlite3 /data/openwa.db \
+ssh new-server "sqlite3 /data/openwa.sqlite \
     \".import session_record.csv sessions\""
 
 # Start new server
@@ -714,7 +730,7 @@ breaking_changes:
     - auth: Basic Auth → API Key
 
   config:
-    - DATABASE_PATH → DATABASE_URL (for PostgreSQL)
+    - DATABASE_PATH → DATABASE_TYPE + discrete connection vars (DATABASE_HOST, DATABASE_PORT, DATABASE_NAME, DATABASE_USERNAME, DATABASE_PASSWORD) for PostgreSQL
     - WEBHOOK_URL → Managed via API
 
   database:
@@ -748,9 +764,10 @@ docker compose down
 echo "🔄 Running migrations..."
 docker run --rm \
   -v $(pwd)/data:/app/data \
-  -e DATABASE_URL=sqlite:///app/data/openwa.db \
+  -e DATABASE_TYPE=sqlite \
+  -e DATABASE_NAME=/app/data/openwa.sqlite \
   ghcr.io/rmyndharis/openwa:0.2.0 \
-  npm run migration:run
+  npm run migration:run:prod   # the prod image strips ts-node/TS source — use :prod
 
 # 4. Migrate configuration
 echo "⚙️ Migrating configuration..."
@@ -758,8 +775,8 @@ cat > .env.new << 'EOF'
 # OpenWA v0.2.x Configuration
 
 # Database (unchanged if using SQLite)
-DATABASE_ADAPTER=sqlite
-DATABASE_URL=sqlite:./data/openwa.db
+DATABASE_TYPE=sqlite
+DATABASE_NAME=./data/openwa.sqlite
 
 # New in v0.2: API Key Authentication
 API_KEY_ENABLED=true
@@ -815,7 +832,7 @@ breaking_changes:
     - Rate limiting enforced
 
   config:
-    - ENGINE_TYPE required (default: whatsapp-web.js)
+    - ENGINE_TYPE required (default: whatsapp-web.js; also accepts: baileys)
     - STORAGE_ADAPTER required (default: local)
 
   database:
@@ -843,10 +860,10 @@ BACKUP_DIR="./backups/v02-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$BACKUP_DIR"
 
 # Backup database
-if [ "$DATABASE_ADAPTER" = "postgresql" ]; then
-  pg_dump $DATABASE_URL > "$BACKUP_DIR/database.sql"
+if [ "$DATABASE_TYPE" = "postgres" ]; then
+  pg_dump -h "$DATABASE_HOST" -U "$DATABASE_USERNAME" "$DATABASE_NAME" > "$BACKUP_DIR/database.sql"
 else
-  cp ./data/openwa.db "$BACKUP_DIR/"
+  cp ./data/openwa.sqlite "$BACKUP_DIR/"
 fi
 
 # Backup auth sessions
@@ -874,7 +891,7 @@ echo "⚙️ Updating configuration..."
 cat >> .env << 'EOF'
 
 # New in v1.0
-ENGINE_TYPE=whatsapp-web.js
+ENGINE_TYPE=whatsapp-web.js  # default (Chromium-based); set to "baileys" for browser-free engine
 STORAGE_ADAPTER=local
 CACHE_ADAPTER=memory
 
@@ -956,10 +973,10 @@ docker compose down
 echo "📥 Restoring database..."
 if [ -f "$BACKUP_DIR/database.sql" ]; then
     # PostgreSQL
-    psql $DATABASE_URL < "$BACKUP_DIR/database.sql"
+    psql -h "$DATABASE_HOST" -U "$DATABASE_USERNAME" -d "$DATABASE_NAME" < "$BACKUP_DIR/database.sql"
 else
     # SQLite
-    cp "$BACKUP_DIR/openwa.db" ./data/
+    cp "$BACKUP_DIR/openwa.sqlite" ./data/
 fi
 
 # 3. Restore auth sessions
@@ -1135,8 +1152,8 @@ async function fullExport(options: ExportOptions): Promise<void> {
     version: process.env.npm_package_version,
     exportedAt: new Date().toISOString(),
     settings: {
-      DATABASE_ADAPTER: process.env.DATABASE_ADAPTER,
-      STORAGE_ADAPTER: process.env.STORAGE_ADAPTER,
+      DATABASE_TYPE: process.env.DATABASE_TYPE,
+      STORAGE_TYPE: process.env.STORAGE_TYPE,
       ENGINE_TYPE: process.env.ENGINE_TYPE,
     },
   };
@@ -1242,24 +1259,48 @@ async function fullImport(options: ImportOptions): Promise<void> {
 | Permission denied        | File ownership         | `chown -R 1000:1000 ./data`  |
 | Out of memory            | Large export           | Increase Docker memory limit |
 
+### PostgreSQL: boot crash-loop after upgrading a `DATABASE_SYNCHRONIZE=true` deployment
+
+**Symptom:** after upgrade, the container crash-loops on boot. `docker logs` shows one of:
+
+- `column "id" is of type uuid but default expression is of type character varying`
+- `foreign key constraint ... cannot be implemented ... incompatible types: character varying and uuid`
+
+**Cause:** a deployment previously bootstrapped with `DATABASE_SYNCHRONIZE=true` on PostgreSQL has native `uuid` `id`/FK columns (TypeORM derives them from `@PrimaryGeneratedColumn('uuid')`), while the migration chain assumes `varchar`. The two are incompatible, and migrations run unconditionally on the Postgres data connection (`migrationsRun: true`), so boot cannot complete (issue #690).
+
+**Fix (automatic for most deployments):** OpenWA ships a guard migration (`NormalizeSynchronizeUuidColumns`, ordered before the first collision) that converts the affected `uuid` columns to `varchar` on the next boot. For small-to-medium databases this is transparent — upgrade and restart.
+
+**Large-database maintenance window:** the conversion rewrites `messages` and `message_batches` in full under an exclusive lock. If either table is large (millions of rows) and your orchestrator's liveness/readiness grace is tight, run the migration against the stopped app during a planned window:
+
+```bash
+docker compose down
+DATABASE_TYPE=postgres DATABASE_HOST=... DATABASE_USERNAME=... \
+  DATABASE_PASSWORD=... DATABASE_NAME=openwa npm run migration:run
+docker compose up -d
+```
+
+(The CLI runner does not impose a statement timeout; the migration lifts it via `SET LOCAL`.)
+
+`DATABASE_SYNCHRONIZE=true` on PostgreSQL is unsupported for production. Leave it unset (the default `false`) and let migrations manage the schema.
+
 ### Debug Commands
 
 ```bash
 # Check database integrity
-sqlite3 ./data/openwa.db "PRAGMA integrity_check;"
+sqlite3 ./data/openwa.sqlite "PRAGMA integrity_check;"
 
 # Verify auth session files
 ls -la ./data/.wwebjs_auth/session-*/
 
 # Check file permissions
-stat ./data/openwa.db
+stat ./data/openwa.sqlite
 stat ./data/.wwebjs_auth
 
 # Verify PostgreSQL connection
-psql $DATABASE_URL -c "SELECT version();"
+psql -h "$DATABASE_HOST" -U "$DATABASE_USERNAME" -d "$DATABASE_NAME" -c "SELECT version();"
 
 # Check migration status
-npm run migration:status
+npm run migration:show
 
 # Force re-run specific migration
 npm run migration:run -- --name CreateApiKeysTable

@@ -1,30 +1,249 @@
-import { Injectable, OnModuleInit } from '@nestjs/common';
+import {
+  Injectable,
+  NotFoundException,
+  OnApplicationBootstrap,
+  OnModuleInit,
+  OnModuleDestroy,
+  Optional,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { ModuleRef } from '@nestjs/core';
+import { toNeutralJid, userPart } from '../../engine/identity/wa-id';
+import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
+import { AsyncLocalStorage } from 'async_hooks';
 import * as fs from 'fs';
 import * as path from 'path';
 import { createLogger } from '../../common/services/logger.service';
-import { HookManager } from '../hooks';
+import { HookManager, HookEvent, KNOWN_HOOK_EVENTS, isKnownHookEvent } from '../hooks';
 import {
+  PluginCapabilityError,
+  PluginCapabilityPermission,
+  PluginEngineReadCapability,
   PluginManifest,
+  PluginMessagingCapability,
+  PluginNetCapability,
+  PluginConversationsCapability,
+  PluginHandoverCapability,
+  PluginMappingsCapability,
   PluginInstance,
   PluginStatus,
   PluginContext,
   IPlugin,
   PluginType,
   PluginLogger,
+  PluginConfigSchema,
+  validateIngressManifest,
+  warnUnauthenticatedIngressRoutes,
+  warnUnsignedTimestampRoutes,
 } from './plugin.interfaces';
+import { validatePluginManifest } from './plugin-manifest';
+import { effectiveNetAllow, isNetHostAllowed, performPluginFetch } from './plugin-net';
 import { PluginStorageService } from './plugin-storage.service';
+import { isPluginActiveForSession, resolvePluginConfig } from './plugin-activation';
+import { PluginWorkerHost } from './sandbox/plugin-worker-host';
+import { WorkerThreadChannel } from './sandbox/worker-thread-channel';
+import { dispatchCapabilityVerb } from './sandbox/capability-router';
+import { PluginLogLevel } from './sandbox/protocol';
+import { buildConversationSendFacade, ConversationMediaType } from './conversation-send-facade';
+import { shouldDispatchToPlugin } from './handover-gate';
+import { makeOnWebhookSubscribe } from './webhook-subscribe.util';
+import { registerPluginSearchProvider, unregisterPluginSearchProvider } from './search-provider-registration.util';
+import { INGRESS_DISPATCH_TIMEOUT_MS } from '../../modules/integration/integration.constants';
+import type { MessageService } from '../../modules/message/message.service';
+import type { SessionService } from '../../modules/session/session.service';
+import type { IWhatsAppEngine } from '../../engine/interfaces/whatsapp-engine.interface';
+import {
+  ConversationMappingConflict,
+  type ConversationMappingService,
+} from '../../modules/integration/conversation-mapping.service';
+import type { PluginInstanceService } from '../../modules/integration/plugin-instance.service';
+import type { IngressJobData } from '../../modules/queue/processors/ingress.processor';
+import type { SearchProviderRegistry } from '../../modules/search/search-provider.registry';
+
+/** Default per-plugin heap cap for the sandbox worker; an OOM terminates the worker, not the host. */
+const SANDBOX_MAX_OLD_GEN_MB = 256;
+/** Time budget for a sandboxed plugin's hook handler before the chain proceeds without it. */
+const SANDBOX_HOOK_TIMEOUT_MS = 5000;
+/** A sandboxed plugin's healthCheck must answer within this, else it's reported unhealthy (not hung). */
+const SANDBOX_HEALTH_TIMEOUT_MS = 5000;
+/** A sandboxed plugin's search handler must answer within this, else /search fails fast (not hung). */
+const SANDBOX_SEARCH_TIMEOUT_MS = 10000;
+/**
+ * A sandboxed plugin's load()/onLoad/onEnable/onDisable must complete within this, else the worker is
+ * torn down and the operation fails — a wedged lifecycle can't hang the enable/disable request (and
+ * the ADMIN HTTP call behind it) forever. Generous on purpose: a slow-but-valid onEnable that opens
+ * connections should still finish well under it.
+ */
+const SANDBOX_LIFECYCLE_TIMEOUT_MS = 30000;
+
+/**
+ * Max concurrent worker-initiated capability calls per sandboxed plugin. A burst beyond this is rejected
+ * (the plugin sees a thrown Error) rather than amplified into unbounded host-side sends/fetches/writes.
+ */
+const SANDBOX_MAX_INFLIGHT_CAPS = 32;
+
+/**
+ * Host-side budget for ONE worker-initiated capability call. A plugin whose calls hang would otherwise
+ * hold all SANDBOX_MAX_INFLIGHT_CAPS slots forever (self-DoS). On timeout the worker gets an error and
+ * the slot frees; the late-settling host work is only WARN-logged (see PluginWorkerHost.withCapTimeout —
+ * a bound, not an atomicity guarantee). Default; plugins.capTimeoutMs (PLUGIN_CAP_TIMEOUT_MS) overrides.
+ */
+const SANDBOX_CAP_TIMEOUT_MS = 30000;
+
+/**
+ * Rate limit for the structured sandboxed-hook error log: at most one line per event per window so a
+ * hook that throws on every message can't flood the host log. Suppressed occurrences are counted and
+ * ride the next emitted line.
+ */
+const SANDBOX_HOOK_ERROR_LOG_INTERVAL_MS = 60000;
+
+/**
+ * Worker log-relay bounds (per sandboxed plugin): at most this many lines per window are relayed;
+ * excess is dropped, counted, and surfaced as one warn per window. Longer lines are truncated. The
+ * worker is not a security boundary — these are robustness bounds against a chatty/buggy plugin
+ * flooding the host log, not isolation.
+ */
+const SANDBOX_LOG_MAX_PER_WINDOW = 200;
+const SANDBOX_LOG_WINDOW_MS = 10000;
+const SANDBOX_LOG_MAX_MESSAGE_LENGTH = 8192;
+
+/**
+ * Host process.env keys an untrusted plugin worker is allowed to see. Everything else — secrets like
+ * API_MASTER_KEY, API_KEY_PEPPER, the DATABASE_/REDIS_ vars, DOCKER_HOST — is withheld. The worker is
+ * a thread, so it needs no PATH to start and require() resolves via module paths, not env.
+ */
+const SANDBOX_ENV_ALLOWLIST = ['NODE_ENV', 'NODE_EXTRA_CA_CERTS', 'TZ'] as const;
+
+/**
+ * Resolve a plugin's `main` entry to an absolute path, asserting it stays inside
+ * <pluginsDir>/<pluginId>. `main` comes from a user-supplied manifest, so a
+ * value like '../../etc/passwd' (or an absolute path) must be rejected BEFORE require().
+ */
+export function resolvePluginMainPath(pluginsDir: string, pluginId: string, main: string): string {
+  const base = path.resolve(pluginsDir, pluginId);
+  const mainPath = path.resolve(base, main);
+  if (mainPath !== base && !mainPath.startsWith(base + path.sep)) {
+    throw new Error(`Plugin ${pluginId} main path escapes the plugin directory`);
+  }
+  return mainPath;
+}
+
+/**
+ * Sibling directory names an in-place plugin update stages into / backs up to (see
+ * PluginsService.updatePackageInner). Dot-prefixed so the boot directory scan skips them, and placed
+ * inside the plugins dir so the swap renames stay on one filesystem (EXDEV-safe). The loader's
+ * boot-time reconciler (recoverInterruptedUpdates) keys off these exact names.
+ */
+export function pluginUpdateStagingDirName(pluginId: string): string {
+  return `.${pluginId}.new`;
+}
+export function pluginUpdateBackupDirName(pluginId: string): string {
+  return `.${pluginId}.bak`;
+}
+
+/**
+ * Build the minimal, allowlisted env for an untrusted plugin worker so it never inherits host secrets.
+ * Only {@link SANDBOX_ENV_ALLOWLIST} keys are forwarded (unset keys are omitted, not emitted as
+ * `undefined`), and NODE_ENV defaults to 'production' when the host has none.
+ */
+export function buildSandboxWorkerEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const key of SANDBOX_ENV_ALLOWLIST) {
+    if (source[key] !== undefined) env[key] = source[key];
+  }
+  env.NODE_ENV = source.NODE_ENV ?? 'production';
+  return env;
+}
+
+/**
+ * Translate a normalized conversation media send into the concrete MessageService media method for the
+ * envelope's type. Kept pure (no `this`) so the loader binds it directly and it can be unit-tested in
+ * isolation. The switch is exhaustive over ConversationMediaType — adding a type without a case is a
+ * compile error here rather than a silent runtime fall-through.
+ */
+export function dispatchConversationMedia(
+  svc: Pick<MessageService, 'sendImage' | 'sendVideo' | 'sendAudio' | 'sendDocument'>,
+  sessionId: string,
+  opts: { chatId: string; url: string; type: ConversationMediaType; caption?: string },
+): Promise<unknown> {
+  const dto = { chatId: opts.chatId, url: opts.url, caption: opts.caption };
+  switch (opts.type) {
+    case 'image':
+      return svc.sendImage(sessionId, dto);
+    case 'video':
+      return svc.sendVideo(sessionId, dto);
+    case 'audio':
+      return svc.sendAudio(sessionId, dto);
+    case 'voice':
+      // A voice envelope is a PTT note: sendAudio with ptt classifies it as 'voice' and defaults the
+      // codec to audio/ogg;opus, so it renders as a WhatsApp voice bubble rather than an audio file.
+      return svc.sendAudio(sessionId, { ...dto, ptt: true });
+    case 'file':
+      return svc.sendDocument(sessionId, dto);
+  }
+}
+
+// Plugin ids whose bundled-extension code was permanently removed (v0.7 — superseded by the
+// marketplace chat-flow / group-translate; also reserved in plugin-installer). A leftover
+// directory without a manifest marks them as deleted on disk, so the stale registry entry (which
+// still reports them installed/enabled) is pruned on boot. Scoped to these known ids so a
+// temporarily-unreadable plugin dir (e.g. an unmounted volume) never loses its persisted config.
+const LEGACY_REMOVED_PLUGIN_IDS = new Set(['auto-reply', 'translation']);
+
+/**
+ * Fill config keys the schema declares a `default` for and that are absent (undefined) in the
+ * stored config. Seeding happens at LOAD time (fresh installs and every boot), so a plugin whose
+ * schema fields carry defaults never runs its lifecycle with them missing — the failure class of
+ * "enable throws: <field> is required/has no value" for defaulted fields. Explicit values — even
+ * null — are never overwritten, and object/array defaults are deep-cloned so the seeded runtime
+ * config and the persisted entry can't share a mutable reference. Required fields WITHOUT a
+ * declared default stay absent on purpose: those need real operator input, not an invented value.
+ */
+export function seedConfigDefaults(
+  schema: PluginConfigSchema | undefined,
+  config: Record<string, unknown>,
+): Record<string, unknown> {
+  const properties = schema?.properties;
+  if (!properties) return config;
+  let seeded: Record<string, unknown> | undefined;
+  for (const [key, field] of Object.entries(properties)) {
+    if (config[key] !== undefined || field === null || typeof field !== 'object') continue;
+    const value = field.default;
+    if (value === undefined) continue;
+    if (!seeded) seeded = { ...config };
+    seeded[key] = value !== null && typeof value === 'object' ? structuredClone(value) : value;
+  }
+  return seeded ?? config;
+}
 
 @Injectable()
-export class PluginLoaderService implements OnModuleInit {
+export class PluginLoaderService implements OnModuleInit, OnApplicationBootstrap, OnModuleDestroy {
   private readonly logger = createLogger('PluginLoaderService');
   private readonly plugins = new Map<string, PluginInstance>();
+  /** Plugin ids whose enable() is in flight — a synchronous lock so concurrent enables can't double-run. */
+  private readonly enabling = new Set<string>();
+  // Live worker host per enabled sandboxed (untrusted) plugin. Built-ins are not in here.
+  private readonly sandboxHosts = new Map<string, PluginWorkerHost>();
+  // Last hook-handler error each sandboxed plugin's worker reported, surfaced via checkPluginHealth so a
+  // hook that keeps throwing is visible to the operator. Cleared on disable (fresh enable = fresh slate).
+  private readonly lastSandboxHookError = new Map<string, { event: string; error: string; at: Date }>();
+  // Carries the firing event's sessionId across an in-process hook handler so ctx.config (a getter)
+  // resolves the per-session slice. Per async call tree, so concurrent sessions don't cross over.
+  private readonly hookSession = new AsyncLocalStorage<{ sessionId?: string }>();
   private readonly pluginsDir: string;
 
   constructor(
     private readonly configService: ConfigService,
     private readonly hookManager: HookManager,
     private readonly pluginStorage: PluginStorageService,
+    // Resolves MessageService/SessionService lazily inside capability verbs. ModuleRef is used
+    // instead of constructor injection to avoid the provider cycle
+    // PluginLoaderService -> SessionService -> EngineFactory -> PluginLoaderService.
+    private readonly moduleRef: ModuleRef,
+    // Shared lid->phone table (EngineModule is @Global and exports it). Optional so the many unit tests
+    // that construct this service with the 4 prior args still compile; when absent, canonicalChatId
+    // degrades to identity (no @lid resolution).
+    @Optional() private readonly lidMappingStore?: LidMappingStoreService,
   ) {
     this.pluginsDir = this.configService.get<string>('plugins.dir') ?? './plugins';
   }
@@ -44,6 +263,58 @@ export class PluginLoaderService implements OnModuleInit {
     });
   }
 
+  /**
+   * Re-enable the plugins the operator had enabled (#856). `status` cannot carry that across a restart
+   * — it describes the runtime, and loading never runs a plugin — so the decision is read from the
+   * separately persisted `enabledByOperator`. Without this, every restart (an upgrade, a host reboot, a
+   * Docker restart policy) silently switched off every extension, and a relay simply stopped relaying.
+   *
+   * Runs at bootstrap rather than in onModuleInit so the rest of the app is wired before any plugin
+   * code executes. Built-ins are skipped: an engine is enabled by EngineFactory against the configured
+   * engine.type, and enabling a non-active engine here would be rejected anyway.
+   *
+   * Best-effort and sequential, like the shutdown teardown: a plugin that cannot come back is logged
+   * and left in ERROR, and never holds up the gateway.
+   */
+  async onApplicationBootstrap(): Promise<void> {
+    const restorable = this.getAllPlugins().filter(
+      p => !p.builtIn && this.pluginStorage.getPluginEntry(p.manifest.id)?.enabledByOperator === true,
+    );
+    for (const plugin of restorable) {
+      const pluginId = plugin.manifest.id;
+      try {
+        await this.enablePlugin(pluginId);
+      } catch (error) {
+        this.logger.error(
+          `Failed to restore plugin ${pluginId} on startup; it stays disabled until re-enabled`,
+          error instanceof Error ? error.message : String(error),
+          { pluginId, action: 'plugin_restore_failed' },
+        );
+      }
+    }
+  }
+
+  /**
+   * Graceful shutdown (SIGTERM → app.close()): run onDisable for every enabled plugin so it can flush
+   * buffers, close connections, and persist state. Previously onDisable only ran via the REST disable
+   * and uninstall paths, so a normal restart/deploy/scale-down skipped it and stateful plugins lost
+   * in-flight work. Best-effort and sequential: one plugin's failure must not block the others.
+   */
+  async onModuleDestroy(): Promise<void> {
+    const enabled = this.getAllPlugins().filter(p => p.status === PluginStatus.ENABLED);
+    for (const plugin of enabled) {
+      try {
+        await this.disablePlugin(plugin.manifest.id);
+      } catch (error) {
+        this.logger.error(
+          `Failed to disable plugin ${plugin.manifest.id} during shutdown`,
+          error instanceof Error ? error.message : String(error),
+          { pluginId: plugin.manifest.id, action: 'plugin_shutdown_disable_failed' },
+        );
+      }
+    }
+  }
+
   private loadBuiltInPlugins(): void {
     // Built-in plugins are registered programmatically
     // This will be used by Phase 4 to register engine plugins
@@ -53,10 +324,17 @@ export class PluginLoaderService implements OnModuleInit {
   }
 
   private loadPluginsFromDirectory(dir: string): void {
+    // Reconcile any interrupted-update leftovers BEFORE scanning, so a crash mid-swap can't make a
+    // plugin silently vanish while its registry entry still claims it is installed.
+    this.recoverInterruptedUpdates(dir);
+
     const entries = fs.readdirSync(dir, { withFileTypes: true });
 
     for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
+      // Skip non-directories and dot-prefixed dirs (e.g. a crash-leftover `.<id>.bak` update backup or
+      // `.<id>.new` staging tree), so a half-finished update can't be re-loaded as a duplicate-id
+      // plugin on the next boot. recoverInterruptedUpdates has already reconciled them by this point.
+      if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
 
       const pluginPath = path.join(dir, entry.name);
       const manifestPath = path.join(pluginPath, 'manifest.json');
@@ -66,6 +344,12 @@ export class PluginLoaderService implements OnModuleInit {
           pluginPath,
           action: 'manifest_missing',
         });
+        if (LEGACY_REMOVED_PLUGIN_IDS.has(entry.name)) {
+          this.pluginStorage.deletePluginEntry(entry.name);
+          this.logger.log(`Pruned stale registry entry for removed built-in plugin: ${entry.name}`, {
+            action: 'registry_ghost_pruned',
+          });
+        }
         continue;
       }
 
@@ -77,6 +361,67 @@ export class PluginLoaderService implements OnModuleInit {
           error instanceof Error ? error.message : String(error),
           { pluginPath, action: 'plugin_load_failed' },
         );
+        // The runtime just dropped this plugin, but a registry entry from a previous successful
+        // load still claims it installed/enabled — reconcile the persisted state to ERROR so the
+        // mismatch surfaces instead of silently persisting. The entry itself (operator config,
+        // enabledByOperator) is preserved: fix the manifest/main and the next boot loads and
+        // re-enables it (ensureRegistryEntry resets the status on a successful load). No-op when
+        // no entry exists (a hand-placed dir that never loaded).
+        this.pluginStorage.setPluginStatus(entry.name, PluginStatus.ERROR);
+      }
+    }
+  }
+
+  /**
+   * Crash recovery for in-place updates (see PluginsService.updatePackageInner). An update stages the
+   * new tree at `.<id>.new`, then swaps with two renames (live → `.<id>.bak`, staging → live). Both
+   * siblings are dot-prefixed, so the scan above skips them — but without reconciliation a crash
+   * BETWEEN the renames loses the live dir and the plugin silently vanishes from the runtime while
+   * its registry entry still claims it is installed. Reconcile before scanning:
+   *  - live dir missing + `.<id>.bak` present → the swap was interrupted: restore the backup as the
+   *    live dir (the previous version comes back; the update never touched the registry entry or the
+   *    operator's config, so nothing else needs repairing).
+   *  - live dir present + `.<id>.bak` present → the swap completed but the process died before the
+   *    backup cleanup: drop the backup.
+   *  - `.<id>.new` present → staging from an interrupted/failed update; the live install (if any)
+   *    was never swapped: drop it.
+   * Best-effort: a reconciliation failure is logged and left for the next boot rather than aborting
+   * plugin loading entirely.
+   */
+  private recoverInterruptedUpdates(dir: string): void {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const match = /^\.(.+)\.(?:bak|new)$/.exec(entry.name);
+      if (!match) continue;
+      const pluginId = match[1];
+      const leftover = path.join(dir, entry.name);
+      const liveDir = path.join(dir, pluginId);
+      try {
+        if (entry.name === pluginUpdateStagingDirName(pluginId)) {
+          fs.rmSync(leftover, { recursive: true, force: true });
+          this.logger.warn(`Dropped stale update staging for plugin ${pluginId}`, {
+            pluginId,
+            action: 'plugin_update_staging_pruned',
+          });
+        } else if (!fs.existsSync(liveDir)) {
+          fs.renameSync(leftover, liveDir);
+          this.logger.warn(
+            `Restored plugin ${pluginId} from its update backup — a previous update was interrupted mid-swap`,
+            { pluginId, action: 'plugin_update_backup_restored' },
+          );
+        } else {
+          fs.rmSync(leftover, { recursive: true, force: true });
+          this.logger.warn(`Dropped stale update backup for plugin ${pluginId}`, {
+            pluginId,
+            action: 'plugin_update_backup_pruned',
+          });
+        }
+      } catch (error) {
+        this.logger.error(
+          `Failed to reconcile the interrupted-update leftover ${entry.name}`,
+          error instanceof Error ? error.message : String(error),
+          { pluginId, action: 'plugin_update_recovery_failed' },
+        );
       }
     }
   }
@@ -84,30 +429,68 @@ export class PluginLoaderService implements OnModuleInit {
   loadPlugin(pluginPath: string): PluginInstance {
     const manifestPath = path.join(pluginPath, 'manifest.json');
     const manifestContent = fs.readFileSync(manifestPath, 'utf-8');
-    const manifest = JSON.parse(manifestContent) as PluginManifest;
+    const manifest = JSON.parse(manifestContent) as unknown;
 
-    // Validate manifest
-    if (!manifest.id || !manifest.name || !manifest.version || !manifest.type || !manifest.main) {
-      throw new Error(`Invalid manifest: missing required fields`);
+    // Boot-time validation is the SAME validation install runs (parsePluginPackage): a hand-placed
+    // or crash-leftover directory must satisfy the install contract too — plain-object shape,
+    // required string fields, id format + reserved ids, extension-only type, and a `main` that
+    // cannot escape the plugin dir. Otherwise a manifest the installer would have rejected loads
+    // anyway and only fails (or worse, runs unexpected code) at enable time.
+    validatePluginManifest(manifest);
+
+    // Anchor `main` inside THIS on-disk directory: the lexical check above is forward-slash only,
+    // so a platform-separator escape (e.g. Windows-style `..\x`) would slip past it — resolve and
+    // re-check containment here. Parity with install's in-archive check: the entry must exist as a
+    // file, or the plugin loads "successfully" and only blows up when someone enables it.
+    const mainPath = resolvePluginMainPath(path.dirname(pluginPath), path.basename(pluginPath), manifest.main);
+    if (!fs.existsSync(mainPath) || !fs.statSync(mainPath).isFile()) {
+      throw new Error(`Plugin ${manifest.id}: main file not found in the plugin directory: ${manifest.main}`);
     }
+
+    // Reject a malformed ingress declaration (SDK-major mismatch, missing webhook:ingress permission,
+    // duplicate/empty routes, non-positive toleranceSec) at load time instead of letting it silently
+    // load and become provisionable. No-op for plugins that declare no ingress. A route declaring
+    // signature.scheme 'none' is rejected unless the operator opted in via ALLOW_UNSIGNED_INGRESS=true.
+    validateIngressManifest(manifest, this.configService.get<boolean>('ingress.allowUnsigned', false));
+
+    // Surface a loud warning for any ingress route that skips signature verification — a scheme:'none'
+    // route is a fully-unauthenticated public endpoint that can trigger WhatsApp sends. Only reachable
+    // when the operator opted in (otherwise validateIngressManifest above rejected it); the warning
+    // reminds them to front the URL with a network/reverse-proxy ACL.
+    warnUnauthenticatedIngressRoutes(manifest, this.logger);
+
+    // Same loud-warning treatment for an hmac route whose declared timestamp is not bound into the
+    // signature: freshness is enforced, but an unsigned timestamp lets a replay mint a fresh one.
+    warnUnsignedTimestampRoutes(manifest, this.logger);
 
     // Check if plugin already loaded
     if (this.plugins.has(manifest.id)) {
       throw new Error(`Plugin ${manifest.id} is already loaded`);
     }
 
-    // Load stored config
-    const storedConfig = this.pluginStorage.getPluginConfig(manifest.id);
+    // Load any persisted config + per-session activation + per-session config so an operator's choices
+    // survive a restart.
+    const storedConfig = this.pluginStorage.getPluginConfig(manifest.id) ?? {};
+    const storedSessions = this.pluginStorage.getPluginSessions(manifest.id) ?? undefined;
+    const storedSessionConfig = this.pluginStorage.getPluginSessionConfig(manifest.id) ?? undefined;
 
     const pluginInstance: PluginInstance = {
       manifest,
       status: PluginStatus.INSTALLED,
-      config: storedConfig ?? {},
+      // Seed schema-declared defaults under the stored config, so a defaulted field is never
+      // missing when the plugin later runs (explicit values are never overwritten).
+      config: seedConfigDefaults(manifest.configSchema, storedConfig),
       instance: null,
       loadedAt: new Date(),
+      builtIn: false,
+      activeSessions: storedSessions,
+      sessionConfig: storedSessionConfig,
     };
 
     this.plugins.set(manifest.id, pluginInstance);
+
+    // Ensure a registry entry exists so later enable/disable/config writes persist.
+    this.ensureRegistryEntry(manifest, false);
 
     this.logger.log(`Plugin loaded: ${manifest.name} v${manifest.version}`, {
       pluginId: manifest.id,
@@ -116,6 +499,58 @@ export class PluginLoaderService implements OnModuleInit {
     });
 
     return pluginInstance;
+  }
+
+  /**
+   * Ensure a freshly-loaded plugin has a persisted registry entry, so later enable/disable/config
+   * writes (which only update an EXISTING entry) actually persist instead of silently no-op'ing.
+   * Creates a complete INSTALLED entry when none exists; an existing entry's persisted status/config
+   * is left untouched. Best-effort (saveRegistry swallows fs errors, so a disk failure never turns a
+   * load into a 500). Does NOT enable or run the plugin — boot never auto-executes plugin code.
+   */
+  private ensureRegistryEntry(manifest: PluginManifest, builtIn: boolean): void {
+    // Reconcile the persisted entry with the freshly-loaded runtime: loading never runs the plugin, so
+    // the entry's status is (re)set to INSTALLED to match the runtime. Enabling is a separate step that
+    // runs the lifecycle — at bootstrap for a plugin the operator had enabled (see
+    // onApplicationBootstrap), or on an explicit ADMIN action. The operator's persisted config and
+    // enable decision are preserved so settings/secrets and the decision itself survive. Best-effort:
+    // saveRegistry swallows fs errors, so a disk failure never turns a load into a 500.
+    const existing = this.pluginStorage.getPluginEntry(manifest.id);
+    // The operator's standing enable decision (#856). `status` below is deliberately reset, so intent
+    // has to live in its own field or a restart loses it. A pre-#856 row has no such field: adopt it
+    // from a status of ENABLED, which can only have been written by an explicit enable since the last
+    // boot (every boot rewrites the status to INSTALLED), so it is a faithful record of the intent.
+    const enabledByOperator = existing?.enabledByOperator ?? existing?.status === PluginStatus.ENABLED;
+    this.pluginStorage.setPluginEntry({
+      id: manifest.id,
+      type: manifest.type,
+      name: manifest.name,
+      version: manifest.version,
+      status: PluginStatus.INSTALLED,
+      // The operator's persisted config survives, with schema-declared defaults seeded under it so
+      // the persisted entry matches the seeded runtime config (see loadPlugin).
+      config: seedConfigDefaults(manifest.configSchema, existing?.config ?? {}),
+      builtIn,
+      installedAt: existing?.installedAt ?? new Date(),
+      updatedAt: new Date(),
+      // setPluginEntry REPLACES the entry, so the operator's per-session activation + config must be
+      // carried over or every boot wipes them from disk (lost after the second restart).
+      activeSessions: existing?.activeSessions,
+      sessionConfig: existing?.sessionConfig,
+      enabledByOperator,
+    });
+  }
+
+  /**
+   * Record that the operator wants this plugin on (or off), so bootstrap can restore it (#856).
+   *
+   * Call this ONLY from an operator-facing action. In particular it must never be called from
+   * disablePlugin: onModuleDestroy disables every running plugin during a graceful shutdown, and
+   * treating that as "the operator turned it off" would erase the decision on the way out — which is
+   * the very bug this exists to fix, just moved somewhere harder to see.
+   */
+  setOperatorEnabled(pluginId: string, enabled: boolean): void {
+    this.pluginStorage.setPluginEnabledByOperator(pluginId, enabled);
   }
 
   async enablePlugin(pluginId: string): Promise<void> {
@@ -128,30 +563,32 @@ export class PluginLoaderService implements OnModuleInit {
       return; // Already enabled
     }
 
+    // Engines are mutually exclusive and pinned to the deployment's engine.type config (the factory
+    // reads that, not plugin status). Enabling a second engine at runtime would show two "active"
+    // engines and desync the factory, so reject anything but the configured active engine.
+    if (plugin.manifest.type === PluginType.ENGINE) {
+      const activeEngine = this.configService.get<string>('engine.type') ?? 'whatsapp-web.js';
+      if (pluginId !== activeEngine) {
+        throw new Error(
+          `Engine "${pluginId}" is not the active engine ("${activeEngine}"). Set engine.type and restart to switch engines.`,
+        );
+      }
+    }
+
+    // Concurrency guard: status flips to ENABLED only AFTER the awaits below, so two concurrent enable
+    // calls would both pass the check above, both run onEnable, and both register the plugin's hooks
+    // (duplicate side effects). Claim the enable synchronously here so a racing caller is rejected
+    // before any await; released in finally.
+    if (this.enabling.has(pluginId)) {
+      throw new Error(`Plugin ${pluginId} is already being enabled`);
+    }
+    this.enabling.add(pluginId);
+
     try {
-      // Create plugin context
-      const context = this.createPluginContext(plugin);
-
-      // Load the plugin instance if not already loaded
-      if (!plugin.instance) {
-        const mainPath = path.join(this.pluginsDir, pluginId, plugin.manifest.main);
-        // Dynamic require for user plugins
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
-        const pluginModule = require(mainPath) as { default?: new () => IPlugin };
-        if (pluginModule.default) {
-          plugin.instance = new pluginModule.default();
-        } else {
-          throw new Error(`Plugin ${pluginId} does not export a default class`);
-        }
-      }
-
-      // Call lifecycle hooks
-      if (plugin.instance.onLoad) {
-        await plugin.instance.onLoad(context);
-      }
-
-      if (plugin.instance.onEnable) {
-        await plugin.instance.onEnable(context);
+      if (plugin.builtIn === false) {
+        await this.enableSandboxed(pluginId, plugin);
+      } else {
+        await this.enableInProcess(pluginId, plugin);
       }
 
       plugin.status = PluginStatus.ENABLED;
@@ -171,11 +608,28 @@ export class PluginLoaderService implements OnModuleInit {
 
       this.pluginStorage.setPluginStatus(pluginId, PluginStatus.ERROR);
 
+      // A plugin that subscribed hooks before its onLoad/onEnable threw would otherwise leave those
+      // registrations live: a later successful enable re-registers them, so each event then dispatches
+      // to the plugin once per failed attempt. Drop them here. Safe on this path only — an
+      // already-enabled plugin returns early above, so the catch only runs for an enable that never
+      // went live, which owns no hooks worth keeping. (Idempotent: no-ops when none were registered.)
+      this.hookManager.unregisterPlugin(pluginId);
+
       throw error;
+    } finally {
+      this.enabling.delete(pluginId);
     }
   }
 
-  async disablePlugin(pluginId: string): Promise<void> {
+  /**
+   * Disable an enabled plugin (best-effort force-teardown for sandboxed ones). `opts.unload` is set
+   * ONLY by the unload path (uninstall / in-place update): it additionally dispatches the plugin's
+   * onUnload hook. A plain disable (REST / shutdown teardown) deliberately does NOT fire onUnload —
+   * disable is reversible and its cleanup hook is onDisable, while onUnload means "removed from the
+   * runtime". (For a sandboxed plugin the worker thread does die on disable, but terminate() itself
+   * releases its timers/sockets; the hook contract stays: onUnload only on unload.)
+   */
+  async disablePlugin(pluginId: string, opts?: { unload?: boolean }): Promise<void> {
     const plugin = this.plugins.get(pluginId);
     if (!plugin) {
       throw new Error(`Plugin ${pluginId} not found`);
@@ -186,18 +640,54 @@ export class PluginLoaderService implements OnModuleInit {
     }
 
     try {
-      const context = this.createPluginContext(plugin);
-
-      if (plugin.instance?.onDisable) {
-        await plugin.instance.onDisable(context);
+      const host = this.sandboxHosts.get(pluginId);
+      if (host) {
+        // Disable is a force-teardown: even if the plugin's onDisable hangs (now bounded) or throws,
+        // we still kill the worker and drop the reference, so a misbehaving plugin can never block a
+        // disable or leak its worker thread.
+        try {
+          await host.runLifecycle('onDisable', SANDBOX_LIFECYCLE_TIMEOUT_MS);
+        } catch (error) {
+          this.logger.warn(`Sandboxed plugin ${pluginId} onDisable failed during disable; terminating anyway`, {
+            pluginId,
+            action: 'sandbox_disable_lifecycle_failed',
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+        if (opts?.unload) {
+          // The worker is about to be terminated, so this is the ONLY chance onUnload ever gets for
+          // a sandboxed plugin — after terminate the hook is unreachable, and unloadPlugin's
+          // in-process call can't help (plugin.instance is null). Same bounded, best-effort policy
+          // as onDisable above: a wedged/throwing onUnload must never block the teardown.
+          try {
+            await host.runLifecycle('onUnload', SANDBOX_LIFECYCLE_TIMEOUT_MS);
+          } catch (error) {
+            this.logger.warn(`Sandboxed plugin ${pluginId} onUnload failed during unload; terminating anyway`, {
+              pluginId,
+              action: 'sandbox_unload_lifecycle_failed',
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
+        await host.terminate().catch(() => undefined);
+        this.sandboxHosts.delete(pluginId);
+      } else {
+        const context = this.createPluginContext(plugin);
+        if (plugin.instance?.onDisable) {
+          await plugin.instance.onDisable(context);
+        }
       }
 
       // Unregister all hooks for this plugin
       this.hookManager.unregisterPlugin(pluginId);
+      // Drop the plugin's search-provider entry (if any) so queries don't route to a terminated worker.
+      unregisterPluginSearchProvider(this.getSearchRegistry(), pluginId);
 
       plugin.status = PluginStatus.DISABLED;
 
       this.pluginStorage.setPluginStatus(pluginId, PluginStatus.DISABLED);
+      // A fresh enable starts with a clean hook-error slate (the state is per runtime, not persisted).
+      this.lastSandboxHookError.delete(pluginId);
 
       this.logger.log(`Plugin disabled: ${plugin.manifest.name}`, {
         pluginId,
@@ -216,12 +706,16 @@ export class PluginLoaderService implements OnModuleInit {
       throw new Error(`Plugin ${pluginId} not found`);
     }
 
-    // Disable first if enabled
+    // Disable first if enabled. `unload: true` so a SANDBOXED plugin also gets its onUnload hook:
+    // disable terminates the worker thread, which would otherwise make onUnload unreachable. An
+    // in-process plugin's onUnload runs below instead (its instance survives disable). A sandboxed
+    // plugin that is already disabled has no live worker left to notify — its resources were
+    // released when the worker terminated, so there is nothing to clean up.
     if (plugin.status === PluginStatus.ENABLED) {
-      await this.disablePlugin(pluginId);
+      await this.disablePlugin(pluginId, { unload: true });
     }
 
-    // Call onUnload
+    // Call onUnload (in-process plugins; a sandboxed one received it above, before terminate)
     if (plugin.instance?.onUnload) {
       const context = this.createPluginContext(plugin);
       await plugin.instance.onUnload(context);
@@ -235,6 +729,47 @@ export class PluginLoaderService implements OnModuleInit {
     });
   }
 
+  /** Absolute path of the directory user plugins are loaded from (used by install/uninstall). */
+  getPluginsDir(): string {
+    return this.pluginsDir;
+  }
+
+  /** Whether a plugin is a first-party built-in (engine / bundled extension) vs an installed user plugin. */
+  isBuiltIn(pluginId: string): boolean {
+    return this.pluginStorage.getPluginEntry(pluginId)?.builtIn ?? false;
+  }
+
+  /**
+   * Fully remove an installed user plugin: disable + unload from the runtime, drop its persisted
+   * registry entry, and delete its directory from disk. Built-ins (engines, bundled extensions) are
+   * registered programmatically with no on-disk dir and must never be removable.
+   */
+  async uninstallPlugin(pluginId: string): Promise<void> {
+    if (this.pluginStorage.getPluginEntry(pluginId)?.builtIn) {
+      throw new Error(`Cannot uninstall built-in plugin ${pluginId}`);
+    }
+
+    if (this.plugins.has(pluginId)) {
+      await this.unloadPlugin(pluginId);
+    }
+    this.pluginStorage.deletePluginEntry(pluginId);
+
+    // Delete the plugin's directory, guarding against a traversal id escaping the plugins dir.
+    const base = path.resolve(this.pluginsDir);
+    const dir = path.resolve(base, pluginId);
+    if (dir !== base && dir.startsWith(base + path.sep) && fs.existsSync(dir)) {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+
+    // Drop the plugin's ctx.storage data dir. Under shipped defaults it lives INSIDE the package
+    // dir (already gone above), but a split-dir deployment (PLUGINS_DIR outside the data dir) would
+    // otherwise leak <dataDir>/plugins/<id> — persisted secrets included — on every uninstall.
+    // Best-effort, and strictly that one plugin's directory.
+    this.pluginStorage.deletePluginData(pluginId);
+
+    this.logger.log(`Plugin uninstalled: ${pluginId}`, { pluginId, action: 'plugin_uninstalled' });
+  }
+
   updatePluginConfig(pluginId: string, config: Record<string, unknown>): void {
     const plugin = this.plugins.get(pluginId);
     if (!plugin) {
@@ -246,16 +781,618 @@ export class PluginLoaderService implements OnModuleInit {
     // Persist config
     this.pluginStorage.setPluginConfig(pluginId, plugin.config);
 
-    // Notify plugin of config change (async, fire and forget)
-    if (plugin.instance?.onConfigChange && plugin.status === PluginStatus.ENABLED) {
-      const context = this.createPluginContext(plugin);
-      void plugin.instance.onConfigChange(context, plugin.config);
+    // Notify the running plugin of the config change (fire and forget). A sandboxed plugin's
+    // onConfigChange lives in the worker (plugin.instance is null), so route it through the live worker
+    // host so it refreshes ctx.config too; built-ins go through the in-process instance.
+    if (plugin.status === PluginStatus.ENABLED) {
+      const sandboxHost = this.sandboxHosts.get(pluginId);
+      if (sandboxHost) {
+        sandboxHost.sendConfigChange(plugin.config);
+      } else if (plugin.instance?.onConfigChange) {
+        const context = this.createPluginContext(plugin);
+        void plugin.instance.onConfigChange(context, plugin.config);
+      }
     }
 
     this.logger.debug(`Plugin config updated: ${pluginId}`, {
       pluginId,
       action: 'plugin_config_updated',
     });
+  }
+
+  /**
+   * Set the sessions a session-scoped plugin is activated for. `['*']` = all numbers (system-wide),
+   * an explicit list scopes it to those sessions, `[]` deactivates it everywhere. Takes effect on the
+   * next hook event (the gate reads plugin.activeSessions live) and survives a restart.
+   */
+  setPluginSessions(pluginId: string, sessions: string[]): PluginInstance {
+    const plugin = this.plugins.get(pluginId);
+    if (!plugin) {
+      throw new Error(`Plugin ${pluginId} not found`);
+    }
+    if (plugin.manifest.sessionScoped === false) {
+      throw new Error(`Plugin ${pluginId} is global (not session-scoped) and cannot be activated per session`);
+    }
+
+    plugin.activeSessions = sessions;
+    this.pluginStorage.setPluginSessions(pluginId, sessions);
+
+    this.logger.log(`Plugin active sessions updated: ${pluginId}`, {
+      pluginId,
+      action: 'plugin_sessions_updated',
+      sessions,
+    });
+    return plugin;
+  }
+
+  /**
+   * Set (or clear) a plugin's per-session config override for `sessionId`. Hooks for that session then
+   * see the override shallow-merged over the base via ctx.config — applied on the next event
+   * (resolution reads plugin.sessionConfig live) and persisted across restart. An empty override
+   * removes it (the session falls back to the base). Global plugins have no per-session config.
+   */
+  setPluginSessionConfig(pluginId: string, sessionId: string, config: Record<string, unknown>): PluginInstance {
+    const plugin = this.plugins.get(pluginId);
+    if (!plugin) {
+      throw new Error(`Plugin ${pluginId} not found`);
+    }
+    if (plugin.manifest.sessionScoped === false) {
+      throw new Error(`Plugin ${pluginId} is global (not session-scoped) and has no per-session config`);
+    }
+
+    const next = { ...(plugin.sessionConfig ?? {}) };
+    if (config && Object.keys(config).length > 0) {
+      next[sessionId] = config;
+    } else {
+      delete next[sessionId];
+    }
+    plugin.sessionConfig = next;
+    this.pluginStorage.setPluginSessionConfig(pluginId, next);
+
+    this.logger.debug(`Plugin session config updated: ${pluginId}`, {
+      pluginId,
+      action: 'plugin_session_config_updated',
+      sessionId,
+    });
+    return plugin;
+  }
+
+  /**
+   * Surface a sandboxed plugin's hook-handler failure host-side: record it for the plugin's health
+   * surface and emit one structured warn per event per SANDBOX_HOOK_ERROR_LOG_INTERVAL_MS — a hook
+   * that throws on every message must be visible, but must not become a log-flood vector. Suppressed
+   * occurrences are counted and ride the next emitted line.
+   */
+  private recordSandboxHookError(
+    pluginId: string,
+    event: string,
+    error: string,
+    rateLimit: Map<string, { lastAt: number; suppressed: number }>,
+  ): void {
+    this.lastSandboxHookError.set(pluginId, { event, error, at: new Date() });
+    const now = Date.now();
+    const state = rateLimit.get(event);
+    if (state && now - state.lastAt < SANDBOX_HOOK_ERROR_LOG_INTERVAL_MS) {
+      state.suppressed++;
+      return;
+    }
+    const suppressed = state?.suppressed ?? 0;
+    rateLimit.set(event, { lastAt: now, suppressed: 0 });
+    this.logger.warn(`Sandboxed plugin ${pluginId} hook '${event}' handler failed: ${error}`, {
+      pluginId,
+      event,
+      action: 'sandbox_hook_error',
+      ...(suppressed > 0 ? { suppressed } : {}),
+    });
+  }
+
+  /**
+   * Run a plugin's healthCheck across both tiers. A sandboxed plugin's healthCheck lives in the worker
+   * (plugin.instance is null), so route to the live worker host (time-bounded); built-ins use the
+   * in-process instance. Returns the default "healthy" when the plugin implements no health check.
+   */
+  async checkPluginHealth(pluginId: string): Promise<{ healthy: boolean; message?: string }> {
+    const sandboxHost = this.sandboxHosts.get(pluginId);
+    if (sandboxHost) {
+      const result = await sandboxHost.healthCheck(SANDBOX_HEALTH_TIMEOUT_MS);
+      // Attach the last hook-handler error the worker reported: a plugin whose hook throws on every
+      // event can still answer healthCheck "healthy" while doing nothing useful. This is operator
+      // context, not a verdict override — the worker's own healthCheck stays authoritative.
+      const lastError = this.lastSandboxHookError.get(pluginId);
+      if (!lastError) return result;
+      const note = `last hook error in '${lastError.event}' at ${lastError.at.toISOString()}: ${lastError.error}`;
+      return { healthy: result.healthy, message: result.message ? `${result.message}; ${note}` : note };
+    }
+    const plugin = this.plugins.get(pluginId);
+    if (plugin?.instance?.healthCheck) {
+      return plugin.instance.healthCheck();
+    }
+    return { healthy: true, message: 'Plugin does not implement health check' };
+  }
+
+  /**
+   * Dispatch a queued ingress job into its plugin's live sandbox worker. Called from IngressProcessor,
+   * mirroring checkPluginHealth's sandboxHosts lookup. Throws when the plugin has no live
+   * worker (disabled/crashed since the job was enqueued) or when the worker's handler itself reports
+   * failure (`!result.ok`, e.g. a 502/504/500) — either way BullMQ's retry/DLQ machinery takes over.
+   */
+  async dispatchWebhookForInstance(d: IngressJobData): Promise<void> {
+    const host = this.sandboxHosts.get(d.pluginId);
+    if (!host) {
+      throw new Error('no live sandbox host for plugin ' + d.pluginId);
+    }
+    // Resolve this instance's per-session config (the base merged with the sessionScope override that
+    // provisioning wrote) so the ingress handler reads it as ctx.config — this is what makes a minted
+    // instance multi-tenant. Best-effort: an unresolved plugin just yields undefined (base config only).
+    const plugin = this.plugins.get(d.pluginId);
+    const route = plugin?.manifest.ingress?.find(candidate => candidate.route === d.route);
+    // Reaching dispatch means every authenticating scheme already passed host verification. A route
+    // explicitly configured with scheme:none is unauthenticated and must never be labelled verified.
+    // Missing/hot-swapped route metadata fails closed.
+    const verified = route ? route.signature.scheme !== 'none' : false;
+    const instance = await this.getPluginInstanceService().resolve(d.pluginId, d.instanceId);
+    const config = plugin
+      ? resolvePluginConfig(
+          plugin.config,
+          plugin.sessionConfig,
+          instance?.sessionScope ?? undefined,
+          plugin.manifest.sessionScoped !== false,
+        )
+      : undefined;
+    const result = await host.dispatchWebhook({
+      instanceId: d.instanceId,
+      route: d.route,
+      method: d.method ?? 'POST',
+      headers: d.payload.headers,
+      query: d.payload.query,
+      body: d.payload.body,
+      rawBody: d.payload.rawBody,
+      verified,
+      deliveryId: d.deliveryId,
+      sessionId: d.sessionId,
+      config,
+      timeoutMs: INGRESS_DISPATCH_TIMEOUT_MS,
+    });
+    if (!result.ok) {
+      throw new Error(result.error ?? 'ingress dispatch failed with status ' + result.status);
+    }
+  }
+
+  /**
+   * Resolve MessageService at call time via a lazy require so plugin-loader creates NO top-level
+   * module-load edge to message.service. A static import closes the cycle
+   * plugin-loader -> message -> session -> engine.factory -> core/plugins barrel -> plugin-loader,
+   * which corrupts MessageService's constructor paramtype metadata (SessionService -> undefined) at boot.
+   */
+  private getMessageService(): MessageService {
+    const mod =
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      require('../../modules/message/message.service') as typeof import('../../modules/message/message.service');
+    return this.moduleRef.get(mod.MessageService, { strict: false });
+  }
+
+  private getSessionService(): SessionService {
+    const mod =
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      require('../../modules/session/session.service') as typeof import('../../modules/session/session.service');
+    return this.moduleRef.get(mod.SessionService, { strict: false });
+  }
+
+  /**
+   * Same lazy-require pattern as getMessageService/getSessionService: a static import of the
+   * integration module would add a top-level edge back into plugin-loader's own module graph.
+   */
+  private getConversationMappingService(): ConversationMappingService {
+    const mod =
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      require('../../modules/integration/conversation-mapping.service') as typeof import('../../modules/integration/conversation-mapping.service');
+    return this.moduleRef.get(mod.ConversationMappingService, { strict: false });
+  }
+
+  private getPluginInstanceService(): PluginInstanceService {
+    const mod =
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      require('../../modules/integration/plugin-instance.service') as typeof import('../../modules/integration/plugin-instance.service');
+    return this.moduleRef.get(mod.PluginInstanceService, { strict: false });
+  }
+
+  /**
+   * Resolve the SearchProviderRegistry lazily — search is conditionally loaded (SEARCH_ENABLED=false omits
+   * SearchModule), so the registry may not be registered. Mirrors the lazy-require pattern for
+   * MessageService/SessionService to avoid a static module edge and a DI cycle. Returns undefined when
+   * search is disabled, so the loader can no-op search-provider registration without throwing.
+   */
+  private getSearchRegistry(): SearchProviderRegistry | undefined {
+    try {
+      const mod =
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        require('../../modules/search/search-provider.registry') as typeof import('../../modules/search/search-provider.registry');
+      return this.moduleRef.get(mod.SearchProviderRegistry, { strict: false });
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Enforce a plugin's declared manifest permissions at the capability boundary. A plugin may only
+   * use a capability whose permission string it declares in `manifest.permissions`; anything else
+   * (including a manifest with no permissions) is denied. Runs first in each capability verb so a
+   * missing grant fails fast and uniformly as a PluginCapabilityError.
+   */
+  private assertPermission(manifest: PluginManifest, permission: PluginCapabilityPermission): void {
+    if (!(manifest.permissions ?? []).includes(permission)) {
+      throw new PluginCapabilityError(
+        `Plugin ${manifest.id} is missing the '${permission}' permission required for this capability`,
+      );
+    }
+  }
+
+  /**
+   * Enforce a plugin's manifest session scope. Runs BEFORE any engine/message resolution —
+   * sessionId is supplied by the plugin, so this is the security boundary. Absent = ['*'].
+   */
+  private assertSessionAllowed(manifest: PluginManifest, sessionId: string): void {
+    const allowed = manifest.sessions ?? ['*'];
+    if (!allowed.includes('*') && !allowed.includes(sessionId)) {
+      throw new PluginCapabilityError(`Plugin ${manifest.id} is not permitted to act on session ${sessionId}`);
+    }
+  }
+
+  /** Per-session activation gate: is this plugin currently activated for `sessionId`'s event? */
+  private isHookActive(plugin: PluginInstance, sessionId: string | undefined): boolean {
+    return isPluginActiveForSession(plugin.manifest.sessionScoped ?? true, plugin.activeSessions ?? ['*'], sessionId);
+  }
+
+  /**
+   * The capability session gate. A plugin may act on `sessionId` only if BOTH hold: its manifest scope
+   * allows the session (the static author boundary, assertSessionAllowed) AND the operator has activated
+   * the plugin for that session (the dynamic boundary, the same gate hook dispatch uses). manifest.sessions
+   * alone is not enough — a general adapter ships `['*']` and is scoped by operator activation, so without
+   * the activeSessions check a plugin activated for one session could reach another's engine/mappings/
+   * handover. Defaults (`activeSessions ?? ['*']`, `sessionScoped:false`) preserve every unrestricted flow.
+   */
+  private assertSessionActive(plugin: PluginInstance, sessionId: string): void {
+    this.assertSessionAllowed(plugin.manifest, sessionId);
+    if (!this.isHookActive(plugin, sessionId)) {
+      throw new PluginCapabilityError(`Plugin ${plugin.manifest.id} is not activated for session ${sessionId}`);
+    }
+  }
+
+  /**
+   * Scope-check, then resolve the live engine for a session. getEngine returns undefined for an
+   * unknown OR unstarted session (no throw), so guard it into a defined PluginCapabilityError.
+   * A present-but-not-READY engine throws EngineNotReadyError from the adapter on use (→ 409).
+   */
+  private resolveEngine(plugin: PluginInstance, sessionId: string): IWhatsAppEngine {
+    this.assertSessionActive(plugin, sessionId);
+    const engine = this.getSessionService().getEngine(sessionId);
+    if (!engine) {
+      throw new PluginCapabilityError(`Session ${sessionId} has no active engine (unknown or not started)`);
+    }
+    return engine;
+  }
+
+  /** Engine read capabilities: require the `engine:read` permission, then resolve the live engine. */
+  private resolveEngineRead(plugin: PluginInstance, sessionId: string): IWhatsAppEngine {
+    this.assertPermission(plugin.manifest, PluginCapabilityPermission.ENGINE_READ);
+    return this.resolveEngine(plugin, sessionId);
+  }
+
+  /**
+   * Definitive "this session row no longer exists" probe for the stale-mapping repair paths below.
+   * True ONLY on a clean not-found from the sessions table; any other failure (service unresolvable,
+   * DB error) returns false, so the cross-session fences stay fail-CLOSED when the answer is
+   * indeterminate. The runtime engine map can't answer this — a stopped session has no engine but
+   * still owns its mappings.
+   */
+  private async isSessionGone(sessionId: string): Promise<boolean> {
+    try {
+      await this.getSessionService().findOne(sessionId);
+      return false;
+    } catch (error) {
+      return error instanceof NotFoundException;
+    }
+  }
+
+  /**
+   * Build a worker host for a sandboxed (untrusted) plugin. Overridable so tests can inject a fake
+   * instead of spawning a real OS thread. Production loads the compiled worker bootstrap from dist.
+   */
+  protected createSandboxHost(
+    capDispatcher?: (verb: string, args: unknown[]) => Promise<unknown>,
+    onHookSubscribe?: (event: string, priority?: number) => void,
+    onWebhookSubscribe?: (route: string) => void,
+    onLog?: (level: PluginLogLevel, message: string, meta?: Record<string, unknown>) => void,
+    runWithHookGuard?: (inFlightEvents: string[], run: () => Promise<unknown>) => Promise<unknown>,
+    onSearchProviderRegister?: () => void,
+    onWorkerExit?: (code: number, intentional: boolean) => void,
+  ): PluginWorkerHost {
+    const workerEntry = path.join(__dirname, 'sandbox', 'worker-bootstrap.js');
+    return new PluginWorkerHost(
+      new WorkerThreadChannel({
+        workerEntry,
+        maxOldGenerationSizeMb: SANDBOX_MAX_OLD_GEN_MB,
+        // Withhold host secrets: the worker gets a minimal allowlisted env, not a copy of process.env.
+        env: buildSandboxWorkerEnv(),
+      }),
+      capDispatcher,
+      onHookSubscribe,
+      onWebhookSubscribe,
+      onLog,
+      runWithHookGuard,
+      SANDBOX_MAX_INFLIGHT_CAPS,
+      onSearchProviderRegister,
+      onWorkerExit,
+      this.configService.get<number>('plugins.capTimeoutMs') ?? SANDBOX_CAP_TIMEOUT_MS,
+    );
+  }
+
+  /** Built-in (trusted) enable: require + run the lifecycle in-process with the live capability context. */
+  private async enableInProcess(pluginId: string, plugin: PluginInstance): Promise<void> {
+    const context = this.createPluginContext(plugin);
+
+    if (!plugin.instance) {
+      // Containment guard: reject a manifest.main that escapes the plugin dir.
+      const mainPath = resolvePluginMainPath(this.pluginsDir, pluginId, plugin.manifest.main);
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const pluginModule = require(mainPath) as { default?: new () => IPlugin };
+      if (pluginModule.default) {
+        plugin.instance = new pluginModule.default();
+      } else {
+        throw new Error(`Plugin ${pluginId} does not export a default class`);
+      }
+    }
+
+    if (plugin.instance.onLoad) {
+      await plugin.instance.onLoad(context);
+    }
+    if (plugin.instance.onEnable) {
+      await plugin.instance.onEnable(context);
+    }
+  }
+
+  /**
+   * Untrusted enable: load the plugin in an isolated worker and drive its lifecycle there. Capability
+   * calls and hooks round-trip to the host, which enforces permission + session scope. A failure
+   * tears the worker back down.
+   */
+  private async enableSandboxed(pluginId: string, plugin: PluginInstance): Promise<void> {
+    // Containment guard: reject a manifest.main that escapes the plugin dir.
+    const mainPath = resolvePluginMainPath(this.pluginsDir, pluginId, plugin.manifest.main);
+    // The capability dispatcher runs a worker request through the SAME context an in-process plugin
+    // gets, so permission + session-scope checks (assertPermission / assertSessionActive) apply
+    // identically. The worker can only ask; the host is the gatekeeper.
+    const context = this.createPluginContext(plugin);
+
+    // When the worker subscribes to a hook, register a shim with the hook manager that dispatches the
+    // event into the worker (time-bounded, so a wedged plugin can't stall the chain). The shim looks
+    // the host up at fire time, so disabling the plugin (which removes it + unregisters hooks) stops it.
+    // Harden the IPC boundary against an untrusted worker flooding the host hook registry. HookEvent is
+    // a type-only union and the wire payload is an arbitrary string, so a hostile/buggy worker can post
+    // 'hook-subscribe' with (a) the same event repeatedly and (b) unbounded fabricated event names
+    // ('x:0','x:1',…). Without guards each call adds a live host-side registration (unbounded host-heap
+    // growth + an O(n log n) re-sort). Three guards, all local to this enableSandboxed call (dropped on
+    // disable): reject unknown events (bounds growth to the finite known set + drops events that can
+    // never fire), dedup per event, and a belt-and-suspenders size cap.
+    const subscribedEvents = new Set<HookEvent>();
+    let unknownEventWarned = false;
+    const onHookSubscribe = (event: string, priority?: number): void => {
+      if (!isKnownHookEvent(event)) {
+        if (!unknownEventWarned) {
+          unknownEventWarned = true; // warn at most once per plugin so a flood isn't a log-flood vector
+          this.logger.warn(`Sandboxed plugin ${pluginId} subscribed to an unknown hook event; ignoring`, {
+            pluginId,
+            event,
+            action: 'sandbox_unknown_hook_event',
+          });
+        }
+        return;
+      }
+      if (subscribedEvents.has(event)) return;
+      if (subscribedEvents.size >= KNOWN_HOOK_EVENTS.size) return; // can't exceed the known set
+      subscribedEvents.add(event);
+      // Per-event rate-limit state for the hook-error log; local to this enable call so it is dropped
+      // on disable exactly like subscribedEvents.
+      const hookErrorLogState = new Map<string, { lastAt: number; suppressed: number }>();
+      this.hookManager.register(
+        pluginId,
+        event,
+        async hookCtx => {
+          const liveHost = this.sandboxHosts.get(pluginId);
+          if (!liveHost) return { continue: true };
+          // Per-session activation gate: a session-scoped plugin only sees events for the sessions
+          // it is activated for. Pass-through (don't dispatch into the worker) otherwise.
+          if (!this.isHookActive(plugin, hookCtx.sessionId)) return { continue: true };
+          // Handover gate: once a human has taken over (or closed) a conversation, the bot stops
+          // seeing its inbound messages. Scoped to message:received only — every other hook event is
+          // unaffected. Best-effort + fail-open: a lookup failure (or an event/mapping shape the gate
+          // can't resolve) must never block a normal message from reaching the adapter.
+          if (event === 'message:received') {
+            try {
+              const chatId = (hookCtx.data as { chatId?: string } | undefined)?.chatId;
+              if (chatId && hookCtx.sessionId) {
+                const handover = await this.getConversationMappingService().findHandoverForChat(
+                  hookCtx.sessionId,
+                  chatId,
+                );
+                if (!shouldDispatchToPlugin(handover, pluginId)) return { continue: true };
+              }
+            } catch (error) {
+              this.logger.debug(`Handover gate lookup failed for plugin ${pluginId}; dispatching normally`, {
+                pluginId,
+                event,
+                error: error instanceof Error ? error.message : String(error),
+                action: 'handover_gate_fail_open',
+              });
+            }
+          }
+          return liveHost
+            .dispatchHook({
+              event,
+              data: hookCtx.data,
+              sessionId: hookCtx.sessionId,
+              source: hookCtx.source,
+              // The host resolves the per-session slice (real secrets — the worker is the plugin's
+              // trusted execution context) and ships it; the worker exposes it as ctx.config.
+              config: resolvePluginConfig(
+                plugin.config,
+                plugin.sessionConfig,
+                hookCtx.sessionId,
+                plugin.manifest.sessionScoped !== false,
+              ),
+              timeoutMs: SANDBOX_HOOK_TIMEOUT_MS,
+              onTimeout: () =>
+                this.logger.warn(`Sandboxed plugin ${pluginId} hook '${event}' timed out`, {
+                  pluginId,
+                  event,
+                  action: 'sandbox_hook_timeout',
+                }),
+            })
+            .then(result => {
+              // The worker reports (not throws) a hook-handler failure: surface it host-side instead
+              // of failing open in silence. The chain itself still proceeds fail-open.
+              if (result.error) this.recordSandboxHookError(pluginId, event, result.error, hookErrorLogState);
+              return { continue: result.continue, data: result.data };
+            });
+        },
+        priority,
+      );
+    };
+
+    // When the worker claims an ingress route, record it against the manifest-declared routes so the
+    // host knows which routes this worker will handle. Same hardening as onHookSubscribe (the wire
+    // `route` is an arbitrary untrusted string): drop when the manifest lacks 'webhook:ingress', drop
+    // an undeclared route (warn once), dedup, and cap. subscribedRoutes is local to this enable call,
+    // so it is dropped on disable exactly as subscribedEvents is.
+    const subscribedRoutes = new Set<string>();
+    const declaredRoutes = new Set((plugin.manifest.ingress ?? []).map(r => r.route));
+    const onWebhookSubscribe = makeOnWebhookSubscribe({
+      pluginId,
+      declaredRoutes,
+      hasPermission: (plugin.manifest.permissions ?? []).includes(PluginCapabilityPermission.WEBHOOK_INGRESS),
+      subscribed: subscribedRoutes,
+      maxRoutes: declaredRoutes.size,
+      warn: (message, meta) => this.logger.warn(message, meta),
+    });
+
+    // Route the worker plugin's ctx.logger.* calls to the same per-plugin logger an in-process plugin
+    // uses, so sandboxed plugins log identically (prefixed + structured) instead of bare stdout. The
+    // relay is bounded: oversized lines are truncated and throughput is capped per window — a chatty
+    // or buggy plugin must not flood the host log. Dropped lines are counted and surfaced as one warn
+    // per window (never one line per drop, or the bound itself would be a flood vector), plus a final
+    // flush on worker exit so a plugin that goes quiet first doesn't silently lose the count. State is
+    // local to this enable call, so it resets on disable.
+    let logWindowStart = Date.now();
+    let logCount = 0;
+    let logDropped = 0;
+    const onLog = (level: PluginLogLevel, message: string, meta?: Record<string, unknown>): void => {
+      const now = Date.now();
+      if (now - logWindowStart >= SANDBOX_LOG_WINDOW_MS) {
+        if (logDropped > 0) {
+          this.logger.warn(
+            `Dropped ${logDropped} log messages from sandboxed plugin ${pluginId} (log relay rate limit)`,
+            { pluginId, action: 'sandbox_log_relay_dropped', dropped: logDropped },
+          );
+        }
+        logWindowStart = now;
+        logCount = 0;
+        logDropped = 0;
+      }
+      logCount++;
+      if (logCount > SANDBOX_LOG_MAX_PER_WINDOW) {
+        logDropped++;
+        return;
+      }
+      const bounded =
+        typeof message === 'string' && message.length > SANDBOX_LOG_MAX_MESSAGE_LENGTH
+          ? `${message.slice(0, SANDBOX_LOG_MAX_MESSAGE_LENGTH)}…[truncated]`
+          : message;
+      if (level === 'error') context.logger.error(bounded, undefined, meta);
+      else context.logger[level](bounded, meta);
+    };
+
+    // When the worker declares itself a search provider (ctx.registerSearchProvider →
+    // search-provider-register), register a PluginSearchProvider in the SearchProviderRegistry. The host
+    // is in sandboxHosts by the time registration fires (during onLoad/onEnable), so look it up lazily
+    // like onHookSubscribe. Search disabled (no registry, or SEARCH_PROVIDER=none) → the util skips.
+    const onSearchProviderRegister = (): void => {
+      const liveHost = this.sandboxHosts.get(pluginId);
+      if (!liveHost) return;
+      registerPluginSearchProvider({
+        pluginId,
+        label: `${plugin.manifest.name} (plugin)`,
+        transport: liveHost,
+        timeoutMs: SANDBOX_SEARCH_TIMEOUT_MS,
+        registry: this.getSearchRegistry(),
+        mode: this.configService.get<string>('search.provider', 'auto'),
+      });
+    };
+
+    // A worker that crashes AFTER a successful enable is otherwise invisible to the loader (handleExit only
+    // drains in-flight calls). Drop the plugin's search-provider entry so the registry falls back to
+    // builtin-fts instead of routing every /search to a dead worker (auto mode would otherwise pin the dead
+    // provider ACTIVE). Mirrors the enable-failure cleanup. Broader crash-lifecycle cleanup (status, hooks)
+    // is a pre-existing gap for all bridges and out of scope here.
+    const onWorkerExit = (code: number, intentional: boolean): void => {
+      // Final log-relay flush: the per-window drop warn above only fires when a new line arrives in a
+      // later window, so without this a plugin that goes quiet (or is disabled) before the rollover
+      // silently discards its pending count. The worker is gone, so no further lines can arrive.
+      if (logDropped > 0) {
+        this.logger.warn(
+          `Dropped ${logDropped} log messages from sandboxed plugin ${pluginId} (log relay rate limit)`,
+          { pluginId, action: 'sandbox_log_relay_dropped', dropped: logDropped },
+        );
+        logDropped = 0;
+      }
+      // Always release the search-provider slot so the registry can fall back to builtin-fts. On a crash
+      // this is the only cleanup; on a deliberate disable/enable-failure the explicit unregister already
+      // ran, making this a harmless no-op.
+      unregisterPluginSearchProvider(this.getSearchRegistry(), pluginId);
+      if (intentional) return; // routine disable/enable-failure already logged and expected
+      // Unexpected crash after a successful enable: the worker is gone. Drop the dead host +
+      // unregister the hook shims (so they don't keep dispatching into the dead worker) + mark the
+      // plugin ERROR so the dashboard reflects reality. The dispatchHook/dispatchWebhook dead-checks
+      // fail-fast; this cleanup is the root-cause fix (it also makes the shim's !liveHost guard fire).
+      const crashed = this.plugins.get(pluginId);
+      if (crashed) {
+        crashed.status = PluginStatus.ERROR;
+        crashed.error = `worker exited unexpectedly (code ${code})`;
+        this.pluginStorage.setPluginStatus(pluginId, PluginStatus.ERROR);
+      }
+      this.hookManager.unregisterPlugin(pluginId);
+      this.sandboxHosts.delete(pluginId);
+      this.logger.warn(`Sandboxed plugin ${pluginId} worker exited unexpectedly (code ${code})`, {
+        pluginId,
+        code,
+        action: 'sandbox_worker_exit',
+      });
+    };
+
+    const host = this.createSandboxHost(
+      (verb, args) => dispatchCapabilityVerb(context, verb, args),
+      onHookSubscribe,
+      onWebhookSubscribe,
+      onLog,
+      // Re-establish the in-flight hook context for worker-initiated capability calls, so a sandboxed
+      // plugin that sends from within a send hook can't loop the event back into itself unboundedly.
+      (events, run) => this.hookManager.runInFlight(events as HookEvent[], run),
+      onSearchProviderRegister,
+      onWorkerExit,
+    );
+    this.sandboxHosts.set(pluginId, host);
+    try {
+      await host.load(mainPath, { pluginId, config: plugin.config }, SANDBOX_LIFECYCLE_TIMEOUT_MS);
+      await host.runLifecycle('onLoad', SANDBOX_LIFECYCLE_TIMEOUT_MS);
+      await host.runLifecycle('onEnable', SANDBOX_LIFECYCLE_TIMEOUT_MS);
+    } catch (error) {
+      this.sandboxHosts.delete(pluginId);
+      // Drop a search provider registered mid-onEnable before the failure: without this, a plugin that
+      // registers then throws leaves a dead provider as the ACTIVE registry entry in auto mode, so every
+      // /search routes to a terminated worker → outage. Mirrors disablePlugin's cleanup.
+      unregisterPluginSearchProvider(this.getSearchRegistry(), pluginId);
+      await host.terminate().catch(() => undefined);
+      throw error;
+    }
   }
 
   private createPluginContext(plugin: PluginInstance): PluginContext {
@@ -274,21 +1411,243 @@ export class PluginLoaderService implements OnModuleInit {
         ),
     };
 
+    const hookSession = this.hookSession;
     return {
       pluginId: plugin.manifest.id,
       manifest: plugin.manifest,
-      config: plugin.config,
+      // Per-session: inside a hook, returns the override merged over the base for the firing session;
+      // outside a hook (lifecycle), the base config. A getter so it reflects live config edits too.
+      get config() {
+        return resolvePluginConfig(
+          plugin.config,
+          plugin.sessionConfig,
+          hookSession.getStore()?.sessionId,
+          plugin.manifest.sessionScoped !== false,
+        );
+      },
       hookManager: this.hookManager,
       logger: pluginLogger,
       storage: this.pluginStorage.createPluginStorage(plugin.manifest.id),
       registerHook: (event, handler, priority) => {
-        this.hookManager.register(plugin.manifest.id, event, handler, priority);
+        // Wrap with the per-session activation gate so an in-process plugin only handles events for
+        // the sessions it is activated for (mirrors the sandboxed shim), and scope the firing
+        // sessionId so ctx.config resolves the right per-session slice for the handler.
+        this.hookManager.register(
+          plugin.manifest.id,
+          event,
+          async hookCtx => {
+            if (!this.isHookActive(plugin, hookCtx.sessionId)) return { continue: true };
+            return this.hookSession.run({ sessionId: hookCtx.sessionId }, () => handler(hookCtx));
+          },
+          priority,
+        );
       },
-      getService: <T>(): T | undefined => {
-        // Limited service access for sandboxing
-        // Only expose safe services
-        return undefined;
+      // In-process built-ins are not reached by the ingress pipeline (it dispatches to sandbox hosts),
+      // so fail loud rather than silently never firing. Sandboxed plugins get a real registerWebhook
+      // from the worker bootstrap.
+      registerWebhook: () => {
+        throw new PluginCapabilityError(
+          `Plugin ${plugin.manifest.id}: registerWebhook (ingress) is only available to sandboxed plugins`,
+        );
       },
+      messages: {
+        sendText: async (sessionId, chatId, text) => {
+          // Validate permission + scope + that the session has a live engine BEFORE MessageService
+          // persists a pending row: a missing grant / dead session must fail with
+          // PluginCapabilityError, not a raw TypeError + orphaned row. resolveEngine also runs
+          // assertSessionActive.
+          this.assertPermission(plugin.manifest, PluginCapabilityPermission.MESSAGES_SEND);
+          this.resolveEngine(plugin, sessionId);
+          return this.getMessageService().sendText(sessionId, { chatId, text });
+        },
+        reply: async (sessionId, chatId, quotedMessageId, text) => {
+          this.assertPermission(plugin.manifest, PluginCapabilityPermission.MESSAGES_SEND);
+          this.resolveEngine(plugin, sessionId);
+          return this.getMessageService().reply(sessionId, { chatId, quotedMessageId, text });
+        },
+      } satisfies PluginMessagingCapability,
+      engine: {
+        getGroupInfo: async (sessionId, groupId) => this.resolveEngineRead(plugin, sessionId).getGroupInfo(groupId),
+        getContacts: async sessionId => this.resolveEngineRead(plugin, sessionId).getContacts(),
+        getContactById: async (sessionId, contactId) =>
+          this.resolveEngineRead(plugin, sessionId).getContactById(contactId),
+        checkNumberExists: async (sessionId, phone) =>
+          this.resolveEngineRead(plugin, sessionId).checkNumberExists(phone),
+        getChats: async sessionId => this.resolveEngineRead(plugin, sessionId).getChats(),
+        getChatHistory: async (sessionId, chatId, limit, includeMedia) =>
+          this.resolveEngineRead(plugin, sessionId).getChatHistory(
+            chatId,
+            // Clamp to the REST non-deep ceiling (MessageService.MAX_CHAT_HISTORY_LIMIT = 100) so an
+            // untrusted plugin can't request an unbounded history fetch.
+            Math.min(Math.max(Math.trunc(limit ?? 50), 1), 100),
+            includeMedia ?? false,
+          ),
+        canonicalChatId: (sessionId, chatId) => {
+          // resolveEngineRead is the gate only (engine:read permission + live session); the resolution
+          // itself is a synchronous host lid->phone lookup, not an engine call, mirroring the webhook
+          // from-filter. Not `async` (nothing to await) — a resolved promise satisfies the signature.
+          this.resolveEngineRead(plugin, sessionId);
+          return Promise.resolve(toNeutralJid(chatId, jid => this.lidMappingStore?.getCached(userPart(jid)) ?? null));
+        },
+      } satisfies PluginEngineReadCapability,
+      net: {
+        fetch: async (url, init) => {
+          // Two gates: the declared permission, then the effective host allowlist = manifest net.allow
+          // UNION the hosts of net.allowConfigHosts keys across the base config AND every per-session
+          // override. The host gate has no firing-session context for a sandboxed plugin's cap round-trip,
+          // so admit every operator-configured tenant host (all public + still SSRF-guarded at connect)
+          // rather than resolving a single, possibly wrong (base-only), one. The SSRF guard inside
+          // performPluginFetch still blocks internal IPs even when the host is allowlisted.
+          this.assertPermission(plugin.manifest, PluginCapabilityPermission.NET_FETCH);
+          const netConfigs = [plugin.config ?? {}, ...Object.values(plugin.sessionConfig ?? {})];
+          const allow = [
+            ...new Set(
+              netConfigs.flatMap(cfg =>
+                effectiveNetAllow(plugin.manifest.net?.allow, plugin.manifest.net?.allowConfigHosts, cfg),
+              ),
+            ),
+          ];
+          if (!isNetHostAllowed(allow, url)) {
+            throw new PluginCapabilityError(
+              `Plugin ${plugin.manifest.id} may not fetch ${url} — add its host to net.allow or net.allowConfigHosts`,
+            );
+          }
+          return performPluginFetch(url, init);
+        },
+      } satisfies PluginNetCapability,
+      conversations: buildConversationSendFacade({
+        manifest: plugin.manifest,
+        assertPermission: this.assertPermission.bind(this),
+        assertSessionActive: (sessionId: string) => this.assertSessionActive(plugin, sessionId),
+        resolveChatId: async env => {
+          if (!env.instanceId || !env.source?.externalConversationId) {
+            throw new PluginCapabilityError(
+              `Plugin ${plugin.manifest.id}: conversation.send requires chatId, or both instanceId and source to resolve one`,
+            );
+          }
+          const mapping = await this.getConversationMappingService().getByProvider(
+            plugin.manifest.id,
+            env.instanceId,
+            env.source.externalConversationId,
+          );
+          if (!mapping) {
+            throw new PluginCapabilityError(
+              `Plugin ${plugin.manifest.id}: no conversation mapping for instance ${env.instanceId} / ${env.source.externalConversationId}`,
+            );
+          }
+          // Fail closed on a cross-session mapping: getByProvider keys on (pluginId, instanceId,
+          // providerConversationId) only, so a stale row can resolve to a chat owned by a DIFFERENT
+          // session than the envelope's. Parity with the assertSessionActive(m.sessionId) check on
+          // mappings.getByProvider below — never send through a session the mapping does not belong to.
+          // (mapping.sessionId is NOT NULL in the entity, so a plain inequality check suffices. The
+          // env.sessionId guard is for the type only — the facade rejects a missing sessionId first.)
+          if (env.sessionId && mapping.sessionId !== env.sessionId) {
+            // Repair path: the mapping's session was DELETED (operator re-paired under a new id), so
+            // the row is stale rather than cross-session. Rebind it to the envelope's session —
+            // already activation-gated by the facade — and let the send proceed; without this the
+            // dead session's rows bricked conversation.send permanently. A mapping owned by another
+            // EXISTING session is a genuine cross-session violation and still throws.
+            if (await this.isSessionGone(mapping.sessionId)) {
+              await this.getConversationMappingService().rebindSession(mapping.id, env.sessionId);
+              this.logger.warn(
+                `Rebound conversation mapping for instance ${env.instanceId} / ${env.source.externalConversationId} ` +
+                  `from deleted session ${mapping.sessionId} to ${env.sessionId}`,
+                { pluginId: plugin.manifest.id, action: 'conversation_mapping_rebound' },
+              );
+              return mapping.chatId;
+            }
+            throw new PluginCapabilityError(
+              `Plugin ${plugin.manifest.id}: conversation mapping for instance ${env.instanceId} / ${env.source.externalConversationId} belongs to session ${mapping.sessionId}, not ${env.sessionId}`,
+            );
+          }
+          return mapping.chatId;
+        },
+        // Re-establish the in-flight hook context around the downstream send so an adapter that calls
+        // conversation.send from within its own ingress handling can't echo-loop back into itself via
+        // its own outbound message:sending hook. Gate on an ALREADY-in-flight event (mirrors the
+        // worker-cap wrap's `inFlight.length > 0` check): a plain top-level send must NOT suppress
+        // message:sending for unrelated observers (audit/moderation) — only genuine re-entrancy does.
+        runGuarded: (events, run) =>
+          (events as HookEvent[]).some(e => this.hookManager.isInFlight(e))
+            ? this.hookManager.runInFlight(events as HookEvent[], run)
+            : run(),
+        sendText: (sessionId, opts) => this.getMessageService().sendText(sessionId, opts),
+        reply: (sessionId, opts) => this.getMessageService().reply(sessionId, opts),
+        sendMedia: (sessionId, opts) => dispatchConversationMedia(this.getMessageService(), sessionId, opts),
+        sendLocation: (sessionId, opts) => this.getMessageService().sendLocation(sessionId, opts),
+      } satisfies Parameters<typeof buildConversationSendFacade>[0]) satisfies PluginConversationsCapability,
+      handover: {
+        set: async (key, state) => {
+          // Same gate as conversation.send: flipping handover is part of owning the conversation, so
+          // it reuses CONVERSATION_SEND rather than adding a new permission.
+          this.assertPermission(plugin.manifest, PluginCapabilityPermission.CONVERSATION_SEND);
+          this.assertSessionActive(plugin, key.sessionId);
+          const mapping = await this.getConversationMappingService().get({
+            sessionId: key.sessionId,
+            chatId: key.chatId,
+            pluginId: plugin.manifest.id,
+            instanceId: key.instanceId,
+          });
+          if (!mapping) {
+            throw new PluginCapabilityError(
+              `Plugin ${plugin.manifest.id}: no conversation mapping for session ${key.sessionId} / chat ${key.chatId} / instance ${key.instanceId}`,
+            );
+          }
+          await this.getConversationMappingService().setHandover(mapping.id, state);
+        },
+      } satisfies PluginHandoverCapability,
+      mappings: {
+        upsert: async (key, providerConversationId) => {
+          this.assertPermission(plugin.manifest, PluginCapabilityPermission.CONVERSATION_SEND);
+          this.assertSessionActive(plugin, key.sessionId);
+          const mappingKey = {
+            sessionId: key.sessionId,
+            chatId: key.chatId,
+            pluginId: plugin.manifest.id,
+            instanceId: key.instanceId,
+          };
+          try {
+            await this.getConversationMappingService().upsert(mappingKey, providerConversationId);
+          } catch (error) {
+            if (!(error instanceof ConversationMappingConflict)) throw error;
+            // The reverse unique key is held by another row. If that row's session was DELETED
+            // (operator re-paired under a new id), the adapter can never converge — the forward key
+            // carries the new sessionId, so every upsert bricks on the dead session's row. Supersede
+            // the stale row and retry once. A row owned by an EXISTING session is a genuine conflict
+            // and rethrows.
+            const stale = await this.getConversationMappingService().getByProvider(
+              plugin.manifest.id,
+              key.instanceId,
+              providerConversationId,
+            );
+            if (!stale || !(await this.isSessionGone(stale.sessionId))) throw error;
+            await this.getConversationMappingService().delete(stale.id);
+            await this.getConversationMappingService().upsert(mappingKey, providerConversationId);
+          }
+        },
+        get: async key => {
+          this.assertPermission(plugin.manifest, PluginCapabilityPermission.CONVERSATION_SEND);
+          this.assertSessionActive(plugin, key.sessionId);
+          const m = await this.getConversationMappingService().get({
+            sessionId: key.sessionId,
+            chatId: key.chatId,
+            pluginId: plugin.manifest.id,
+            instanceId: key.instanceId,
+          });
+          return m ? { providerConversationId: m.providerConversationId, handoverState: m.handoverState } : null;
+        },
+        getByProvider: async (instanceId, providerConversationId) => {
+          this.assertPermission(plugin.manifest, PluginCapabilityPermission.CONVERSATION_SEND);
+          const m = await this.getConversationMappingService().getByProvider(
+            plugin.manifest.id,
+            instanceId,
+            providerConversationId,
+          );
+          // Parity with get/upsert: a plugin may only read a mapping for a session it is activated for.
+          if (m) this.assertSessionActive(plugin, m.sessionId);
+          return m ? { sessionId: m.sessionId, chatId: m.chatId, handoverState: m.handoverState } : null;
+        },
+      } satisfies PluginMappingsCapability,
     };
   }
 
@@ -321,16 +1680,30 @@ export class PluginLoaderService implements OnModuleInit {
   // Built-in Plugin Registration (for Phase 4)
   // ============================================================================
 
-  registerBuiltInPlugin(manifest: PluginManifest, instance: IPlugin): void {
+  registerBuiltInPlugin(manifest: PluginManifest, instance: IPlugin, config: Record<string, unknown> = {}): void {
+    // Merge: env-derived defaults stay live each boot (so a changed .env wins), while an operator's
+    // persisted overrides win for the keys they actually set. Engine config is wholly env-derived
+    // (no persisted overrides), so it is never frozen to a first-boot snapshot.
+    const effectiveConfig = { ...config, ...(this.pluginStorage.getPluginConfig(manifest.id) ?? {}) };
+
     const pluginInstance: PluginInstance = {
       manifest,
       status: PluginStatus.INSTALLED,
-      config: {},
+      config: effectiveConfig,
       instance,
       loadedAt: new Date(),
+      builtIn: true,
+      // Read persisted per-session activation + config back into the runtime, like loadPlugin —
+      // otherwise the delivery gate falls back to all-sessions/base-config after every restart for a
+      // session-scoped built-in the operator had restricted.
+      activeSessions: this.pluginStorage.getPluginSessions(manifest.id) ?? undefined,
+      sessionConfig: this.pluginStorage.getPluginSessionConfig(manifest.id) ?? undefined,
     };
 
     this.plugins.set(manifest.id, pluginInstance);
+
+    // Ensure a registry entry exists so later enable/disable/config writes persist.
+    this.ensureRegistryEntry(manifest, true);
 
     this.logger.debug(`Built-in plugin registered: ${manifest.name}`, {
       pluginId: manifest.id,
