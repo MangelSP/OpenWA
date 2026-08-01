@@ -190,6 +190,8 @@ services:
       # Security
       - API_MASTER_KEY=${API_MASTER_KEY:-}
       - TRUSTED_PROXIES=${TRUSTED_PROXIES:-}
+      # SSRF allowlist for webhook URL validation (e.g. host.docker.internal for local dev).
+      - SSRF_ALLOWED_HOSTS=${SSRF_ALLOWED_HOSTS:-}
       # Forward the plain-HTTP dashboard CSP override; unset preserves the application default.
       - CSP_UPGRADE_INSECURE_REQUESTS=${CSP_UPGRADE_INSECURE_REQUESTS:-}
       # Docker socket proxy (openwa-api never touches /var/run/docker.sock directly)
