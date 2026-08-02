@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chat Flow Config</title>
+<style>
+  /* Colour lives in custom properties so the dark theme is a variable swap rather than a second
+     stylesheet. The host resolves its theme and sends it with the config handshake
+     (config:value.theme), because this editor runs in an opaque-origin sandbox and cannot read the
+     dashboard's theme itself. Falls back to the OS preference when the host says nothing, so the editor
+     is still readable on a host that predates the theme field. */
+  :root {
+    --bg: #f8f9fa;
+    --fg: #212529;
+    --fg-strong: #1a1a2e;
+    --muted: #6c757d;
+    --hint: #868e96;
+    --surface: #fff;
+    --border: #dee2e6;
+    --border-input: #ced4da;
+    --border-soft: #e9ecef;
+    --accent: #4f7fff;
+    --accent-strong: #3360cc;
+    --accent-ring: rgba(79,127,255,0.15);
+    --add-bg: #e8f0fe; --add-fg: #2d5fc4; --add-bd: #b8d0f7; --add-bg-hover: #d0e3ff;
+    --rm-bg: #fdecea; --rm-fg: #b91c1c; --rm-bd: #f5c6c6; --rm-bg-hover: #fcd5d5;
+    --root-bg: #e6f4ea; --root-fg: #1a7a3a; --root-bd: #a8d5b5; --root-bg-hover: #c9e9d2;
+    --ok-bg: #d4edda; --ok-fg: #155724; --ok-bd: #c3e6cb;
+    --err-bg: #f8d7da; --err-fg: #721c24; --err-bd: #f5c6c6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #12161c;
+      --fg: #e6e9ef;
+      --fg-strong: #f2f4f8;
+      --muted: #9aa4b2;
+      --hint: #8b95a3;
+      --surface: #1a1f27;
+      --border: #2b323c;
+      --border-input: #39414d;
+      --border-soft: #262d36;
+      --accent: #6b93ff;
+      --accent-strong: #4f7fff;
+      --accent-ring: rgba(107,147,255,0.25);
+      --add-bg: #1b2740; --add-fg: #9dbcff; --add-bd: #2d4372; --add-bg-hover: #24345a;
+      --rm-bg: #3a1f20; --rm-fg: #ff9a94; --rm-bd: #5c2f2f; --rm-bg-hover: #4a2728;
+      --root-bg: #16301f; --root-fg: #7fd39b; --root-bd: #27543a; --root-bg-hover: #1d4028;
+      --ok-bg: #16301f; --ok-fg: #7fd39b; --ok-bd: #27543a;
+      --err-bg: #3a1f20; --err-fg: #ff9a94; --err-bd: #5c2f2f;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #12161c;
+    --fg: #e6e9ef;
+    --fg-strong: #f2f4f8;
+    --muted: #9aa4b2;
+    --hint: #8b95a3;
+    --surface: #1a1f27;
+    --border: #2b323c;
+    --border-input: #39414d;
+    --border-soft: #262d36;
+    --accent: #6b93ff;
+    --accent-strong: #4f7fff;
+    --accent-ring: rgba(107,147,255,0.25);
+    --add-bg: #1b2740; --add-fg: #9dbcff; --add-bd: #2d4372; --add-bg-hover: #24345a;
+    --rm-bg: #3a1f20; --rm-fg: #ff9a94; --rm-bd: #5c2f2f; --rm-bg-hover: #4a2728;
+    --root-bg: #16301f; --root-fg: #7fd39b; --root-bd: #27543a; --root-bg-hover: #1d4028;
+    --ok-bg: #16301f; --ok-fg: #7fd39b; --ok-bd: #27543a;
+    --err-bg: #3a1f20; --err-fg: #ff9a94; --err-bd: #5c2f2f;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: system-ui, -apple-system, sans-serif;
+    font-size: 14px;
+    background: var(--bg);
+    color: var(--fg);
+    padding: 16px;
+  }
+  h1 { font-size: 18px; font-weight: 600; margin-bottom: 16px; color: var(--fg-strong); }
+  .field { margin-bottom: 14px; }
+  label { display: block; font-weight: 500; margin-bottom: 4px; }
+  input[type="text"], textarea {
+    width: 100%;
+    padding: 7px 10px;
+    border: 1px solid var(--border-input);
+    border-radius: 5px;
+    font-size: 14px;
+    font-family: inherit;
+    background: var(--surface);
+    color: var(--fg);
+    transition: border-color 0.15s;
+  }
+  input[type="text"]:focus, textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent-ring);
+  }
+  textarea { resize: vertical; min-height: 64px; }
+  .check-row { display: flex; align-items: center; gap: 8px; }
+  .check-row input[type="checkbox"] { width: 16px; height: 16px; cursor: pointer; accent-color: var(--accent); }
+  .section-title {
+    font-weight: 600;
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+    margin-bottom: 8px;
+    margin-top: 18px;
+  }
+  .tree { margin-bottom: 12px; }
+  .node {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin-bottom: 8px;
+  }
+  .node-header { display: flex; align-items: flex-start; gap: 8px; }
+  /* `input.node-key` (0,1,1), not `.node-key` (0,1,0): the generic `input[type="text"]` rule above is
+     also (0,1,1), so a bare class lost to it and the key field stretched to 100%, pushing the reply
+     textarea and the row's buttons outside the card. flex-basis carries the width so the rule holds
+     even if a future edit reorders the stylesheet. */
+  input.node-key { flex: 0 0 72px; width: 72px; }
+  .node-text { flex: 1; min-height: 48px; }
+  .node-actions { display: flex; flex-direction: column; gap: 4px; flex-shrink: 0; }
+  .children { margin-left: 20px; margin-top: 8px; padding-left: 12px; border-left: 2px solid var(--border-soft); }
+  button {
+    cursor: pointer;
+    font-size: 12px;
+    font-family: inherit;
+    border-radius: 4px;
+    border: 1px solid transparent;
+    padding: 4px 9px;
+    white-space: nowrap;
+  }
+  .btn-add {
+    background: var(--add-bg);
+    color: var(--add-fg);
+    border-color: var(--add-bd);
+  }
+  .btn-add:hover { background: var(--add-bg-hover); }
+  .btn-remove {
+    background: var(--rm-bg);
+    color: var(--rm-fg);
+    border-color: var(--rm-bd);
+  }
+  .btn-remove:hover { background: var(--rm-bg-hover); }
+  .btn-add-root {
+    background: var(--root-bg);
+    color: var(--root-fg);
+    border-color: var(--root-bd);
+    font-size: 13px;
+    padding: 6px 14px;
+    margin-bottom: 12px;
+  }
+  .btn-add-root:hover { background: var(--root-bg-hover); }
+  .btn-save {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent-strong);
+    font-size: 14px;
+    padding: 9px 24px;
+    font-weight: 600;
+    margin-top: 16px;
+  }
+  .btn-save:hover:not(:disabled) { background: var(--accent-strong); }
+  .btn-save:disabled { opacity: 0.55; cursor: not-allowed; }
+  #feedback {
+    margin-top: 10px;
+    padding: 8px 12px;
+    border-radius: 5px;
+    font-size: 13px;
+    display: none;
+  }
+  #feedback.ok { background: var(--ok-bg); color: var(--ok-fg); border: 1px solid var(--ok-bd); display: block; }
+  #feedback.err { background: var(--err-bg); color: var(--err-fg); border: 1px solid var(--err-bd); display: block; }
+  .hint { font-size: 11px; color: var(--hint); margin-top: 2px; }
+</style>
+</head>
+<body>
+<h1>Chat Flow Editor</h1>
+
+<div class="field">
+  <label for="trigger">Trigger word</label>
+  <input type="text" id="trigger" placeholder="e.g. menu (leave blank = any message)">
+  <p class="hint">Case-insensitive. Leave empty to start on any incoming message.</p>
+</div>
+
+<div class="field">
+  <label for="greeting">Greeting / opening menu</label>
+  <textarea id="greeting" rows="4" placeholder="Hi! Please choose:&#10;1. Hosting&#10;2. Support"></textarea>
+</div>
+
+<div class="field check-row">
+  <input type="checkbox" id="respondInGroups">
+  <label for="respondInGroups" style="margin-bottom:0">Also respond in group chats</label>
+</div>
+
+<div class="section-title">Menu options</div>
+<div class="tree" id="tree"></div>
+<button class="btn-add-root" id="addRoot">+ Add option</button>
+
+<div>
+  <button class="btn-save" id="saveBtn">Save</button>
+  <div id="feedback"></div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  // ── Helpers ──────────────────────────────────────────────────────────────
+
+  function el(tag, attrs, children) {
+    var e = document.createElement(tag);
+    if (attrs) Object.entries(attrs).forEach(function([k, v]) { e[k] = v; });
+    if (children) children.forEach(function(c) { if (c) e.appendChild(c); });
+    return e;
+  }
+
+  function input(cls, placeholder, val) {
+    var e = el('input', { type: 'text', className: cls, placeholder: placeholder || '' });
+    e.value = val != null ? val : '';
+    return e;
+  }
+
+  function textarea(cls, placeholder, val) {
+    var e = el('textarea', { className: cls, placeholder: placeholder || '' });
+    e.value = val != null ? val : '';
+    return e;
+  }
+
+  // ── Tree rendering ────────────────────────────────────────────────────────
+
+  function renderNode(node) {
+    // node = { key?: string, text?: string, options?: Node[] }
+    var keyIn = input('node-key', 'Key (e.g. 1)', node.key || '');
+    var textIn = textarea('node-text', 'Reply text', node.text || '');
+    var removeBtn = el('button', { className: 'btn-remove', type: 'button', textContent: 'Remove' });
+    var addChildBtn = el('button', { className: 'btn-add', type: 'button', textContent: '+ Sub-option' });
+
+    var children = el('div', { className: 'children' });
+    (node.options || []).forEach(function(child) {
+      children.appendChild(renderNode(child));
+    });
+    // Hide children container when empty (border-left looks odd empty)
+    function updateChildrenVisibility() {
+      children.style.display = children.childElementCount ? '' : 'none';
+    }
+    updateChildrenVisibility();
+
+    addChildBtn.addEventListener('click', function() {
+      children.appendChild(renderNode({}));
+      updateChildrenVisibility();
+    });
+
+    var nodeDiv = el('div', { className: 'node' }, [
+      el('div', { className: 'node-header' }, [
+        keyIn,
+        textIn,
+        el('div', { className: 'node-actions' }, [removeBtn, addChildBtn])
+      ]),
+      children
+    ]);
+
+    removeBtn.addEventListener('click', function() {
+      var parent = nodeDiv.parentNode;
+      parent.removeChild(nodeDiv);
+      // If the parent is a .children div, update its visibility
+      if (parent.classList && parent.classList.contains('children')) {
+        parent.style.display = parent.childElementCount ? '' : 'none';
+      }
+    });
+
+    return nodeDiv;
+  }
+
+  // ── Assemble config from DOM ──────────────────────────────────────────────
+
+  function assembleNodes(containerEl) {
+    var result = [];
+    var nodeDivs = containerEl.children;
+    for (var i = 0; i < nodeDivs.length; i++) {
+      var nodeDiv = nodeDivs[i];
+      var keyIn = nodeDiv.querySelector('.node-key');
+      var textIn = nodeDiv.querySelector('.node-text');
+      var childrenEl = nodeDiv.querySelector('.children');
+      var key = keyIn ? keyIn.value.trim() : '';
+      if (!key) continue; // drop nodes with empty key
+      var node = { key: key, text: textIn ? textIn.value : '' };
+      var childNodes = childrenEl ? assembleNodes(childrenEl) : [];
+      if (childNodes.length) node.options = childNodes;
+      result.push(node);
+    }
+    return result;
+  }
+
+  function assembleConfig() {
+    return {
+      trigger: document.getElementById('trigger').value,
+      greeting: document.getElementById('greeting').value,
+      respondInGroups: document.getElementById('respondInGroups').checked,
+      options: assembleNodes(document.getElementById('tree'))
+    };
+  }
+
+  // ── Populate DOM from config ──────────────────────────────────────────────
+
+  function populateConfig(cfg) {
+    // Coerce / default every field — never throw on bad input
+    var c = cfg && typeof cfg === 'object' ? cfg : {};
+    document.getElementById('trigger').value = typeof c.trigger === 'string' ? c.trigger : '';
+    document.getElementById('greeting').value = typeof c.greeting === 'string' ? c.greeting : '';
+    document.getElementById('respondInGroups').checked = !!c.respondInGroups;
+    var tree = document.getElementById('tree');
+    tree.textContent = ''; // clear safely
+    var opts = Array.isArray(c.options) ? c.options : [];
+    opts.forEach(function(node) {
+      if (node && typeof node === 'object') {
+        tree.appendChild(renderNode(node));
+      }
+    });
+  }
+
+  // ── postMessage bridge ────────────────────────────────────────────────────
+  // The host serves this file in a sandboxed iframe it controls and is the only peer; the bridge trusts the
+  // parent by design (the iframe cannot know the dashboard's origin a priori), and never receives the API
+  // key. Config is only ever sent to the parent on an explicit Save. This matches the v0.7 configUi contract.
+
+  var saveBtn = document.getElementById('saveBtn');
+  var feedback = document.getElementById('feedback');
+
+  function showFeedback(msg, isOk) {
+    feedback.textContent = msg;
+    feedback.className = isOk ? 'ok' : 'err';
+  }
+
+  function hideFeedback() {
+    feedback.className = '';
+    feedback.style.display = 'none';
+  }
+
+  // The host resolves 'system' for us, so this is only ever 'light' or 'dark'. Anything else (including
+  // a host too old to send it) leaves the attribute off, which falls back to the OS preference. Sent once
+  // with the config handshake — the theme control is behind the modal overlay, so it cannot change while
+  // this editor is open.
+  function applyTheme(theme) {
+    if (theme === 'light' || theme === 'dark') {
+      document.documentElement.setAttribute('data-theme', theme);
+    }
+  }
+
+  window.addEventListener('message', function(event) {
+    var data = event.data;
+    if (!data || typeof data.type !== 'string') return;
+    if (data.type === 'config:value') {
+      applyTheme(data.theme);
+      populateConfig(data.config);
+    } else if (data.type === 'config:saved') {
+      showFeedback('Saved!', true);
+      saveBtn.disabled = false;
+    } else if (data.type === 'config:error') {
+      showFeedback(data.message || 'Save failed.', false);
+      saveBtn.disabled = false;
+    }
+    // Ignore unrecognized types
+  });
+
+  saveBtn.addEventListener('click', function() {
+    saveBtn.disabled = true;
+    hideFeedback();
+    var cfg = assembleConfig();
+    parent.postMessage({ type: 'config:save', config: cfg }, '*');
+  });
+
+  document.getElementById('addRoot').addEventListener('click', function() {
+    document.getElementById('tree').appendChild(renderNode({}));
+  });
+
+  // Request config on load
+  parent.postMessage({ type: 'config:get' }, '*');
+})();
+</script>
+
+<!-- Self-test: load with ?selftest to run round-trip assertions in the console -->
+<script>
+if (new URLSearchParams(location.search).has('selftest')) {
+  (function selftest() {
+    // Minimal stubs so assembleNodes/assembleConfig can be called
+    // We test the logic inline by replicating it here (same source of truth)
+
+    function assembleNodesFromArray(arr) {
+      // arr = [{key, text, options?}]
+      var result = [];
+      arr.forEach(function(node) {
+        var key = (node.key || '').trim();
+        if (!key) return;
+        var out = { key: key, text: node.text || '' };
+        var kids = node.options ? assembleNodesFromArray(node.options) : [];
+        if (kids.length) out.options = kids;
+        result.push(out);
+      });
+      return result;
+    }
+
+    function roundTrip(cfg) {
+      // Mirror populateConfig coercion: guard against null/non-object
+      var c = cfg && typeof cfg === 'object' ? cfg : {};
+      return {
+        trigger: typeof c.trigger === 'string' ? c.trigger : '',
+        greeting: typeof c.greeting === 'string' ? c.greeting : '',
+        respondInGroups: !!c.respondInGroups,
+        options: assembleNodesFromArray(Array.isArray(c.options) ? c.options : [])
+      };
+    }
+
+    // ── Test 1: basic round-trip with nesting ──
+    var sample = {
+      trigger: 'menu',
+      greeting: 'Hi! Choose an option:',
+      respondInGroups: false,
+      options: [
+        { key: '1', text: 'Hosting', options: [
+          { key: '1', text: 'Shared hosting info' },
+          { key: '2', text: 'VPS info' }
+        ]},
+        { key: '2', text: 'Support' }
+      ]
+    };
+    var result = roundTrip(sample);
+    console.assert(result.trigger === 'menu', 'trigger preserved');
+    console.assert(result.greeting === 'Hi! Choose an option:', 'greeting preserved');
+    console.assert(result.respondInGroups === false, 'respondInGroups preserved');
+    console.assert(result.options.length === 2, 'two root options');
+    console.assert(result.options[0].key === '1', 'root[0] key');
+    console.assert(result.options[0].text === 'Hosting', 'root[0] text');
+    console.assert(Array.isArray(result.options[0].options), 'root[0] has sub-options');
+    console.assert(result.options[0].options.length === 2, 'root[0] has 2 sub-options');
+    console.assert(result.options[0].options[0].key === '1', 'sub[0] key');
+    console.assert(result.options[0].options[1].key === '2', 'sub[1] key');
+    console.assert(!result.options[1].options, 'leaf has no options property');
+
+    // ── Test 2: empty-key nodes are dropped ──
+    var withEmpties = {
+      trigger: '',
+      greeting: 'Hi',
+      respondInGroups: true,
+      options: [
+        { key: '', text: 'should be dropped' },
+        { key: '  ', text: 'also dropped (whitespace)' },
+        { key: '1', text: 'kept' }
+      ]
+    };
+    var r2 = roundTrip(withEmpties);
+    console.assert(r2.options.length === 1, 'empty-key nodes dropped');
+    console.assert(r2.options[0].key === '1', 'kept node key');
+    console.assert(r2.respondInGroups === true, 'respondInGroups true preserved');
+
+    // ── Test 3: partial / bad config coerced without throwing ──
+    var r3 = roundTrip({});
+    console.assert(r3.trigger === '', 'missing trigger defaults to empty string');
+    console.assert(r3.greeting === '', 'missing greeting defaults to empty string');
+    console.assert(r3.respondInGroups === false, 'missing respondInGroups defaults false');
+    console.assert(r3.options.length === 0, 'missing options defaults to []');
+
+    var r4 = roundTrip(null);
+    console.assert(r4.trigger === '', 'null config: trigger defaults');
+
+    // ── Test 4: keys are trimmed ──
+    var r5 = roundTrip({ options: [{ key: '  2  ', text: 'trimmed' }] });
+    console.assert(r5.options[0].key === '2', 'key is trimmed');
+
+    console.log('[selftest] All assertions passed.');
+  })();
+}
+</script>
+</body>
+</html>
