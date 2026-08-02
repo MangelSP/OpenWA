@@ -16,7 +16,8 @@ func (q *ListSessionsQuery) values() url.Values {
 }
 
 // SessionResponse describes a WhatsApp session. Status is one of: created,
-// initializing, qr_ready, authenticating, ready, disconnected, failed.
+// initializing, qr_ready, authenticating, ready, disconnected, action_required,
+// failed.
 type SessionResponse struct {
 	ID          string  `json:"id"`
 	Name        string  `json:"name"`
@@ -28,6 +29,11 @@ type SessionResponse struct {
 	CreatedAt   string  `json:"createdAt,omitempty"`
 	UpdatedAt   string  `json:"updatedAt,omitempty"`
 	LastError   *string `json:"lastError,omitempty"`
+	// EngineLoaded reports whether the gateway holds a live engine for this session -- the
+	// precondition stop/logout/force-kill require and start refuses. Not derivable from Status:
+	// "disconnected" covers both a session mid automatic-reconnect (engine present) and one stopped
+	// with no engine. Nil from a gateway that predates the field.
+	EngineLoaded *bool `json:"engineLoaded,omitempty"`
 }
 
 // CreateSessionRequest is the body for creating a session. ProxyType is one of:

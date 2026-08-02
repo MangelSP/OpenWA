@@ -228,6 +228,7 @@
     "qr_ready": "Scanner le QR",
     "ready": "Connecté",
     "disconnected": "Déconnecté",
+    "action_required": "Action requise",
     "failed": "Échec",
     "authenticating": "Authentification..."
   },
@@ -296,6 +297,7 @@
       "start": "Démarrer",
       "stop": "Arrêter",
       "reconnect": "Reconnecter",
+      "unlink": "Dissocier",
       "delete": "Supprimer",
       "killStuck": "Arrêter (bloquée)"
     },
@@ -304,6 +306,8 @@
       "readyDesc": "La session WhatsApp est maintenant connectée",
       "disconnectedTitle": "Session déconnectée",
       "disconnectedDesc": "La session WhatsApp a été déconnectée",
+      "actionRequiredTitle": "Action requise",
+      "actionRequiredDesc": "Cette session nécessite votre attention. Ouvrez la session pour voir quoi faire.",
       "failedTitle": "Échec de la session",
       "failedDesc": "Le démarrage de la session WhatsApp a échoué. Ouvrez la session pour en voir la raison."
     },
@@ -323,6 +327,18 @@
       "failedTitle": "Échec de l'arrêt forcé",
       "failed": "Échec de l'arrêt forcé de la session."
     },
+    "unlink": {
+      "title": "Dissocier l'appareil",
+      "message": "Dissocier la session <strong>\"{{name}}\"</strong> du compte WhatsApp ?",
+      "warning": "WhatsApp retire cet appareil des Appareils associés du compte et la session s'arrête. La reconnexion nécessite un nouveau scan QR ou un code d'appairage. Pour effacer aussi toutes les données locales, supprimez ensuite la session.",
+      "confirm": "Dissocier",
+      "successTitle": "Appareil dissocié",
+      "success": "Dissociation terminée : l'appareil a été déconnecté et les identifiants de session locaux ont été effacés. Reconnecter nécessite un nouveau QR code ou code d'association.",
+      "failedTitle": "Échec de la dissociation",
+      "failed": "Impossible de dissocier la session.",
+      "incompleteTitle": "Dissociation incomplète",
+      "incomplete": "La session s'est arrêtée localement, mais l'opération de déconnexion est incomplète — l'appareil peut encore être associé. Démarrez la session et relancez la dissociation."
+    },
     "pairing": {
       "tabQr": "Code QR",
       "tabPhone": "Lier avec un numéro de téléphone",
@@ -340,6 +356,10 @@
       "step3": "<strong>3.</strong> Appuyez sur <strong>Connecter un appareil</strong>, puis sur <strong>Lier avec un numéro de téléphone</strong>",
       "step4": "<strong>4.</strong> Saisissez sur votre téléphone le code à 8 caractères affiché ci-dessus",
       "waitingConnection": "En attente de la liaison de votre téléphone…"
+    },
+    "start": {
+      "teardownPendingTitle": "Démarrage de la session",
+      "teardownPending": "Un nettoyage d'identifiants pour cette session est encore en cours. Patientez un instant et réessayez."
     }
   },
   "webhooks": {

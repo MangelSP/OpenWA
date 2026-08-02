@@ -235,6 +235,7 @@
     "qr_ready": "סריקת QR",
     "ready": "מחובר",
     "disconnected": "מנותק",
+    "action_required": "נדרשת פעולה",
     "failed": "נכשל",
     "authenticating": "מאמת..."
   },
@@ -303,6 +304,7 @@
       "start": "הפעלה",
       "stop": "עצירה",
       "reconnect": "התחברות מחדש",
+      "unlink": "ביטול קישור",
       "delete": "מחיקה",
       "killStuck": "סגור תקוע"
     },
@@ -311,6 +313,8 @@
       "readyDesc": "ה-Session של WhatsApp מחובר",
       "disconnectedTitle": "ה-Session נותק",
       "disconnectedDesc": "ה-Session של WhatsApp נותק",
+      "actionRequiredTitle": "נדרשת פעולה",
+      "actionRequiredDesc": "ה-Session הזה דורש את תשומת לבך. פתחו את ה-Session כדי לראות מה לעשות.",
       "failedTitle": "ה-Session נכשל",
       "failedDesc": "ה-Session של WhatsApp נכשל באתחול. פתחו את ה-Session כדי לראות את הסיבה."
     },
@@ -330,6 +334,18 @@
       "failedTitle": "הסגירה בכוח נכשלה",
       "failed": "סגירת הסשן בכוח נכשלה."
     },
+    "unlink": {
+      "title": "ביטול קישור המכשיר",
+      "message": "לבטל את קישור הסשן <strong>\"{{name}}\"</strong> מחשבון הוואטסאפ?",
+      "warning": "וואטסאפ תסיר מכשיר זה מרשימת המכשירים המקושרים של החשבון והסשן ייעצר. ההתחברות מחדש דורשת סריקת QR חדשה או קוד התאמה. כדי למחוק גם את כל הנתונים המקומיים, מחק את הסשן לאחר מכן.",
+      "confirm": "ביטול קישור",
+      "successTitle": "המכשיר נותק",
+      "success": "ביטול הקישור הושלם: המכשיר נותק ואישורי הסשן המקומיים נמחקו. חיבור מחדש דורש סריקת QR חדשה או קוד הוראה.",
+      "failedTitle": "ביטול הקישור נכשל",
+      "failed": "לא ניתן לבטל את קישור הסשן.",
+      "incompleteTitle": "ביטול קישור חלקי",
+      "incomplete": "הסשן נעצר מקומית, אך פעולת ההתנתקות אינה מושלמת — ייתכן שהמכשיר עדיין מקושר. הפעל את הסשן ונסה שוב את ביטול הקישור."
+    },
     "pairing": {
       "tabQr": "קוד QR",
       "tabPhone": "קישור עם מספר טלפון",
@@ -347,6 +363,10 @@
       "step3": "<strong>3.</strong> יש להקיש על <strong>קישור מכשיר</strong>, ולאחר מכן על <strong>קישור עם מספר טלפון במקום זאת</strong>",
       "step4": "<strong>4.</strong> יש להזין במכשיר את הקוד בן 8 התווים המוצג למעלה",
       "waitingConnection": "ממתין לקישור המכשיר שלך…"
+    },
+    "start": {
+      "teardownPendingTitle": "הפעלת סשן",
+      "teardownPending": "פירוק אישורים לסשן זה עדיין מתבצע. המתן רגע ונסה שוב."
     }
   },
   "webhooks": {

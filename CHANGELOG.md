@@ -7,6 +7,869 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.4] - 2026-08-02
+
+A large internal release with a deliberately small external surface: roughly 30,000 changed lines,
+almost all of it code motion. The five largest god objects at 0.12.3 were decomposed into cohesive
+units — both engine adapters into per-domain delegates, `SessionService` into a lifecycle owner plus
+focused collaborators, `InfraController` into four controllers by resource, the plugin sandbox IPC
+bridge out of the plugin loader, and the `Chats` dashboard page into per-section components — along
+with the largest god methods in the webhook dispatcher, the queue processor, the bulk-message
+batcher and the storage service. The largest single method in the codebase went from 8,366 to 4,819
+characters.
+
+None of it was meant to change behavior, and the HTTP contract bears that out: the 129 paths in
+`openapi.json`, their methods, parameters, request bodies, response schemas, security requirements
+and all 68 component schemas are identical to 0.12.3. The entries below cover the externally visible
+consequences.
+
+### Changed
+
+- **12 `operationId` values in `openapi.json` were renamed.** `InfraController` was split into four
+  controllers by resource — `InfraStatusController`, `InfraConfigController`, `InfraDataController`
+  and `InfraStorageController` — and NestJS derives an operation's id from its controller class name,
+  so every `/api/infra` operation is now `Infra<Resource>Controller_<method>` instead of
+  `InfraController_<method>` (for example `InfraController_getStatus` →
+  `InfraStatusController_getStatus`). 12 of the specification's 158 operations are affected, all of
+  them under `/api/infra`.
+
+  Nothing on the wire moved. The 129 paths, their HTTP methods, parameters, request bodies, response
+  schemas, security requirements and the 68 component schemas are byte-identical to 0.12.3 — a client
+  that calls the REST API by URL needs no change at all. The rename matters only if you generate a
+  client from the specification and its generator names methods after `operationId`: those method
+  names change, and the generated client has to be regenerated.
+
+- **A file attached but not yet sent in Dashboard > Chats is now dropped when you open a different
+  conversation.** Previously the staged file outlived the room it was picked in: attaching in one
+  chat, going back, and opening another left the attachment sitting in the second chat's composer,
+  where the next send would deliver it to the wrong recipient. It is now cleared as soon as another
+  chat is opened, and cleared when the session is switched.
+
+  Closing and reopening the *same* room still keeps it, so the round trip is lossless — the same
+  guarantee the typed message draft already had. Both lifetimes are pinned by regression tests.
+
+## [0.12.3] - 2026-08-01
+
+### Fixed
+
+- **A plugin whose code is missing can now be switched off.** `enabledByOperator` is the standing
+  instruction to enable a plugin on every boot, and the only way to withdraw it is
+  `POST /api/plugins/{id}/disable`. That route answered 404 whenever the plugin was not loaded — which
+  is exactly the state an install lands in when its package directory is gone: an interrupted update,
+  or a directory that was never on the data volume. The registry entry survives with its config,
+  `ctx.storage` and the enable decision intact, so reinstalling the code brought the plugin straight
+  back up and no API call could prevent it. The only way out was hand-editing `registry.json`:
+  `DELETE /api/plugins/{id}` answers 404 in the same state and for the same reason, so uninstalling
+  was not an escape either.
+
+  `disable` records intent rather than performing a runtime operation, so it now clears the decision
+  against the registry when the plugin is not loaded and reports
+  `Plugin {id} is not loaded; it will not be enabled on boot`. This is the same reasoning the route
+  already applied to a plugin sitting in `error` after a failed restore. 404 is now reserved for an id
+  with no registry entry at all. Nothing is skipped in the process: there is no runtime in this state,
+  so no lifecycle hook goes unrun and no worker is left behind.
+
+- **Eight settings written to `data/.env.generated` were silently ignored under the bundled Docker
+  Compose stack.** `docker-compose.yml` forwards a variable as `- KEY=${KEY:-}` so a real host value
+  reaches the container; with nothing set, that line renders an *empty* value. An empty value still
+  occupies `process.env`, and both lower-priority layers — the project `.env` and
+  `data/.env.generated` — are loaded with dotenv `override: false`, which will not replace a key that
+  is already present, blank or not. `clearBlankEnv` exists to delete exactly those blanks before the
+  files load, but its key list had drifted behind the compose file: `AUTO_START_SESSIONS`,
+  `BODY_SIZE_LIMIT`, `API_MASTER_KEY`, `TRUSTED_PROXIES`, `CSP_UPGRADE_INSECURE_REQUESTS`,
+  `WWEBJS_WEB_VERSION`, `WWEBJS_WEB_VERSION_REMOTE_PATH` and `WWEBJS_AUTH_TIMEOUT_MS` were forwarded
+  but never cleared. Setting any of them in `data/.env.generated` — a file the first-run header
+  invites operators to edit directly — did nothing, with no error and no warning.
+
+  `AUTO_START_SESSIONS` is the one that got noticed, and it is worth being precise about the shape of
+  the regression. The bundled *production* compose gained its forward in 0.12.0 — before that it had
+  none, so an operator's `data/.env.generated` supplied the flag unobstructed, because there was no
+  blank value to shadow it. (The *dev* compose has forwarded it since 0.10.0, defaulting it to `true`.)
+  Adding the production forward without the matching clear entry therefore did not relocate an older
+  failure; it switched off the one route that had been working. The flag resolved to off,
+  `SessionService`'s bootstrap hook returned before it looked at a single session, and previously
+  authenticated sessions stayed at `disconnected` with no engine ever created and a null
+  `lastError`. (#981)
+
+  The clear list is now covered by a test that derives the expected set from `docker-compose.yml` and
+  `docker-compose.dev.yml`, so a forward added without its clear entry fails in CI rather than
+  shipping inert.
+
+- **Restarting from Dashboard > Infrastructure no longer reloads the page into an error.** The restart
+  modal polls the server and reloads once it answers, but it polled `GET /api/infra/health` — a plain
+  ping with no knowledge of shutdown. That endpoint keeps answering `200` for the entire drain window
+  and the engine teardown that follows, so the very first poll, three seconds in, was answered by the
+  process that had just been asked to exit. The modal declared success and reloaded two seconds later,
+  by which time the old process was gone and the new one had not yet bound its port — leaving the
+  operator on a 502/503 from their reverse proxy until they refreshed by hand several times.
+
+  The poll now targets `GET /api/health/ready`, which reports `503` the moment draining starts and
+  keeps reporting it until both databases answer. The page therefore reloads only once the new process
+  is genuinely serving, and it waits for the databases too rather than only for the port to open.
+
+  With the poll now waiting for real readiness, its deadline started to matter for the first time.
+  It was a fixed 60 attempts at one second, while `POST /api/infra/restart` estimates up to 63 seconds
+  for a restart that brings up PostgreSQL, Redis and MinIO together — so a full-profile restart could
+  have reported failure while the stack was still coming up correctly. The deadline is now derived
+  from the estimate the server already returns, with the old 60 as a floor. (#1019)
+
+- **`backup.sh` could archive a database the application had stopped using.** Both scripts resolved
+  every path from the process environment alone, while the application fills the same settings from
+  three layers: the environment, then `./.env`, then `<data dir>/.env.generated` — the file Dashboard >
+  Infrastructure writes. An install configured through the dashboard was therefore backed up at the
+  *default* paths.
+
+  That is not reliably loud. A missing database already failed the run, but a database left at a
+  default path from before the operator switched was archived instead and the run exited 0. A backup
+  that captured an abandoned database announces itself only during a restore. `backup.sh` was already
+  copying `.env.generated` into the archive without ever reading it.
+
+  Both scripts now resolve through the same three layers, in the application's order, so an explicit
+  environment value still wins. Only plain `KEY=value` lines are honoured: a value containing a quote
+  or a `#` anywhere is reported on stderr and skipped rather than guessed at, because a silently
+  mis-parsed path is the failure being fixed. That is deliberately broader than trailing comments — a
+  password containing `#` is skipped too, loudly, and must be passed in the environment. The Postgres
+  connection details `pg_dump` uses resolve the same way, so a dashboard-provisioned database no
+  longer needs its credentials restated in the operator's shell.
+
+- **`cp .env.example .env` pinned 23 settings the dashboard is supposed to own.** Configuration is
+  filled from the process environment, then `.env`, then `data/.env.generated`, each supplying only
+  what the previous layer left unset. Every value shipped uncommented in `.env.example` therefore
+  became a permanent pin the moment an operator followed the documented setup step: the matching
+  dashboard control still moved, saved and reported success, while the running value never changed.
+
+  The blank-forward fix above cannot reach this. `clearBlankEnv` runs before `.env` is read, so it
+  only clears blanks arriving from the process environment. A value in `.env` — including an *empty*
+  one, since dotenv treats `KEY=` as present rather than absent — is never cleared. The copied
+  `DATABASE_TYPE=sqlite` was enough on its own to shadow a dashboard switch to Postgres, leaving the
+  app quietly on SQLite; and for an operator who had also set `DATABASE_TYPE=postgres` by hand, the
+  copied `DATABASE_PASSWORD=` then shadowed the password the dashboard had provisioned and the next
+  production boot refused to start. The dashboard could not warn about either, because the save-time
+  guard reads a snapshot taken before `.env` was loaded and so validated the file value it was writing
+  rather than the one that would win.
+
+  All 23 blank-forwarded keys are now commented out with their defaults shown, so copying the file no
+  longer pins any of them, and a test derives that set from both compose files and fails if one is
+  shipped uncommented again. Each was checked against its application-level default first; none
+  changes behaviour *silently* when absent — `DATABASE_USERNAME` has no application default at all, so
+  under `DATABASE_TYPE=postgres` it now fails boot validation naming the variable instead of resolving
+  to `openwa`. One further exception is called out in the file: the dev compose defaults an unset
+  `AUTO_START_SESSIONS` to `true`, so a dev stack that had inherited `false` from a copied
+  `.env.example` now gets the dev default it was always meant to have.
+
+  Five dashboard-managed keys are **not** covered, because they have no compose forward and so fall
+  outside both the fix and its guard: `POSTGRES_BUILTIN`, `REDIS_BUILTIN`, `MINIO_BUILTIN`,
+  `DATABASE_SSL` and `DATABASE_SSL_REJECT_UNAUTHORIZED`. Copying `.env.example` still pins those.
+
+- **A link posted to a Channel gets a sharp preview thumbnail again** (whatsapp-web.js engine).
+  WhatsApp Web selects a different preview transport for newsletters, and `whatsapp-web.js` 1.34.7
+  calls `WAWebLinkPreviewChatAction.getLinkPreview(link)` with the destination chat omitted — so the
+  action could not select that transport even though the message was afterwards handed to the
+  newsletter send job. The preview was built as if for an ordinary chat, which is why the same URL
+  rendered correctly in a 1-on-1 conversation and arrived blurred or empty on a Channel.
+
+  The function takes two parameters — read off the live WhatsApp Web build, `getLinkPreview` reports
+  arity 2 — so the chat now fills a parameter the function actually declares rather than one that
+  would be ignored. It is applied the way the existing `201832` fix already is: an exact transform of
+  the installed dependency, skipped when already present and refused outright on any other shape.
+  `postinstall` applies it best-effort so a local install never hard-fails, while the production image
+  build runs it strictly, turning dependency drift into a build failure rather than an image that
+  silently ships without it. The message-edit path is unchanged and still uses the old call. (#1006)
+
+## [0.12.2] - 2026-08-01
+
+### Changed
+
+- **The live engine is reachable through its own narrow port instead of through the session lifecycle
+  owner.** Ten feature services (contacts, groups, labels, channels, calls, profile, catalog, status,
+  and both message services) injected the whole 2.9k-line `SessionService` purely to reach its private
+  `engines` map, which coupled every one of them to start/stop/delete/reconnect semantics they never
+  call. The map now lives in `EngineRegistry`, exported from the (already global) `EngineModule`, so
+  those services depend on "give me the running engine for this session" and eight feature modules no
+  longer import `SessionModule` at all. `SessionService` remains the only writer, and the services
+  that genuinely drive the lifecycle (`MessageService` for `findOne`/edit recording, `InfraController`
+  for orphan reaping) still hold it deliberately. No API change: each call site keeps its own error, so
+  contacts/labels/groups/channels/calls/profile still answer 400 `Session is not started`,
+  catalog/status still answer 404 `not found or not connected`, and the two message services keep their
+  distinct wording. `openapi.json` is unchanged, byte for byte.
+
+  The engine-identity rule that guards every lifecycle path — a late callback from a superseded engine
+  must never mutate a session that now belongs to a different one, or to none — was open-coded at
+  around twenty call sites as `isLiveEngine(id, e) && engines.delete(id)`. It is now `isLive` /
+  `deleteIfLive` on the registry, written once.
+
+- **Six self-contained concerns were lifted out of `SessionService`.** Each was previously reachable
+  only by driving the full session lifecycle, so the trickiest logic in the file had the least direct
+  coverage. The `@lid`→phone read-through cache became `SessionLidResolver` (and took an `@Optional`
+  constructor dependency with it); the reconnect backoff *decision* became a pure `decideReconnect()`
+  with injected clock and jitter, leaving the service to apply only the effects; the liveness watchdog
+  became `SessionLivenessWatchdog`, which owns its interval and failure counter and reports back
+  through a single `onDead` callback; the per-message serialization chain became a general
+  `KeyedMutationQueue`; every path that turns an engine message callback into a persisted row —
+  live inbound, own-send echo, ack reconciliation, revoke, reactions, edits and history backfill —
+  became `MessageProjector`, which owns the one mutation chain that IS the per-message ordering
+  guarantee; and the transient failure reason behind `lastError` became `SessionErrorStore`, the one
+  map that eight lifecycle paths write and exactly one reader — the session read model — consumes.
+
+  Behaviour is unchanged. The existing session specs still pass, edited only mechanically: they
+  register the new collaborators as real providers (not mocks) and reach their state instead of the
+  service's own fields — no assertion was changed or removed. The split adds 69 tests over branches
+  that previously needed hours of uptime or live engine callbacks to reach: the FIFO eviction that
+  bounds the lid cache, the stability reset that stops a long-lived
+  session slowly wedging `FAILED` across unrelated transient drops, the loop-alert re-arm after a
+  stable stretch, the non-finite-delay fallback that keeps an operator typo from becoming a relaunch
+  storm, the watchdog's stale-result guard for an engine superseded mid-probe, and the mutation-chain
+  reclamation that stops the map growing once per message touched.
+
+  The three message-persist paths (live inbound, own-send echo, history backfill) also stop
+  re-deriving their shared row mapping: `buildMessageMetadata()` now states the one deliberate
+  difference between them (inbound trusts the engine's media field; the two paths known to lose media
+  synthesize the omitted marker that keeps a row from rendering as an empty bubble and dropping out of
+  the by-type stats), and `storableWaMessageId()` makes the empty-sentinel chokepoint real rather than
+  a comment repeated at each call site.
+
+  `initializeEngine` itself drops from 801 lines to 324. Nearly all of it was engine-callback bodies
+  inlined into one object literal, which hid the wiring — which events exist, and in what order —
+  under the handling; the five largest (inbound message, own-send echo, ack, ready, revoke) are now
+  named methods and the function reads as the event table it is. Pure code motion: each method takes
+  the same captured `(id, engine)` the closure did, so the stale-generation identity guards are
+  unchanged.
+
+- **The session lifecycle no longer imports the whatsapp-web.js adapter to size a timeout.** The
+  deadline `SessionService` races `engine.initialize()` against is engine-agnostic — it applies to
+  Baileys sessions too — but it was derived inline from `resolveAuthTimeoutMs()`, which the adapter
+  owned, so the lifecycle owner depended on one specific engine's module for a value it applies to
+  all of them. Both the env parse and the derivation now live in `engine/engine-init-timeout.ts`, and
+  the adapter re-exports `resolveAuthTimeoutMs` for the callers that legitimately reach it through
+  the engine they are configuring.
+
+  Pure code motion — the derived deadline is identical, and both
+  `whatsapp-web-js.adapter.spec.ts` and `session.service.spec.ts` pass with no edits. The wwjs-named
+  `WWEBJS_AUTH_TIMEOUT_MS` still feeds the shared floor, which is documented rather than changed: it
+  can only ever raise the deadline above 60s, never lower it, so a Baileys session gets a more
+  generous window and never a shorter one. Splitting the two engines' windows needs its own env var
+  and is a behaviour change, not a move.
+
+- **`data/.env.generated` has one declared location instead of three derived ones.** `InfraController`
+  re-built `path.resolve(process.cwd(), 'data', '.env.generated')` at each of its three readers — the
+  built-in-flag fallback behind the Docker probe, the config form's hydrate, and the merge base the
+  save path then writes back over — which made the file an undeclared dependency shared between
+  reading infrastructure status, rendering the form, and persisting credentials. Those are otherwise
+  independent concerns that touch none of the same state, so moving the file would have been a
+  three-site edit with nothing to catch a missed one. `generated-env.ts` now owns the path and the
+  parse.
+
+  Pure code motion: `infra.controller.spec.ts` passes with no edits, and the path is still resolved
+  per call rather than captured at import. `database/load-cli-env.ts` deliberately keeps its own copy
+  — it resolves the same filename against an injected `cwd` so it stays testable without `chdir`, and
+  folding it in would remove that seam.
+
+### Fixed
+
+- **Installed plugin code now lands in the same tree as the plugin registry.** `PLUGINS_DIR` defaulted
+  to `./plugins` while `PluginStorageService` kept the registry — status, operator config, secrets,
+  `enabledByOperator` — under `<dataDir>/plugins`. The two halves of one install therefore defaulted to
+  two different trees: the loader scanned a directory that did not exist and reported "Loaded 0
+  plugins" while the registry still listed every plugin as installed. Under Docker it was worse than
+  confusing, because `/app/data` is the mounted volume and `./plugins` is not: an installed plugin's
+  code went into the ephemeral container layer and was destroyed by the next `docker compose up -d`,
+  while its config and secrets survived in the registry — a plugin that vanished on every recreate
+  with nothing in the logs pointing at why. The default is now `<dataDir>/plugins`, derived from the
+  same constant the registry path is built from so the two cannot drift apart again.
+
+  Existing installs keep working: when `PLUGINS_DIR` is unset, the old `./plugins` is still scanned as
+  a compatibility fallback, *in addition to* the configured directory (a host part-way through
+  migrating keeps both halves; the configured copy loads first and wins a duplicate id). The fallback
+  is keyed on actually finding a plugin package — a non-dot subdirectory with a `manifest.json` — not
+  on the directory existing, because `<dataDir>/plugins/<id>` doubles as each plugin's `ctx.storage`
+  dir and is routinely full of directories that hold only state. Setting `PLUGINS_DIR` disables the
+  fallback outright: an operator who named the directory has said where plugins live.
+
+- **A restart no longer overwrites the sessions an operator bound a plugin instance to.** The boot
+  scope reconciler re-derived a plugin's `activeSessions` from each instance row, which silently
+  discarded an explicit `PUT /api/plugins/{id}/sessions` — `activeSessions` is restored from
+  `registry.json` and already encodes the outcome of every prior decision, including that one. It also
+  re-bound the plugin to the row's scope even when that session had since been deleted, leaving the
+  plugin activated for a session id nothing will ever match. The boot path is now **additive**: it only
+  ever adds the row's scope and removes nothing. Retiring `'*'` on a concrete activation remains a
+  provisioning-time decision, where the operator is actually narrowing the plugin.
+
+  A concrete scope that matches no session row is now also logged once at boot
+  (`scope_binding_session_missing`). Such an instance receives no events while every signal an operator
+  can read stays reassuring — the row says `enabled`, the plugin's status says `enabled`, hooks are
+  registered and `healthCheck` is green — so this line is the only place that inertness surfaces. It is
+  diagnostic only and never alters the binding: the id may legitimately come back via an import or a
+  re-provision.
+
+- **Plugin health no longer reports a hook error from a worker that already died.** The last
+  hook-handler error a sandboxed plugin reported is operator context on
+  `GET /api/plugins/{id}/health`, and it is scoped to one worker generation — the field's contract was
+  "a fresh enable starts from a clean slate". It was cleared only on `disablePlugin`, but a worker
+  crash and a failed enable both end a generation without going through disable. The replacement
+  worker therefore inherited the dead one's error, and health reported it as current: an operator
+  restarting a plugin to clear a fault saw the same fault reported against the healthy worker that
+  replaced it.
+
+  The record is now cleared where a generation *starts*, so it holds for every way one can end rather
+  than for the single path that happened to be handled.
+
+- **A rolled-back `POST /api/infra/import-data` no longer denies the engines it already stopped.** The
+  orphan pre-flight runs *before* the transaction opens, and `stopOrphans: true` really destroys those
+  engines there — a teardown the rollback cannot undo. Both rollback branches nevertheless returned a
+  hardcoded `restartRequired: false` with three empty orphan arrays, so an operator who hit a per-row
+  warning read "nothing was stopped, no restart needed" while their sessions were in fact down. They
+  now report what actually happened, exactly as the success path already did.
+
+  `restartRequired` on that path narrows to the one thing a rollback cannot undo: a **failed** teardown,
+  which may have left a Chromium/socket alive. A cleanly stopped orphan leaves its session row intact
+  (restart it with `POST /sessions/{id}/start`), and an engine `force` left running was never orphaned
+  after all, because the data that would have orphaned it was not replaced. The response shape is
+  unchanged and `openapi.json` is untouched — only the values were wrong.
+
+- **A missing dashboard asset returns 404 instead of the SPA shell.** `ServeStaticModule`'s built-in
+  fallback answered *every* unmatched GET with `index.html`, so a mistyped or stale `<script src>`
+  came back `200 text/html` and the browser reported a JavaScript syntax error from parsing the HTML
+  shell — pointing at the wrong file and hiding a broken build. `main.ts` already serves dashboard
+  documents (it injects the per-response CSP nonce, so it must own them) and is correctly narrow:
+  it skips `/assets`, and only answers extensionless paths or explicit `text/html` navigations. The
+  module's own catch-all is now disabled so that handler is the single owner. Client-side routes are
+  unaffected.
+
+  This also repairs a deployment shape that was broken outright: when the install path contains a
+  dot-segment (`~/.openwa`, a checkout under `~/.cache`, a `TMPDIR` inside a dotdir), the built-in
+  fallback sent the index by **absolute** path and Express's `send` refuses dot-segments under its
+  default `dotfiles: 'ignore'` — so every client-side route 404'd while `/` and the hashed assets
+  kept working. The e2e lock now runs its whole matrix against both path shapes, with a fixture
+  guard asserting the two really differ (`os.tmpdir()` is not reliably dot-free, and using it
+  blindly collapsed both cases onto one shape and hid exactly this bug).
+
+- **The non-root smoke test can actually be run.** `scripts/smoke-test-non-root.sh` carried a UTF-8
+  BOM ahead of its `#!/bin/sh`, and neither it nor `scripts/smoke-test-docker-proxy.sh` had the
+  executable bit — so the `./scripts/…` invocation both of them document failed outright. The image
+  runs its process as a non-root user by dropping privileges in the entrypoint rather than by a
+  `USER` directive, which is a runtime property no static check can see, and this script is the only
+  thing that verifies it. CI's shellcheck step now covers every script in `scripts/` instead of three
+  of them; the BOM is exactly what it reports as SC1082, so the narrow scope is what let it survive.
+
+- **An e2e run no longer rewrites the developer's `data/.api-key`.** The bootstrap key file is written
+  on first boot (which every e2e run is, having no keys yet) and unlinked when that key is revoked or
+  deleted. Its path was a module const evaluated at import from `process.cwd()`, so nothing could
+  redirect it — an e2e boot whose setup already redirects both databases still reached straight into
+  the real repo-root `data/.api-key`. The four file operations now have one owner
+  (`bootstrap-key-file.ts`) that resolves the path per call and honours a `BOOTSTRAP_KEY_FILE`
+  override, which the e2e setup points at the same throwaway temp dir as the databases. The file is an
+  operator convenience only — never read for seeding or authentication — so this changes nothing about
+  how a key is issued or validated.
+
+- **Opening or closing the QR modal no longer rebuilds the session start/stop/logout handlers.**
+  `applySessionResponse` read `qrData` to decide whether the modal it was clearing belonged to the
+  session being updated, so `qrData?.sessionId` had to sit in its dependency array — and all three
+  lifecycle handlers hold that callback. The functional updater form removes the read and the
+  dependency with it, and is the more correct shape besides: it sees the CURRENT modal rather than
+  whichever one was captured when the callback was last built.
+
+- **A message for a chat the sidebar does not yet have refetches the chat list once, not twice.**
+  The sidebar updater called `loadChats()` from inside a `setChats` updater; React double-invokes
+  updaters under `StrictMode` (which `main.tsx` enables), so the refetch fired twice per such message
+  in development. The decision now lives in a reducer that REPORTS `needsSidebarRefetch` and the caller
+  fires the refetch once, outside the updater — a shape that cannot hide a side effect the way an
+  inline updater could. Both sidebar reducers moved to `utils/chatList.ts`, which also makes the
+  reorder rules, the location-label substitution and the #583 LID-echo suppression reachable from a
+  test for the first time.
+
+- **A stray directory under `data/plugins` no longer reads as a plugin fault.** Anything in there
+  without a `manifest.json` is skipped and logged, once per directory on every boot. The wording was a
+  bare "Plugin `<name>` missing manifest.json", which describes an internal failure rather than a
+  directory the loader simply does not recognise — an operator reporting an unrelated session problem
+  pasted two of these lines as evidence for it. The message now names what was skipped and what to do
+  about it. The `manifest_missing` action key is unchanged, so existing log filters still match.
+
+- **`.env.example` records when `AUTO_START_SESSIONS` began taking effect under Docker Compose.** The
+  bundled `docker-compose.yml` did not forward the variable into the container before v0.12.0, and
+  nothing else could supply it — there is no `env_file:` entry, `.env` is not mounted, and the build
+  context excludes it. Setting the flag on an earlier version therefore did nothing at all, and
+  authenticated sessions stayed `disconnected` after every restart with no indication why. The
+  forwarding itself was fixed in v0.12.0; this only stops the sample config from implying the value was
+  always live.
+
+### Removed
+
+- `scripts/openwa.sh`, an orchestration helper superseded by the in-process Docker orchestration on
+  `/api/infra`. It had no reference from `package.json`, any workflow, the Dockerfile, either compose
+  file, or the documentation.
+
+### Security
+
+- **⚠️ Four unfixed Chromium CVEs are accepted in the `linux/arm64` image.** `CVE-2026-16804`,
+  `-16805`, `-16806` and `-16807` affect the `chromium`, `chromium-common` and `chromium-sandbox`
+  packages. They are arm64-only by construction: Chrome for Testing publishes no linux-arm64 build,
+  so the amd64 image uses CfT while arm64 installs Debian's chromium — the amd64 image is unaffected.
+  **There is no fixed package to upgrade to:** the image carries `150.0.7871.181-1~deb12u1`, and the
+  fixed `151.0.7922.47-1` exists only in Debian sid — bookworm and trixie are both still on `150.x`,
+  so neither a rebuild nor a move to trixie clears it.
+
+  Two of the four (`-16804`, `-16807`) are sandbox escapes, and the image already runs Chromium with
+  `--no-sandbox` (the container is the confinement boundary: `cap_drop ALL`, `no-new-privileges`,
+  read-only rootfs), so they buy an attacker nothing. The other two are use-after-free / arbitrary
+  code execution in Blink, and those are **not** neutralised by that: Chromium renders sender-
+  controlled content, so a crafted message is a plausible path to code execution as the `openwa` user
+  inside the arm64 container. This is accepted so the release can ship while Debian has no fixed
+  build — not because it is harmless. **Operators running arm64 who cannot accept this should stay on
+  their current image until the entry is removed.** The four are recorded in `.trivyignore` with the
+  removal condition: drop them once bookworm ships `chromium >= 151.0.7922.47`.
+
+- **A sandboxed plugin can no longer serve the gateway's search queries without declaring a permission
+  for it.** `ctx.registerSearchProvider` is installed unconditionally in every worker context, and a
+  plugin declares itself a provider by sending `search-provider-register` over IPC — a path that never
+  passes through the capability router gating `ctx.messages` / `ctx.net` / `ctx.engine`. Nothing between
+  that declaration and the `SearchProviderRegistry` consulted the manifest, and under the shipped default
+  `SEARCH_PROVIDER=auto` a registered provider is also made **active**, superseding `builtin-fts`. A
+  plugin that declared no permissions at all could therefore see every query `GET /api/search` serves.
+
+  Registration now requires the new `search:provide` permission. A plugin without it is refused before
+  the provider reaches the registry, the active provider is left untouched, and the host logs one
+  warning (`sandbox_search_provider_denied`) — bounded to a single line per enable, because
+  `WorkerSearchRegistry` posts the declaration only on the plugin's first call. The check is warned
+  rather than silently dropped (as the ingress-subscribe guard does) because there is no manifest
+  `search` array, so no load-time validation can catch it and an operator would otherwise get no signal.
+  `hasPermission` is a required field of `RegisterPluginSearchProviderDeps`, so the compiler — not
+  reviewer discipline — is what keeps a future call site from re-opening the gap.
+
+  **Action required for search-provider plugins:** add `"permissions": ["search:provide"]` to the
+  manifest. Plugins that do not provide search are unaffected, as are all first-party plugins. No
+  gateway payload changes.
+
+## [0.12.1] - 2026-07-30
+
+### Added
+
+- **The session payload reports whether the gateway holds a live engine** (`engineLoaded`). This is the
+  precondition the lifecycle routes actually enforce, and `status` was never a reliable proxy for it:
+  `disconnected` means both "the engine is still registered while an automatic reconnect backs off,
+  and `start` therefore answers 400" and "the session was stopped and has no engine, so `start` is
+  exactly the right call". The dashboard now derives Stop, Unlink, Force-Kill and Start from the field
+  instead of guessing from the status, which closes the case where a session dropped mid-reconnect
+  offered only Start, got a 400, and then left a QR dialog open that could never resolve — and, in the
+  other direction, hid Force-Kill from precisely the wedged engine that button exists for. Added to
+  `openapi.json` and to the JavaScript, Python, Go and Java SDKs (the PHP SDK returns untyped arrays);
+  it is a new optional field on the response, so existing clients are unaffected. A dashboard served
+  by an older gateway falls back to the previous status-based rule rather than reading a missing field
+  as "no engine".
+
+- **The whatsapp-web.js onboarding modal can be dismissed on a non-English WhatsApp Web.** The detector
+  matches the modal's visible confirm label, which is `Continue` only while the page renders in
+  English. Two changes: Chromium is now launched with a pinned `--lang` so the page locale is
+  deterministic across the amd64 and arm64 images (an explicit `--lang` in `PUPPETEER_ARGS` still
+  wins, and the pin is applied even when that variable replaces the default flags — otherwise
+  customising args for an unrelated reason would silently drop it); and
+  `WWEBJS_ONBOARDING_CONTINUE_LABELS` accepts additional labels for a deployment whose modal is
+  localised anyway. An operator-supplied label is matched without the English heading check, which
+  would reject the very modal it targets; the default `Continue` keeps that check, so the
+  out-of-the-box false-positive surface is unchanged.
+
+### Fixed
+
+- **A session awaiting operator action is watched again, without being taken over.** The liveness
+  watchdog skipped every non-`ready` session, so once a session moved to `action_required` its page
+  was never probed again — if it died while waiting for a human, nothing recorded that anywhere. It is
+  now probed, but the result is observed only: a failure is logged and never accrues toward the
+  disconnect threshold, never publishes a `session.disconnected`, and never schedules a reconnect.
+  Acting on it would hand the session to the reconnect path and silently clear the very status that
+  asked for attention, which stays the operator's to clear with a stop and a start. The warning is
+  emitted once per unresponsive stretch rather than once per probe, since a session can legitimately
+  sit in that state until someone reaches it, and a recovery is logged so an earlier warning is not
+  left as the last word.
+
+- **A delete refused while a credential teardown is in flight no longer leaves a status it cannot
+  honour.** That refusal (`409 SESSION_NAME_TEARDOWN_PENDING`) happens after the engine has already
+  been destroyed and evicted, so the surviving row kept reading `ready` — or whatever it was — for a
+  session with nothing behind it, until something else wrote the status. The row is now reconciled to
+  `disconnected` before the refusal propagates. The earlier of the two fences needs no such handling:
+  nothing has run by then, so its status is still accurate.
+
+- **A WhatsApp-initiated logout that arrives during an unrelated teardown no longer hides its
+  credential removal.** whatsapp-web.js emits `disconnected: LOGOUT` and then runs
+  `authStrategy.logout()` → `fs.rm` of the session's profile directory, and that removal happens
+  regardless of what the adapter's listener does. The listener returned early whenever a teardown had
+  already latched — which `stop()`, `destroy()` and `force-kill` all do — so in that window the
+  in-flight removal was never registered, the name-keyed teardown fence saw nothing pending, and a
+  following `start()` under the same name could have its freshly written credentials deleted by it.
+  This is the same hazard the fence was built for, reached through a narrower window. The removal is
+  now surfaced before the latch check, and skipped only when the adapter's own `logout()` started it —
+  that path already registers the real `Client.logout()` promise, which covers the same removal.
+
+- **The dashboard no longer fabricates a session status after a start.** It wrote a local
+  `status: 'connecting'` — a value the gateway does not emit — while keeping every other field from
+  before the request, and used the authoritative response for nothing. It now applies the response as
+  returned, the same rule the stop and unlink paths already follow. A live status push also drops the
+  stale engine answer that arrived with it, and a `disconnected` push refreshes, because that status
+  alone cannot say which of its two meanings applies.
+
+- Removed two session statuses from the dashboard that the gateway never emits (`connecting`, `idle`),
+  along with the dead branches that tested for them.
+
+- Internal tidying with no behaviour change: a caller-initiated logout no longer registers its
+  credential removal twice (the lifecycle already tracks the whole `engine.logout()` promise, which is
+  the only registration that covers both engines), and a duplicated engine-ownership check in the
+  pre-initialize window is gone — it sat behind a synchronous check that cannot change the answer, so
+  it could never disagree with the one before it.
+
+## [0.12.0] - 2026-07-30
+
+The session-lifecycle security hardening release. Lifecycle endpoints, the
+logout operation, and plugin authorization now describe and enforce a single
+evidence-accurate contract: teardown fences fail closed, an unlink success
+reflects the engine-native operation plus local cleanup, and full plugin
+activation replacement requires an unrestricted ADMIN key. Several pre-existing
+races around engine teardown and re-initialization are closed.
+
+### Added
+
+- **The whatsapp-web.js engine auto-dismisses a new account's "What's new on WhatsApp Web" onboarding
+  modal** (#982, #1003). A freshly-linked account shows this modal after `ready`, and left unacknowledged it
+  gets the companion unlinked roughly five minutes later — surfacing as `disconnected: LOGOUT`.
+  whatsapp-web.js exposes no API for the modal (its own #3550 is still open), so the adapter reaches
+  the underlying page directly and clicks Continue best-effort, matching by visible text rather than
+  class selectors, which WhatsApp Web rebuilds across releases. The watcher starts on `ready` and
+  self-terminates after a lifetime cap since the modal is one-shot per account; its interval, cap and
+  probe timeout are all bounded and `.unref()`'d, and it is cleared on every teardown path.
+
+  Detection keys on the **Continue button**, within a bounded number of levels of an element that also
+  carries the heading — not on the heading text alone. An element's text content includes all of its
+  descendants, so a chat-list row previewing the words "what's new", an entirely ordinary English
+  message, satisfies a heading-only test; a control whose exact label is "Continue" sitting inside
+  that same subtree is a shape the chat list does not produce. The heading match accepts the
+  typographic apostrophe WhatsApp Web actually renders as well as the ASCII one.
+
+  **Limitation:** both halves of that match are English strings — the button label `Continue` and the
+  heading "What's new" — so the feature only works while WhatsApp Web renders the modal in English.
+  The rendered language follows the browser locale, which OpenWA does not set (no `--lang`, no
+  `Accept-Language` override), so in practice it is whatever the browser the image launches
+  (`PUPPETEER_EXECUTABLE_PATH`) defaults to rather than anything derived from the WhatsApp account.
+  If a deployment does get a localised modal, the probe finds nothing and does nothing: no
+  auto-dismissal, and no move to `action_required` either —
+  that deployment sees the pre-fix behaviour, where the companion is unlinked unless someone
+  acknowledges the modal in a browser signed in as that account. Matching every localisation would
+  mean carrying WhatsApp's own translation table for two strings it can change at will, so the
+  detector stays English-only and fails silent rather than guessing.
+
+  A session leaves `ready` only when Continue has been clicked repeatedly and the modal is still
+  there — evidence the click is not landing and a human has to acknowledge it on the phone. It then
+  moves to a new **`action_required`** status carrying a human-readable reason via `lastError`
+  (relaxed from FAILED-only to also cover this status), which flows through the existing
+  `session.status` webhook and WebSocket channels, the dashboard status pill, and all five SDKs. A
+  probe that cannot reach the page — a reload, a teardown, a timeout — is logged and otherwise
+  ignored: it says nothing about the modal, and taking a working session out of `ready` blocks every
+  send for a reason the operator cannot act on. The status is deliberately expensive to reach for
+  that reason: five failed dismiss clicks (up from three), so a multi-step "What's new" flow clicked
+  through one screen per tick no longer reads as a stuck modal.
+
+- **`POST /sessions/:id/logout` unlinks the device from the WhatsApp account** (#984, #1003). Both engines
+  already implemented a real protocol-level unlink — whatsapp-web.js calls `WAWebSocketModel.Socket.logout()`
+  and Baileys sends `<remove-companion-device reason="user_initiated"/>` — but the method had no caller,
+  so it was unreachable over the API. `stop()` disconnects while keeping the stored credentials (a later
+  start reconnects without a QR), and `delete()` additionally purges the on-disk auth directories and the
+  session row, but neither tells WhatsApp anything, so the device stayed listed under the account
+  holder's Linked Devices on the phone until they removed it by hand. The new route mirrors `stop()`'s
+  lifecycle — stop-mark, reconnection cancel, bounded and isolated teardown, engine-map reconciliation
+  — while calling `engine.logout()` instead of `engine.disconnect()`, and records a `SESSION_LOGGED_OUT`
+  audit action so an intentional unlink is distinguishable from a plain stop or a WhatsApp-side eviction.
+  The route requires a started session: with no engine loaded there is nothing to send the unlink
+  through, so it returns 400 instead of reporting an unlink that never happened (unlike `stop()`,
+  which treats an already-stopped session as a successful no-op). The engines enforce the same rule
+  one level down — a loaded engine whose browser or socket has gone (a stuck-auth recovery, or a
+  WhatsApp-side logout still inside its reconnect backoff) refuses the unlink rather than resolving
+  as though it had sent one, which would have produced a success response and a `SESSION_LOGGED_OUT`
+  audit row for a device still listed under Linked Devices.
+
+  `200` means the engine-native unlink operation AND the required local credential cleanup both
+  completed — for Baileys a valid companion identity, an acknowledged `remove-companion-device` IQ
+  response, and removal of the on-disk auth dir; for whatsapp-web.js the native `Client.logout()`
+  promise settled. It is NOT an independent observation that the handset UI no longer shows the
+  device. Because a completed unlink wipes the stored credentials, reconnecting after a `200`
+  always requires a fresh QR scan or pairing code.
+
+  If the logout operation does not complete — no send, no acknowledgement, a timeout/transport
+  error, or a local-cleanup failure — the session is still stopped locally and `phone` is cleared,
+  but the route returns `502` with the stable `SESSION_LOGOUT_INCOMPLETE` code and no
+  `SESSION_LOGGED_OUT` audit row is written (#993). An explicit start is then required, and whether
+  the old credentials remain usable depends on the failure point; the route does not promise an
+  automatic retry or a guaranteed QR state. `docs/06` spells both cases out. The route itself is
+  additive, and the stop and delete semantics are unchanged; force-kill gains the same not-started
+  refusal (see the breaking note below).
+
+- **All five SDKs and the dashboard's API client gain the session logout operation** (#984). The
+  JavaScript, Python, Go, PHP, and Java SDKs each expose a `logout` method mirroring the neighbouring
+  `forceKill`, and the dashboard's `sessionApi` gains a matching `logout(id)`, so every client covers
+  the full session lifecycle again. The reference docs (`docs/06`, the curl collection in `docs/07`,
+  the audit-action enumeration in `docs/05`, the method tables in `docs/18` and `sdk/README.md`) now
+  include the route.
+
+- **The dashboard's Sessions page gains an Unlink action** (#984, #1003). Wired to the logout endpoint, it
+  is the only lifecycle button that tells WhatsApp anything: the device disappears from the account
+  holder's Linked Devices list, and reconnecting requires a fresh QR scan or pairing code. It is
+  labelled "Unlink" rather than "Logout" so it cannot be confused with the sidebar's own
+  (authentication) logout. Unlink and Stop now derive their visibility from one shared definition of
+  "this session has a live engine", so a card in one of those states cannot offer an action the API
+  rejects, nor offer Start to a session that is already started — which answers 400 and then leaves a
+  QR dialog open that cannot resolve. That definition now includes `authenticating` (the
+  whatsapp-web.js engine can hold it for 90 seconds) and `action_required`, neither of which
+  previously offered any working action. One gap remains, unchanged from previous releases: a
+  `disconnected` session keeps its engine registered for the duration of the automatic reconnect
+  backoff, and status alone cannot distinguish that from a stopped session with no engine — so Start
+  is still offered there and still answers 400. Closing it needs the API to publish whether an engine
+  is loaded, which is a separate change. The confirmation dialog spells out both consequences (fresh QR to reconnect;
+  delete the session separately if local data should go too), and the 502 case — session stopped
+  locally but the unlink unconfirmed by WhatsApp — surfaces as a warning toast with retry guidance
+  instead of a plain error. Localized across all twelve dashboard locales.
+
+### Fixed
+
+- **`send-document` really sends a document on the whatsapp-web.js engine** (#989, #996, #1000, #1003). Without an
+  explicit document flag, WhatsApp Web classifies an attachment from its declared mimetype, so an
+  `image/*`, `video/*` or `audio/*` payload posted to the document endpoint arrived as a photo, video
+  or audio bubble — re-encoded, and with its filename dropped. Baileys has always forced the document
+  form, so the two engines disagreed on the same request. The flag is withheld for `status@broadcast`
+  and broadcast lists, where whatsapp-web.js refuses every recipient once it is set: setting it there
+  would turn a working send into a failure rather than improve it, so those recipients keep the
+  classification they have today. A document with no filename now defaults to `file` instead of
+  reaching the recipient labelled literally `undefined`.
+
+- **A remote-URL send keeps the mimetype and filename the caller declared.** Media fetched from a URL
+  derived both from the response — content-type and URL basename — because that is all the fetch has
+  to go on, and it overrode what the request actually said. The caller's values now win, matching what
+  the Baileys engine already did; `application/octet-stream` is treated as the placeholder it is
+  rather than a statement about the bytes, so omitting the mimetype still falls back to the response.
+
+  Stickers are the one exception, and keep the fetched content-type. There the mimetype is not a label
+  but an instruction: whatsapp-web.js picks the conversion from it and returns the media untouched once
+  it reads as `image/webp`. A URL sticker declared `image/webp` over bytes that are not webp would
+  therefore be sent unconverted. The response saw those bytes and the caller did not, so for that one
+  decision it is the better source. A declared filename still wins everywhere — nothing branches on it.
+
+- **A wedged logout can no longer delete a freshly re-paired profile** (#994). `teardownEngineSafely`
+  races an engine teardown against a 10s deadline, but the losing promise kept running — and
+  `logout()`'s ends in an `fs.rm` of the session's on-disk profile, the same deterministic path a
+  later `start()` re-creates. A `pupBrowser.close()` wedged past the deadline could therefore land
+  that `rm` on credentials written by a subsequent pairing. Losing teardowns are now tracked against
+  the session name, and `POST /sessions/:id/start` and `DELETE /sessions/:id` fail closed with a
+  retryable `409` (`SESSION_NAME_TEARDOWN_PENDING`) while a prior logout still owns destructive
+  cleanup for that name — they no longer touch the profile path or proceed anyway. The dashboard's
+  start path honours the refusal, so it never opens a QR modal that cannot resolve. On the rare
+  concurrent-logout case the engine may already be stopped to close the race, but the hook, DB
+  deletion and auth purge have not run; retrying the delete after cleanup settles completes it.
+
+- **`npm install` from source no longer fails on native Windows, and the whatsapp-web.js backport
+  actually applies there** (#889, #1003). A unified diff's lines must begin with a space, `+`, `-` or `@`, so
+  neither applier accepts one whose lines end CRLF — both stop at this patch's first empty context
+  line (`git apply`: "corrupt patch at line 7"; `patch`: "malformed patch at line 7"). Windows checks
+  the file out exactly that way whenever `core.autocrlf` is on, which is its default, so the `git
+  apply` fallback introduced for Windows could never run on Windows, and its failure was additionally
+  misread as a half-written tree — which turned a skippable warning into a hard install failure.
+  Three changes: the patch is normalized to LF before either applier sees it, which also repairs
+  clones already on disk with CRLF; a `.gitattributes` rule keeps fresh clones on LF; and a refusal to
+  parse the patch is now correctly treated as "nothing was written", so `--best-effort` degrades
+  instead of aborting the install. That last one is matched on the messages `git apply` emits before
+  it writes anything, not on its exit code alone — the code is shared with fatals raised part-way
+  through writing results, and calling one of those a pristine tree would let `--best-effort` wave a
+  half-patched dependency through as a clean skip, which is the one outcome it must never produce.
+  Only source installs on Windows were affected — the published Docker image and every platform with
+  the `patch` binary applied the backport normally.
+
+- **Native Windows and npm 12 source installs no longer fail during dependency setup.** The
+  whatsapp-web.js backport now normalizes reject-file paths before comparing them, so Windows'
+  `src\structures\Contact.js.rej` is recognized as the same expected, harmless reject as the POSIX
+  path and is cleaned up after verification. The lockfile also resolves `libsignal@6.0.0` from its
+  npm registry tarball (published from the same commit previously fetched over Git SSH), avoiding
+  npm 12's `EALLOWGIT` default without weakening its project security policy.
+
+- **`AUTO_START_SESSIONS` set in `.env` now reaches the container under the bundled production
+  compose.** `docker-compose.yml` never forwarded the variable — not in any revision of the file — so
+  on a stock Docker Compose deployment the flag was inert: previously authenticated sessions were
+  reset to `disconnected` at boot and left there, and the operator got no error to work from, because
+  nothing was misconfigured from the application's point of view. `.env.example` documents the
+  setting, and `docker-compose.dev.yml` did forward it, which made the omission read as a working
+  feature everywhere except where most deployments run. The forward is blank-defaulted like the
+  neighbouring engine options, so an unset value still resolves to the documented opt-out default and
+  only an explicit `true` starts sessions at boot.
+
+- **Deleting a session's stored WhatsApp credentials is now recorded when it happens** (#981). The
+  whatsapp-web.js adapter clears a session's auth directory to recover one that authenticated but never
+  reached runtime readiness within 90 seconds, and that directory holds the only copy of the
+  credentials — once removed, no restart can restore the link and every later start can do nothing but
+  present a fresh QR. The adapter logged only the *failure* to remove it, so a successful wipe left no
+  trace at all: the sole symptom was a session that quietly stopped reconnecting, indistinguishable in
+  the logs from a WhatsApp-side logout or a profile nothing had touched. The removal now logs a warning
+  naming the directory and the session, and the readiness-timeout warning that precedes it carries the
+  session id too — on a multi-session host that is what separates "one session timed out" from "every
+  session did", which have very different causes. No behaviour changes; this closes a blind spot that
+  made the destructive path impossible to confirm from a deployment's own logs.
+
+- **A whatsapp-web.js session no longer publishes a QR belonging to the browser it is about to
+  replace** (#982). On `LOGOUT`, whatsapp-web.js deletes the auth profile and re-runs its injection
+  against the same browser, so the old client keeps serving QR codes while the session lifecycle waits
+  out the reconnect backoff before tearing it down. The adapter suppressed such events only once
+  teardown had begun, so throughout that window — five seconds by default, as long as the configured
+  `reconnectBaseDelay` at most — a stale QR reached the dashboard and the `session.qr` webhook seconds
+  ahead of the real one; scanning it linked a phantom device and left the session unauthenticated. An
+  adapter that has reported a disconnect is now treated as finished for `qr` and `authenticated`
+  alike, matching the guard that already covered teardown.
+
+- **A `LOGOUT` disconnect now says what it means in the logs** (#982). The reason reached operators as
+  the bare engine token, reading like any other transient drop, when in fact WhatsApp Web itself ran a
+  logout and whatsapp-web.js deleted the session's stored credentials before the event was even
+  handed over — so no reconnect can restore the link and the device must be re-scanned. The adapter
+  now states that once, alongside a pointer to check Linked devices on the phone. The
+  `session.disconnected` payload is unchanged.
+
+- **The expected Puppeteer rejection that follows an engine teardown no longer logs as an error with a
+  raw stack** (#982). whatsapp-web.js re-runs its injection from an async listener it never awaits, so
+  closing that browser leaves a pending page evaluate to reject with no owner. It is expected and
+  self-healing, so it is now a warning naming the cause instead of an `Unhandled promise rejection`
+  error that reads like a crash. Nothing is muted: the full reason is still logged, and the actionable
+  variant of the same message — a browser profile left stale by a Chromium-binary change (#663/#708) —
+  is raised inside `initialize()`, caught by the adapter, and keeps its existing advisory.
+
+- Service start during Docker orchestration now applies the same managed-profile allowlist as
+  teardown. Non-managed profile names are dropped before reaching `DockerService` in both directions,
+  so the start path cannot select an unrelated host container any more than teardown can.
+
+- **A session cannot be torn down before its engine has finished initializing.** The teardown path
+  previously ran against an engine handle that the initialize step had not yet produced, racing the
+  pre-init window; teardown is now retired until initialization reports an engine, so a stop/delete
+  that lands during startup cannot act on a handle that was never ready.
+
+- **An async disconnect is fenced by engine identity.** whatsapp-web.js raises its disconnect event
+  from a listener it never awaits, so a teardown that closed the browser could still deliver a stale
+  disconnect for the engine that was just destroyed. The disconnect handler now only acts when the
+  event belongs to the currently-loaded engine for that session, so a superseded client cannot drive
+  a lifecycle transition for its replacement.
+
+- **Stuck-auth recovery keeps its readiness budget across reconnects.** The 90-second
+  readiness-to-wipe budget that lets a stuck-auth self-heal clear and re-pair was reset on every
+  reconnect, so repeated short reconnects kept deferring the wipe and the session sat in
+  `authenticating` indefinitely. The budget is now hoisted above the reconnect loop, so it advances
+  across reconnects and the self-heal still fires.
+
+- **Force-kill no longer reports a kill it did not perform.** `POST /sessions/:id/force-kill` on a
+  session with no live engine used to answer `200` and write a `SESSION_FORCE_KILLED` audit row,
+  although there was no engine to SIGKILL — the audit trail recorded a recovery that never happened.
+  It now returns `400` with the same not-started message the logout route uses. ⚠️ This is a
+  behaviour change for existing callers: see the breaking note below. The side effect that call used
+  to have — writing `disconnected` over a stale row — moves to `POST /sessions/:id/stop`, which still
+  reconciles the status of a session with no live engine and remains the way to correct a row left
+  reading `ready` or `authenticating` after its engine was evicted.
+
+- **The dashboard reconciles session status from authoritative engine state.** Sessions-page
+  visibility and status now derive from one shared definition of "this session has a live engine",
+  the FAILED status no longer holds a concurrency slot (it is evicted by design, with no live engine
+  to offer actions against), force-kill is offered only while an engine-backed status exists, and
+  the logout `200`/`502` outcomes surface with matching evidence-level copy.
+
+- **Both bundled compose files forward the new plugin-download redirect flag.**
+  `PLUGIN_DOWNLOAD_ALLOW_INSECURE_REDIRECTS` (added in this release — see the https→http item under
+  Security) is read straight from the environment, so without a forward an operator could set it in
+  `.env` and see no effect on a Compose deployment: the container never received the variable. Both
+  `docker-compose.yml` and `docker-compose.dev.yml` now pass it through with its secure default
+  (`:-false`), so the documented opt-in is reachable. While the variable is unset nothing changes —
+  `:-false` and an absent variable are read identically. Once you do set it, spell it exactly `true`
+  or `false`: the value now reaches boot validation, which rejects anything else by name rather than
+  silently falling back, so a typo fails the boot instead of quietly choosing a security posture.
+  Note also that the *refusal* it opts out of is new in this release — see the Security item for the
+  upgrade impact.
+
+- **A caller's timeout now bounds the SSRF guard's own DNS resolution, and reports itself honestly.**
+  The guard resolves each host before connecting, and that step previously ignored the caller's
+  `AbortSignal` — it was bounded only by the guard's internal DNS deadline, which raises a blocked-URL
+  error. Redaction turns any such error into `Destination address is not allowed` for the client, so a
+  webhook or plugin-download timeout that landed during resolution was reported as though the
+  destination had failed the policy check. The signal is now honoured before and during the lookup and
+  its own reason propagates, so a timeout reads as a timeout, and one caller deadline covers the whole
+  chain including every redirect hop's resolution rather than each hop restarting a fresh DNS budget.
+
+- **The MCP adapter dependency is refreshed past a transitive advisory.** The bundled MCP SDK was
+  bumped past the Hono advisory in its dependency tree. The MCP adapter remains v1 and optional; the
+  refresh is a dependency-security change and does not alter the MCP wire contract.
+
+### Security
+
+- Infrastructure routes (`/api/infra/*`) now reject API keys restricted to specific sessions.
+  These routes act on the whole deployment, so a key confined to a subset of sessions must not
+  reach them regardless of its role. Unrestricted ADMIN keys are unaffected.
+
+- Plugin installation and lifecycle routes (`/api/plugins/*`) now reject API keys restricted to
+  specific sessions. Installing or enabling a plugin runs its code in the gateway process, which is
+  a deployment-wide action. Full plugin activation replacement (`PUT /api/plugins/:id/sessions`,
+  which overwrites the entire active set) now requires an unrestricted ADMIN key — sending `[]` or
+  a single session from a scoped key would otherwise delete every other tenant's activation, so a
+  scoped key receives `403` on that route. The per-session config route
+  (`PUT /api/plugins/:id/config/:sessionId`) continues to accept restricted keys and remains scoped
+  to the sessions the key allows.
+
+- The queue dashboard (`/api/admin/queues`, available when `QUEUE_ENABLED=true`) now refuses API keys
+  restricted to specific sessions. The dashboard exposes and mutates every queue in the deployment
+  and has no session dimension to scope against.
+
+- Cross-session statistics (`GET /api/stats/overview`, `GET /api/stats/messages`), application
+  settings (`GET /api/settings`), and session creation (`POST /api/sessions`) now require an API key
+  that is not restricted to specific sessions. Per-session statistics remain available to restricted
+  keys for the sessions they allow.
+
+- Redriving a dead-lettered integration delivery now fails closed for session-restricted keys when
+  the integration instance no longer exists. Previously the scope check was skipped for a missing
+  instance, so retained dead-letter rows could be re-dispatched for sessions outside the key's scope.
+  Scoped redrive additionally filters DLQ rows by the `sessionId` stored at provenance time against
+  the key's authorized binding, so each restricted key only ever re-dispatches its own sessions;
+  historical/legacy rows that carry no stored session remain available only to unrestricted redrive,
+  and the reported `remaining` depth is authority-filtered to match.
+
+- A pending credential teardown for a session name now fences its lifecycle with a retryable
+  `409` (`SESSION_NAME_TEARDOWN_PENDING`). `POST /sessions/:id/start` and `DELETE /sessions/:id`
+  refuse to run a destructive side effect while a prior logout still owns cleanup for that name,
+  closing the window where a wedged teardown could land on freshly re-paired credentials.
+
+- Outbound downloads that follow redirects (plugin packages and the plugin catalog) now validate
+  every redirect hop before connecting (hosts named in `SSRF_ALLOWED_HOSTS` remain the documented
+  opt-out). Previously a redirect whose target was a bare IP address bypassed the destination check,
+  because the platform skips name resolution for address literals. Redirect chains are also capped.
+
+- ⚠️ A redirect hop that downgrades `https` to plain `http` is now refused on those same download
+  paths. The payload is executable code, and an http hop exposes it to on-path substitution; the
+  previous implementation delegated redirect-following to the HTTP client and never inspected the
+  scheme of a hop, so such a chain was followed. A chain that starts on plain `http` is unaffected —
+  it was never secure to begin with — but an `http→https→http` chain is refused. **Upgrade impact:**
+  if your plugin or catalog host redirects an `https` URL to an `http` one, that download worked on
+  0.11.1 and now fails. `PLUGIN_DOWNLOAD_ALLOW_INSECURE_REDIRECTS=true` re-allows that specific hop;
+  it does not opt out of the other constraints on this path, which apply either way — every hop is
+  still re-checked before connecting (hosts named in `SSRF_ALLOWED_HOSTS` stay the documented
+  exception: deliberately neither resolved nor pinned), and the chain is still capped (at 5 hops,
+  where 0.11.1 inherited the HTTP client's limit of 20). Prefer checking whether the host can serve
+  the redirect target over https before setting it.
+
+- Added a build-time check that fails when a route acting on the whole deployment is added without
+  refusing session-restricted API keys, so this class of gap cannot be reintroduced silently.
+
+- ⚠️ **Breaking (behavior).** Three refusals change behaviour for existing API consumers:
+
+  1. **`403` for session-restricted keys** on the deployment-global surfaces listed above — most
+     notably full plugin activation replacement (`PUT /api/plugins/:id/sessions`). Unrestricted keys
+     are unaffected.
+  2. **A retryable `409`** (`SESSION_NAME_TEARDOWN_PENDING`) from `POST /sessions/:id/start` and
+     `DELETE /sessions/:id` while a name-keyed credential teardown is still in flight. Applies to all
+     keys.
+  3. **`400` instead of `200`** from `POST /sessions/:id/force-kill` when the session has no live
+     engine. Applies to all keys.
+
+  **Migration.** For (1), use an unrestricted ADMIN key to manage plugin activation; the per-session
+  config route (`PUT /api/plugins/:id/config/:sessionId`) still accepts restricted keys. For (2),
+  treat the `409` as retryable and retry after a short delay — the body carries
+  `code: 'SESSION_NAME_TEARDOWN_PENDING'`, and no destructive side effect ran before the refusal.
+  For (3), read a force-kill `400` as "there was nothing to kill" rather than a failed recovery;
+  callers that used force-kill to reconcile a stale row should call `POST /sessions/:id/stop`
+  instead. Under SemVer 0.x these breaking changes bump the minor version.
+
+## [0.11.1] - 2026-07-28
+
 ### Added
 
 - **The Baileys engine now honors the per-session egress proxy** (#859). `proxyUrl` — http, https,
@@ -24,6 +887,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   published `openapi.json` get a concrete base URL to display.
 
 ### Fixed
+
+- **The published OpenAPI spec no longer advertises a `200` the catalog endpoints never return.**
+  `GET /sessions/{id}/catalog`, `/catalog/products` and `/catalog/products/{productId}` each declared
+  a `200` response described as "always null on whatsapp-web.js", from a time when that engine
+  returned an empty result instead of refusing. Both adapters now throw, so every call answers `501`,
+  and a generated client built against the old snapshot modelled a success case that cannot occur.
+  The stale declarations are removed, the remaining `501` description no longer names only Baileys,
+  and `openapi.json` is regenerated.
+
+- **The documentation set now matches the shipped implementation.** Every numbered document was
+  checked claim by claim against source, and the corrections concentrate where following the docs
+  could fail silently. Session auth was documented at `./data/.wwebjs_auth` when it lives under
+  `SESSION_DATA_PATH` (default `./data/sessions`), so every backup, server-transfer and rollback
+  procedure copied a directory that does not exist and still reported success; compose commands
+  addressed a service named `openwa` where the shipped file defines `openwa-api`; the upgrade runbook
+  used `docker compose pull` against a compose file that builds from source; health checks omitted
+  the global `api` prefix; and several referenced files and scripts were never part of the repository.
+  Documented settings that the configuration layer does not read (`WA_RECONNECT_INTERVAL`,
+  `STORAGE_S3_*`, `CACHE_TYPE`, `API_PREFIX` and others) are replaced by the real names. Endpoints
+  and tooling that do not exist — per-session export/import, a 1.x upgrade path, an MCP tool name —
+  are removed, the catalog endpoints are marked as answering 501 on both engines, and the glossary no
+  longer defines a message queue, message scheduling or a Redis-backed dead-letter queue, none of
+  which the gateway has. Two risk-register rows that claimed send-rate safeguards now describe the
+  controls that ship. Structurally, `docs/23-plugin-sandboxing.md` becomes `docs/30`, resolving a
+  duplicate prefix; the engine capability matrix joins the sequence as `docs/29`; a language-forked
+  second copy of the Docker guide is removed; and the index lists all thirty documents. Separately,
+  the community guidelines and the incident-response template both published a security contact
+  address that does not exist, so a vulnerability report sent by either route reached no maintainer;
+  both now carry the channels `SECURITY.md` defines, GitHub Security Advisories first.
 
 - **A source install without the GNU `patch` binary no longer silently ships an unpatched
   whatsapp-web.js.** OpenWA backports the fix for the WhatsApp Web 2.3000.x message-id rename during
@@ -2506,7 +3398,7 @@ labelId)` instead of returning 501. WhatsApp-Business-only (rejects on personal 
 
 ### Security
 
-- Session scope is now enforced on the session-statistics overview and on per-session plugin activation, so an API key restricted to specific sessions can no longer read or change state for sessions outside its scope.
+- Session scope is now enforced on the session-statistics overview and on per-session plugin config, so an API key restricted to specific sessions can no longer read or change state for sessions outside its scope. (Full plugin activation replacement, `PUT /plugins/:id/sessions`, was later moved to unrestricted ADMIN in 0.12.0 — it replaces the entire active set, so a scoped key now receives `403` there; the per-session config route stays scoped.)
 
 ## [0.6.2] - 2026-06-23
 

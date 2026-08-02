@@ -228,6 +228,7 @@
     "qr_ready": "Scan QR",
     "ready": "Connected",
     "disconnected": "Disconnected",
+    "action_required": "Action required",
     "failed": "Failed",
     "authenticating": "Authenticating..."
   },
@@ -269,6 +270,10 @@
       "errorTitle": "Delete Failed",
       "errorDefault": "Failed to delete session"
     },
+    "start": {
+      "teardownPendingTitle": "Session Starting",
+      "teardownPending": "A credential teardown for this session is still settling. Wait a moment and try again."
+    },
     "qr": {
       "title": "Scan QR Code",
       "step1": "<strong>1.</strong> Open WhatsApp on your phone",
@@ -296,6 +301,7 @@
       "start": "Start",
       "stop": "Stop",
       "reconnect": "Reconnect",
+      "unlink": "Unlink",
       "delete": "Delete",
       "killStuck": "Kill Stuck"
     },
@@ -304,6 +310,8 @@
       "readyDesc": "WhatsApp session is now connected",
       "disconnectedTitle": "Session Disconnected",
       "disconnectedDesc": "WhatsApp session was disconnected",
+      "actionRequiredTitle": "Action required",
+      "actionRequiredDesc": "This session needs your attention. Open the session to see what to do.",
       "failedTitle": "Session Failed",
       "failedDesc": "The WhatsApp session failed to start. Open the session to see the reason."
     },
@@ -322,6 +330,18 @@
       "success": "Session has been force-killed. You can restart it now.",
       "failedTitle": "Force-Kill Failed",
       "failed": "Failed to force-kill the session."
+    },
+    "unlink": {
+      "title": "Unlink Device",
+      "message": "Unlink session <strong>\"{{name}}\"</strong> from the WhatsApp account?",
+      "warning": "WhatsApp removes this device from the account's Linked Devices and the session stops. Reconnecting requires a fresh QR scan or pairing code. To also erase all local data, delete the session afterwards.",
+      "confirm": "Unlink",
+      "successTitle": "Device Unlinked",
+      "success": "Unlink completed: the device was logged out and the local session credentials were cleared. Reconnecting requires a fresh QR scan or pairing code.",
+      "incompleteTitle": "Unlink Incomplete",
+      "incomplete": "The session stopped locally, but the logout operation is incomplete — the device may still be linked. Start the session and retry the logout.",
+      "failedTitle": "Unlink Failed",
+      "failed": "Failed to unlink the session."
     },
     "pairing": {
       "tabQr": "QR Code",

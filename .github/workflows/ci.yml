@@ -241,10 +241,11 @@ jobs:
       - name: Install shellcheck
         run: sudo apt-get install -y --no-install-recommends shellcheck
 
-      - name: shellcheck the backup/restore scripts
-        # Scope this PR: lint the three scripts #926 added or rewrote. Widening to the rest of
-        # scripts/*.sh is tracked separately so a pre-existing warning elsewhere can't fail this gate.
-        run: shellcheck scripts/backup.sh scripts/restore.sh scripts/smoke-test-backup-restore.sh
+      - name: shellcheck every shell script
+        # Widened from the original three (#926) now that the rest are clean too. The narrow scope was
+        # not free: `smoke-test-non-root.sh` carried a UTF-8 BOM before its shebang for months, which
+        # shellcheck reports as SC1082 and which nothing else here would ever have caught.
+        run: shellcheck scripts/*.sh
 
       - name: Run backup/restore smoke test
         run: ./scripts/smoke-test-backup-restore.sh
@@ -293,7 +294,7 @@ jobs:
 
       - name: Login to GitHub Container Registry
         if: github.event_name == 'push'
-        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
