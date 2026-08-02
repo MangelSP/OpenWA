@@ -1,6 +1,34 @@
+import * as path from 'path';
 import { computeFeatureFlags } from './feature-flags';
 import { resolveInflightBodyBudgetBytes } from './inflight-body-budget';
 import { readWsRateLimitConfig } from '../modules/events/ws-rate-limit';
+
+/**
+ * Root of the host's persistent state. Relative on purpose: the image sets WORKDIR /app and mounts
+ * the data volume at /app/data, so this resolves onto the volume without the config having to know
+ * whether it runs in a container.
+ *
+ * Exposed as the `dataDir` key because PluginStorageService already reads it — the key never existed,
+ * so `get('dataDir')` always fell through to its own literal while the plugin package dir defaulted
+ * from an unrelated string. Deriving both from one value is what keeps a plugin's code and its
+ * registry entry in the same tree.
+ *
+ * Deliberately NOT env-overridable: every other data path (DATABASE_NAME, MAIN_DATABASE_NAME,
+ * SESSION_DATA_PATH, BAILEYS_AUTH_DIR, STORAGE_LOCAL_PATH) carries its own override and none of them
+ * would follow a DATA_DIR knob, so such a knob would move part of the state while looking like it
+ * moved all of it.
+ */
+export const DEFAULT_DATA_DIR = './data';
+
+/** Where installed plugin packages live when PLUGINS_DIR is unset — the tree the registry is in. */
+export const DEFAULT_PLUGINS_DIR = path.join(DEFAULT_DATA_DIR, 'plugins');
+
+/**
+ * The plugin package dir OpenWA ≤ 0.12.1 defaulted to. A host that ran on that default has working
+ * plugin code sitting here, so the loader still scans it (and says so, loudly) when PLUGINS_DIR is
+ * unset — see PluginLoaderService.onModuleInit.
+ */
+export const LEGACY_PLUGINS_DIR = './plugins';
 
 /**
  * Shared parser for numeric env knobs whose 0 is a documented opt-out (unlimited / disabled).
@@ -17,8 +45,35 @@ export function resolveNonNegativeIntEnv(raw: string | undefined, fallback: numb
   return Number(trimmed);
 }
 
+/**
+ * The UI locale Chromium is pinned to. WhatsApp Web renders its chrome — including the new-account
+ * onboarding modal the whatsapp-web.js adapter dismisses (#982) — in the browser's language, and that
+ * detector matches visible English text. Without a pin the language is whatever the launched binary
+ * defaults to, which differs between the amd64 (Chrome for Testing) and arm64 (Debian chromium) images
+ * and between host installs.
+ */
+export const PINNED_BROWSER_LOCALE = 'en-US';
+
+/**
+ * Append the locale pin unless the operator already set one. Deliberately applied AFTER the
+ * PUPPETEER_ARGS override rather than baked into the default string: that variable REPLACES the
+ * defaults, so a deployment that customises args for an unrelated reason would otherwise silently
+ * lose the pin and the onboarding detector with it. An explicit `--lang` always wins.
+ *
+ * Returns a NEW array — never mutates the input — because the resolved args object is shared by every
+ * session, and pushing per-session flags onto a shared array leaked proxy settings across sessions
+ * once already (#840).
+ */
+export function withPinnedBrowserLocale(args: string[]): string[] {
+  return args.some(arg => arg.startsWith('--lang')) ? [...args] : [...args, `--lang=${PINNED_BROWSER_LOCALE}`];
+}
+
 export default () => ({
   port: parseInt(process.env.PORT || '2785', 10),
+
+  // Root of the persistent state tree (see DEFAULT_DATA_DIR). Read by PluginStorageService for the
+  // plugin registry and per-plugin storage; the other data paths keep their own env-specific keys.
+  dataDir: DEFAULT_DATA_DIR,
 
   // HTTP server timeouts (Node http.Server). Pinned explicitly so they are operator-tunable and
   // observable at boot rather than left at Node's implicit defaults. requestTimeout defaults to
@@ -136,11 +191,11 @@ export default () => ({
       // Accept either delimiter: .env/compose use commas, the dashboard Infrastructure form
       // persists space-separated. Splitting on both keeps each flag a discrete argv token —
       // a single glued token like "--no-sandbox --disable-gpu" silently neuters --no-sandbox.
-      args: (
-        process.env.PUPPETEER_ARGS || '--no-sandbox,--disable-setuid-sandbox,--disable-dev-shm-usage,--disable-gpu'
-      )
-        .split(/[\s,]+/)
-        .filter(Boolean),
+      args: withPinnedBrowserLocale(
+        (process.env.PUPPETEER_ARGS || '--no-sandbox,--disable-setuid-sandbox,--disable-dev-shm-usage,--disable-gpu')
+          .split(/[\s,]+/)
+          .filter(Boolean),
+      ),
       // Optional path to a system Chromium/Chrome binary. When unset, whatsapp-web.js
       // uses Puppeteer's bundled Chromium. Required on hosts where the bundled binary
       // is missing or incompatible (Alpine, ARM, custom base images).
@@ -240,8 +295,19 @@ export default () => ({
 
   // Plugin platform configuration
   plugins: {
-    // Where installed plugins live on disk (matches the plugin loader's default).
-    dir: process.env.PLUGINS_DIR || './plugins',
+    // Where installed plugin packages live on disk. This MUST resolve to the same tree as the plugin
+    // registry (<dataDir>/plugins/registry.json, see PluginStorageService): a plugin's code and its
+    // registry entry — status, operator config, secrets, enabledByOperator — are two halves of one
+    // install. While the two defaults were independent, an unset PLUGINS_DIR put the code under
+    // ./plugins and the registry under ./data/plugins, so the loader scanned a directory that did not
+    // exist and reported "Loaded 0 plugins" while the registry still listed every plugin as installed;
+    // in Docker the install also landed in the ephemeral container layer instead of the /app/data
+    // volume, destroying the code on the next recreate while its config and secrets survived.
+    dir: process.env.PLUGINS_DIR || DEFAULT_PLUGINS_DIR,
+    // Compatibility only: the pre-fix default, scanned as a fallback so a host that installed plugins
+    // there keeps loading them. Null once PLUGINS_DIR is set — an operator who named the directory
+    // has said where plugins live, and nothing may second-guess that.
+    legacyDir: process.env.PLUGINS_DIR ? null : LEGACY_PLUGINS_DIR,
     // Remote catalog of installable plugins (JSON array; the OpenWA-plugins repo's plugins.json).
     // Fetched through the SSRF guard — add its host to SSRF_ALLOWED_HOSTS if it is not publicly resolvable.
     catalogUrl:

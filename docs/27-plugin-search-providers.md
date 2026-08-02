@@ -1,6 +1,6 @@
 # 27 - Writing a Search-Provider Plugin
 
-> **Status:** The host→plugin search RPC shipped in v0.8.13 (PR #674). A sandboxed plugin can now register
+> **Status:** The host→plugin search RPC shipped in v0.8.14 (PR #674). A sandboxed plugin can now register
 > as a `SearchProvider` and answer `GET /api/search` queries from its own backend (Meilisearch,
 > Elasticsearch, Typesense, OpenSearch, …) while the core stays backend-agnostic. This guide is the
 > plugin-author's contract.
@@ -20,6 +20,20 @@ API client, the index schema) lives in the plugin. Swapping backends is a config
 user-facing feature and the built-in DB-FTS default.
 
 ## 27.2 The contract
+
+### Declare the permission
+
+The manifest must declare `search:provide`:
+
+```json
+{ "id": "meili", "name": "Meilisearch", "version": "1.0.0", "type": "extension",
+  "main": "index.cjs", "permissions": ["search:provide"] }
+```
+
+Without it the host ignores the registration and logs one warning
+(`sandbox_search_provider_denied`); the plugin keeps running and the active provider is unchanged.
+The permission is required because under the default `SEARCH_PROVIDER=auto` a registered provider is
+also made **active**, so it sees every query `GET /api/search` serves.
 
 ### Register the handler
 
@@ -220,5 +234,5 @@ ctx interface is planned; for now the search contract types above are the stable
 
 > See also: [26 - Global Search](./26-global-search.md) (the feature + the built-in provider),
 > [19 - Plugin Architecture](./19-plugin-architecture.md),
-> [23 - Plugin Sandboxing](./23-plugin-sandboxing.md),
+> [30 - Plugin Sandboxing](./30-plugin-sandboxing.md),
 > [06 - API Specification](./06-api-specification.md) §6.4.12 Search.

@@ -5,6 +5,9 @@ import { BadRequestException, NotFoundException, PayloadTooLargeException } from
 import { MessageService } from './message.service';
 import { Message, MessageDirection, MessageStatus } from './entities/message.entity';
 import { SessionService } from '../session/session.service';
+import { EngineRegistry } from '../../engine/engine-registry.service';
+import { MessageProjector } from '../session/message-projector.service';
+import type { IWhatsAppEngine } from '../../engine/interfaces/whatsapp-engine.interface';
 import { HookManager } from '../../core/hooks';
 import { TemplateService } from '../template/template.service';
 import { Template } from '../template/entities/template.entity';
@@ -39,6 +42,8 @@ describe('MessageService', () => {
   let service: MessageService;
   let repository: jest.Mocked<Partial<Repository<Message>>>;
   let sessionService: jest.Mocked<Partial<SessionService>>;
+  let engines: EngineRegistry;
+  let messageProjector: { recordOutboundMessageEdit: jest.Mock };
   let hookManager: jest.Mocked<Partial<HookManager>>;
   let templateService: jest.Mocked<Partial<TemplateService>>;
   let lidMappingStore: { lidsForPhone: jest.Mock; getCached: jest.Mock };
@@ -67,10 +72,13 @@ describe('MessageService', () => {
     mockEngine = createMockEngine();
 
     sessionService = {
-      getEngine: jest.fn().mockReturnValue(mockEngine),
       findOne: jest.fn().mockResolvedValue({ id: 'sess-1', phone: '628123456789' }),
-      recordOutboundMessageEdit: jest.fn().mockResolvedValue(undefined),
     };
+
+    messageProjector = { recordOutboundMessageEdit: jest.fn().mockResolvedValue(undefined) };
+
+    engines = new EngineRegistry();
+    engines.set('sess-1', mockEngine as unknown as IWhatsAppEngine);
 
     hookManager = {
       // Echo the input straight back so the message:sending gate is a pass-through by default; specific
@@ -91,6 +99,8 @@ describe('MessageService', () => {
         MessageService,
         { provide: getRepositoryToken(Message, 'data'), useValue: repository },
         { provide: SessionService, useValue: sessionService },
+        { provide: EngineRegistry, useValue: engines },
+        { provide: MessageProjector, useValue: messageProjector },
         { provide: HookManager, useValue: hookManager },
         { provide: TemplateService, useValue: templateService },
         { provide: LidMappingStoreService, useValue: lidMappingStore },
@@ -187,7 +197,8 @@ describe('MessageService', () => {
         expect.objectContaining({ type: 'text' }),
         expect.any(Object),
       );
-      // message:sent is no longer fired here — it is emitted solely by SessionService.onMessageCreate
+      // message:sent is no longer fired here — it is emitted solely by the onMessageCreate wiring in
+      // SessionEngineLifecycle (via MessageProjector)
       // with a consistent IncomingMessage payload for ALL sends (avoids the prior double dispatch).
       expect(hookManager.execute).not.toHaveBeenCalledWith('message:sent', expect.anything(), expect.anything());
     });
@@ -268,7 +279,7 @@ describe('MessageService', () => {
     });
 
     it('should throw BadRequestException if session is not active', async () => {
-      (sessionService.getEngine as jest.Mock).mockReturnValue(undefined);
+      engines.delete('sess-1');
 
       await expect(service.sendText('inactive', { chatId: 'test@c.us', text: 'hello' })).rejects.toThrow(
         BadRequestException,
@@ -389,10 +400,12 @@ describe('MessageService', () => {
     it('honors a configured template.renderMaxChars override', async () => {
       const configService = {
         get: (key: string, fallback: unknown) => (key === 'template.renderMaxChars' ? 10 : fallback),
-      } as unknown as ConstructorParameters<typeof MessageService>[5];
+      } as unknown as ConstructorParameters<typeof MessageService>[7];
       const capped = new MessageService(
         repository as Repository<Message>,
         sessionService as unknown as SessionService,
+        engines,
+        messageProjector as unknown as MessageProjector,
         hookManager as HookManager,
         templateService as unknown as TemplateService,
         lidMappingStore as unknown as LidMappingStoreService,
@@ -1281,7 +1294,7 @@ describe('MessageService', () => {
       expect(mockEngine.editMessage).toHaveBeenCalledWith('test@c.us', 'wa-msg-1', 'edited');
       // Persistence is delegated to the session's per-message mutation queue (serialized with the
       // inbound edit path) — the service no longer writes the row directly.
-      expect(sessionService.recordOutboundMessageEdit).toHaveBeenCalledWith('sess-1', 'wa-msg-1', 'edited');
+      expect(messageProjector.recordOutboundMessageEdit).toHaveBeenCalledWith('sess-1', 'wa-msg-1', 'edited');
       expect(repository.update).not.toHaveBeenCalled();
       expect(res).toEqual({ messageId: 'wa-msg-1', timestamp: 1706868000 });
     });
@@ -1299,11 +1312,11 @@ describe('MessageService', () => {
       await expect(
         service.editMessage('sess-1', { chatId: 'test@c.us', messageId: 'wa-msg-1', body: 'edited' }),
       ).rejects.toBeInstanceOf(NotFoundException);
-      expect(sessionService.recordOutboundMessageEdit).not.toHaveBeenCalled();
+      expect(messageProjector.recordOutboundMessageEdit).not.toHaveBeenCalled();
     });
 
     it('throws BadRequestException when the session is not started', async () => {
-      (sessionService.getEngine as jest.Mock).mockReturnValue(undefined);
+      engines.delete('sess-1');
       await expect(
         service.editMessage('sess-1', { chatId: 'test@c.us', messageId: 'wa-msg-1', body: 'edited' }),
       ).rejects.toBeInstanceOf(BadRequestException);
@@ -1330,7 +1343,7 @@ describe('MessageService', () => {
       ).rejects.toThrow('Message sending blocked by plugin');
 
       expect(mockEngine.editMessage).not.toHaveBeenCalled();
-      expect(sessionService.recordOutboundMessageEdit).not.toHaveBeenCalled();
+      expect(messageProjector.recordOutboundMessageEdit).not.toHaveBeenCalled();
     });
 
     it('threads a plugin-rewritten edit body through to the engine and the stored row', async () => {
@@ -1342,7 +1355,7 @@ describe('MessageService', () => {
       await service.editMessage('sess-1', { chatId: 'test@c.us', messageId: 'wa-msg-1', body: 'secret' });
 
       expect(mockEngine.editMessage).toHaveBeenCalledWith('test@c.us', 'wa-msg-1', 'redacted');
-      expect(sessionService.recordOutboundMessageEdit).toHaveBeenCalledWith('sess-1', 'wa-msg-1', 'redacted');
+      expect(messageProjector.recordOutboundMessageEdit).toHaveBeenCalledWith('sess-1', 'wa-msg-1', 'redacted');
     });
   });
 

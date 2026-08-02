@@ -8,6 +8,7 @@ import {
   isExecutionContextDestroyedError,
   buildProxyLaunchConfig,
   loadRemoteMedia,
+  probeOnboardingModal,
   resolveAuthTimeoutMs,
   wwebjsAckToDeliveryStatus,
   extractWwebjsCall,
@@ -905,6 +906,197 @@ describe('WhatsAppWebJsAdapter.forceDestroy (recover a wedged session, #351)', (
   });
 });
 
+// Credential teardown is the only operation that removes this session's on-disk WhatsApp credentials
+// (the LocalAuth profile dir). Two code paths reach it: the adapter's own logout() (client.logout()
+// chains authStrategy.logout() → fs.rm) and a WhatsApp-initiated unlink (the lib emits
+// disconnected:LOGOUT, THEN awaits authStrategy.logout() → fs.rm). Both must surface the destructive
+// promise to the lifecycle via onCredentialTeardownStarted SYNCHRONOUSLY, before the awaited settle,
+// so a concurrent start()/delete()/reconnect for the same session NAME sees the in-flight rm and waits
+// for it instead of re-creating/purging credentials the rm is about to delete.
+describe('WhatsAppWebJsAdapter credential-teardown observation', () => {
+  const newAdapter = (): WhatsAppWebJsAdapter =>
+    new WhatsAppWebJsAdapter({ sessionId: 'sess-1', sessionDataPath: './data/sessions', puppeteer: {} });
+  type FakeClient = EventEmitter & {
+    info?: { wid?: { user?: string }; pushname?: string };
+    getState: jest.Mock;
+    pupPage: { evaluate: jest.Mock };
+    destroy?: jest.Mock;
+    logout?: jest.Mock;
+  };
+
+  // Mirrors the ready-reconciliation helper but wires the credential-teardown callback too.
+  const attach = (
+    adapter: WhatsAppWebJsAdapter,
+    overrides: Partial<FakeClient> = {},
+  ): { client: FakeClient; onCredentialTeardownStarted: jest.Mock } => {
+    const client = Object.assign(new EventEmitter(), {
+      info: { wid: { user: '628123' }, pushname: 'Tester' },
+      getState: jest.fn().mockResolvedValue(WAState.CONNECTED),
+      pupPage: { evaluate: jest.fn().mockResolvedValue(true) },
+      ...overrides,
+    }) as FakeClient;
+    const onCredentialTeardownStarted = jest.fn();
+    (adapter as unknown as { client: unknown }).client = client;
+    (adapter as unknown as { callbacks: unknown }).callbacks = { onCredentialTeardownStarted };
+    (adapter as unknown as { setupEventHandlers: () => void }).setupEventHandlers();
+    return { client, onCredentialTeardownStarted };
+  };
+
+  // clearLocalAuth() really removes `<sessionDataPath>/session-<sessionId>`, and these tests assert
+  // the registration contract rather than the removal itself. Stub the rm: unmocked, a developer whose
+  // machine happens to hold a session named 'sess-1' would have its WhatsApp credentials deleted just
+  // by running the suite — and force:true makes that silent.
+  let rmSpy: jest.SpyInstance;
+
+  beforeEach(() => {
+    rmSpy = jest.spyOn(fs.promises, 'rm').mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    rmSpy.mockRestore();
+    jest.useRealTimers();
+  });
+
+  // A caller-initiated logout is tracked from OUTSIDE the adapter: SessionService hands the session
+  // name to teardownEngineSafely, which registers the whole engine.logout() promise — a superset of
+  // the in-page unlink and the profile rm that follows it — and that is the single owner for both
+  // engines (the Baileys adapter reports nothing here either). Registering again from inside would
+  // add a second, narrower promise for the same removal.
+  it('logout() does not register a credential teardown — the lifecycle already tracks this call', async () => {
+    const adapter = newAdapter();
+    const { onCredentialTeardownStarted } = attach(adapter, {
+      logout: jest.fn().mockResolvedValue(undefined),
+      destroy: jest.fn().mockResolvedValue(undefined),
+    });
+
+    await expect(adapter.logout()).resolves.toBeUndefined();
+
+    expect(onCredentialTeardownStarted).not.toHaveBeenCalled();
+  });
+
+  // …and the stand-in the 'disconnected' handler adds for a WhatsApp-initiated logout must not fire
+  // for this one either, or the same removal would be registered twice from two directions.
+  it('logout() suppresses the disconnected-LOGOUT stand-in for its own unlink', async () => {
+    const adapter = newAdapter();
+    const { client, onCredentialTeardownStarted } = attach(adapter, {
+      // client.logout() triggers the in-page logout, which surfaces as disconnected:LOGOUT while the
+      // adapter is still awaiting it.
+      logout: jest.fn().mockImplementation(() => {
+        client.emit('disconnected', 'LOGOUT');
+        return Promise.resolve();
+      }),
+      destroy: jest.fn().mockResolvedValue(undefined),
+    });
+
+    await adapter.logout();
+
+    expect(onCredentialTeardownStarted).not.toHaveBeenCalled();
+  });
+
+  it('a WhatsApp-originated disconnected:LOGOUT registers the credential-teardown promise synchronously before the event loop can run', async () => {
+    // The lib emits disconnected:LOGOUT BEFORE it awaits authStrategy.logout() (the fs.rm). The adapter
+    // must register the destructive cleanup synchronously within the event handler so a start()/reconnect
+    // that races on the next tick observes the in-flight rm.
+    const adapter = newAdapter();
+    const { client, onCredentialTeardownStarted } = attach(adapter);
+
+    client.emit('disconnected', 'LOGOUT');
+
+    // Synchronous: the callback was handed a promise before any await settled.
+    expect(onCredentialTeardownStarted).toHaveBeenCalledTimes(1);
+    const [tracked] = onCredentialTeardownStarted.mock.calls[0] as [Promise<void>];
+    expect(tracked).toBeInstanceOf(Promise);
+    // The fence survives until the tracked rm settles (here it resolves).
+    await expect(tracked).resolves.toBeUndefined();
+  });
+
+  it('does not register a credential teardown for a non-LOGOUT disconnect (a transient drop, not credential removal)', () => {
+    const adapter = newAdapter();
+    const { client, onCredentialTeardownStarted } = attach(adapter);
+
+    client.emit('disconnected', 'NAVIGATION');
+
+    expect(onCredentialTeardownStarted).not.toHaveBeenCalled();
+  });
+
+  it('does not register a second credential teardown when THIS adapter started the logout', () => {
+    // client.logout() during adapter.logout() also fires disconnected:LOGOUT. That path already
+    // registered the real client.logout() promise, which covers the same rm, so the handler must not
+    // add a redundant stand-in. Keyed on logoutInitiated — NOT on tearingDown, which every teardown
+    // path sets (see the next test).
+    const adapter = newAdapter();
+    const { client, onCredentialTeardownStarted } = attach(adapter);
+    (adapter as unknown as { logoutInitiated: boolean }).logoutInitiated = true;
+    (adapter as unknown as { tearingDown: boolean }).tearingDown = true;
+
+    client.emit('disconnected', 'LOGOUT');
+
+    expect(onCredentialTeardownStarted).not.toHaveBeenCalled();
+  });
+
+  // The regression this pair guards: whatsapp-web.js runs authStrategy.logout() → fs.rm(userDataDir)
+  // whatever our listener does. If a stop()/destroy() has already latched the finished flags, an
+  // early return would hide that in-flight rm from the name fence, and a later start() under the same
+  // session name could have its freshly written profile deleted by it.
+  it('registers the credential teardown for a WhatsApp LOGOUT that lands after a stop/destroy set tearingDown', () => {
+    const adapter = newAdapter();
+    const { client, onCredentialTeardownStarted } = attach(adapter);
+    // disconnect()/destroy()/forceDestroy() all set this WITHOUT owning a credential teardown.
+    (adapter as unknown as { tearingDown: boolean }).tearingDown = true;
+
+    client.emit('disconnected', 'LOGOUT');
+
+    expect(onCredentialTeardownStarted).toHaveBeenCalledTimes(1);
+    const [tracked] = onCredentialTeardownStarted.mock.calls[0] as [Promise<void>];
+    expect(tracked).toBeInstanceOf(Promise);
+    // The registered promise is the profile removal itself, not an unrelated resolved promise — and
+    // asserting on the spy also proves the stub above is the fs call being made, not the real one.
+    expect(rmSpy).toHaveBeenCalledWith(expect.stringContaining('session-sess-1'), {
+      recursive: true,
+      force: true,
+    });
+  });
+
+  it('registers the credential teardown for a WhatsApp LOGOUT that lands after a disconnect was already reported', () => {
+    const adapter = newAdapter();
+    const { client, onCredentialTeardownStarted } = attach(adapter);
+    // setStatus(DISCONNECTED) latches this on the first drop; a LOGOUT arriving afterwards still
+    // means the library is deleting the profile.
+    (adapter as unknown as { disconnectReported: boolean }).disconnectReported = true;
+
+    client.emit('disconnected', 'LOGOUT');
+
+    expect(onCredentialTeardownStarted).toHaveBeenCalledTimes(1);
+  });
+
+  it('still reports nothing else for a latched LOGOUT — no status change and no onDisconnected', () => {
+    // Registering the rm must NOT resurrect the rest of the handler: a finished adapter still must
+    // not drive a status transition or schedule a reconnect for its replacement.
+    const adapter = newAdapter();
+    const client = Object.assign(new EventEmitter(), {
+      getState: jest.fn().mockResolvedValue(WAState.CONNECTED),
+      pupPage: { evaluate: jest.fn().mockResolvedValue(true) },
+    }) as FakeClient;
+    const onCredentialTeardownStarted = jest.fn();
+    const onDisconnected = jest.fn();
+    const onStateChanged = jest.fn();
+    (adapter as unknown as { client: unknown }).client = client;
+    (adapter as unknown as { callbacks: unknown }).callbacks = {
+      onCredentialTeardownStarted,
+      onDisconnected,
+      onStateChanged,
+    };
+    (adapter as unknown as { setupEventHandlers: () => void }).setupEventHandlers();
+    (adapter as unknown as { tearingDown: boolean }).tearingDown = true;
+
+    client.emit('disconnected', 'LOGOUT');
+
+    expect(onCredentialTeardownStarted).toHaveBeenCalledTimes(1);
+    expect(onDisconnected).not.toHaveBeenCalled();
+    expect(onStateChanged).not.toHaveBeenCalled();
+  });
+});
+
 describe('WhatsAppWebJsAdapter ready reconciliation (#251/#273)', () => {
   const newAdapter = (): WhatsAppWebJsAdapter =>
     new WhatsAppWebJsAdapter({ sessionId: 'sess-1', sessionDataPath: './data/sessions', puppeteer: {} });
@@ -1066,7 +1258,9 @@ describe('WhatsAppWebJsAdapter ready reconciliation (#251/#273)', () => {
     client.emit('authenticated');
 
     expect(adapter.getStatus()).toBe(EngineStatus.READY);
-    expect(jest.getTimerCount()).toBe(0);
+    // Ready reconciliation is done (0 reconcile timers), but reaching READY arms the onboarding-modal
+    // watcher (#982), so one timer remains until it self-terminates or teardown clears it.
+    expect(jest.getTimerCount()).toBe(1);
     expect(onReady).toHaveBeenCalledTimes(1);
   });
 
@@ -1087,6 +1281,33 @@ describe('WhatsAppWebJsAdapter ready reconciliation (#251/#273)', () => {
       },
       adapter => adapter.logout(),
     );
+  });
+
+  it('logout() rethrows after the destroy fallback so an unconfirmed unlink is observable', async () => {
+    // Swallowing the failure would report a successful unlink that never reached WhatsApp —
+    // and write a false SESSION_LOGGED_OUT audit row up-stack. The session must still die
+    // locally (destroy fallback), but the error must reach the caller.
+    const adapter = newAdapter();
+    const unlinkError = new Error('evaluate failed');
+    const { client } = attachFakeClient(adapter, {
+      logout: jest.fn().mockRejectedValue(unlinkError),
+      destroy: jest.fn().mockResolvedValue(undefined),
+    });
+
+    await expect(adapter.logout()).rejects.toBe(unlinkError);
+    expect(client.destroy).toHaveBeenCalledTimes(1); // local teardown still happened
+    expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
+  });
+
+  // The session layer's "is it started?" check only sees that an engine is registered. An engine can
+  // outlive its client — a stuck-auth recovery nulls it and then waits out the reconnect backoff — and
+  // resolving here would report a confirmed unlink for a request that never left the process, complete
+  // with a SESSION_LOGGED_OUT audit row, while the device stayed listed under Linked Devices.
+  it('logout() rejects when there is no live client rather than reporting a phantom unlink', async () => {
+    const adapter = newAdapter();
+    (adapter as unknown as { client: unknown }).client = null;
+
+    await expect(adapter.logout()).rejects.toThrow(/no live whatsapp web client/i);
   });
 
   it('disables ready reconciliation before destroy awaits client teardown', async () => {
@@ -1200,6 +1421,181 @@ describe('WhatsAppWebJsAdapter ready reconciliation (#251/#273)', () => {
     expect(onQRCode).toHaveBeenCalledTimes(1);
   });
 
+  // #982: whatsapp-web.js does NOT destroy the client on LOGOUT — it deletes the auth profile and
+  // re-runs inject() on the SAME browser, which re-arms the QR handler. The session lifecycle only
+  // tears the engine down after the reconnect backoff (~5s by default, operator-raisable to 300s), so
+  // there is a window where the adapter is DISCONNECTED but NOT tearing down. A QR emitted then belongs
+  // to a browser about to be killed: scanning it links a phantom device and the real QR arrives seconds
+  // later. Same short-circuit-before-encode check as the teardown case above.
+  it('ignores a qr event fired after a LOGOUT disconnect (before teardown starts)', async () => {
+    (qrcode.toDataURL as unknown as jest.Mock).mockClear();
+    const adapter = newAdapter();
+    const { client } = attachFakeClient(adapter);
+    const onQRCode = jest.fn();
+    (adapter as unknown as { callbacks: { onQRCode: jest.Mock } }).callbacks.onQRCode = onQRCode;
+
+    client.emit('disconnected', 'LOGOUT');
+    expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
+    // The distinguishing property of this window: no teardown has begun, so `tearingDown` is still
+    // false and cannot be what suppresses the stale QR.
+    expect((adapter as unknown as { tearingDown: boolean }).tearingDown).toBe(false);
+
+    client.emit('qr', '2@stale-after-logout');
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(qrcode.toDataURL as unknown as jest.Mock).not.toHaveBeenCalled(); // guard short-circuits before the encode
+    expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
+    expect(onQRCode).not.toHaveBeenCalled();
+  });
+
+  // A 'qr' whose pre-await guard passes but whose source client disconnects during the
+  // qrcode.toDataURL() await must not publish a QR after the await resolves. The handler captures the
+  // source client reference, encodes to a LOCAL variable, and re-checks the source-client identity and
+  // the finished flags AFTER the await — so a late encode does not resurrect a finished adapter to
+  // QR_READY, does not overwrite qrCode with a stale value, and does not re-fire the publish/webhook
+  // callback. A native 'disconnected' emitted mid-encode latches disconnectReported synchronously (via
+  // setStatus(DISCONNECTED)) and is exactly the post-await-unsafe window F-06 names.
+  it('drops a QR whose encode finishes after the source client disconnects', async () => {
+    let resolveEncode!: (value: string) => void;
+    const encodePending = new Promise<string>(resolve => {
+      resolveEncode = resolve;
+    });
+    (qrcode.toDataURL as unknown as jest.Mock).mockReturnValue(encodePending);
+
+    const adapter = newAdapter();
+    const { client } = attachFakeClient(adapter);
+    const onQRCode = jest.fn();
+    const onStateChanged = jest.fn();
+    (adapter as unknown as { callbacks: { onQRCode: jest.Mock; onStateChanged: jest.Mock } }).callbacks = {
+      ...((adapter as unknown as { callbacks: unknown }).callbacks as object),
+      onQRCode,
+      onStateChanged,
+    };
+
+    // Pre-await guard passes: the adapter is fresh, no teardown, no disconnect reported.
+    client.emit('qr', '2@late');
+    await Promise.resolve();
+    // The encode is in flight (handler is parked on the awaited toDataURL).
+
+    // The source client disconnects while the encode is pending. setStatus(DISCONNECTED) latches
+    // disconnectReported synchronously — the post-await fence must observe it.
+    client.emit('disconnected', 'NAVIGATION');
+    expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
+    expect((adapter as unknown as { disconnectReported: boolean }).disconnectReported).toBe(true);
+
+    // The late encode resolves. The post-await fence must drop it.
+    resolveEncode('data:image/png;base64,LATEQR');
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
+    expect(onQRCode).not.toHaveBeenCalled();
+    expect((adapter as unknown as { qrCode: string | null }).qrCode).toBeNull();
+    expect(onStateChanged).not.toHaveBeenCalledWith(EngineStatus.QR_READY);
+  });
+
+  // #982: 'LOGOUT' is not a transient drop and the lifecycle cannot recover the link from it —
+  // whatsapp-web.js has already deleted the auth profile by the time the event arrives. The opaque
+  // engine token alone left operators reading it as an ordinary disconnect, so the adapter explains it.
+  it('explains a LOGOUT disconnect (credentials deleted, re-scan required)', () => {
+    const adapter = newAdapter();
+    const logger = (adapter as unknown as { logger: { warn: (m: string) => void } }).logger;
+    const warnSpy = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const { client } = attachFakeClient(adapter);
+
+    client.emit('disconnected', 'LOGOUT');
+
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy.mock.calls[0][0]).toMatch(/re-scan/i);
+    expect(warnSpy.mock.calls[0][0]).toMatch(/credential/i);
+  });
+
+  // Guards against over-explaining: an ordinary transient reason must not gain the re-scan advisory.
+  it('does not explain an ordinary transient disconnect reason', () => {
+    const adapter = newAdapter();
+    const logger = (adapter as unknown as { logger: { warn: (m: string) => void } }).logger;
+    const warnSpy = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const { client } = attachFakeClient(adapter);
+
+    client.emit('disconnected', 'CONFLICT');
+
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  // A deliberate logout() also raises this event: client.logout() triggers the in-page Cmd 'logout'
+  // → framenavigated → DISCONNECTED 'LOGOUT' while the adapter is still awaiting it. The unlink is
+  // already acknowledged by the API response and the session service writes DISCONNECTED itself, so
+  // the handler must stay silent — mirroring the puppeteer-death gate. A WhatsApp-initiated unlink
+  // arrives with tearingDown=false and still flows through (the tests above).
+  it('does not report a disconnected event raised by a deliberate logout()', async () => {
+    let settleLogout: () => void = () => undefined;
+    const logout = jest.fn(
+      () =>
+        new Promise<void>(resolve => {
+          settleLogout = resolve;
+        }),
+    );
+    const adapter = newAdapter();
+    const { client } = attachFakeClient(adapter, {
+      logout,
+      destroy: jest.fn().mockResolvedValue(undefined),
+    });
+    const onDisconnected = jest.fn();
+    (adapter as unknown as { callbacks: { onDisconnected: jest.Mock } }).callbacks.onDisconnected = onDisconnected;
+
+    const logoutCall = adapter.logout();
+    client.emit('disconnected', 'LOGOUT'); // the in-page Socket.logout() raises this mid-flight
+    settleLogout();
+    await logoutCall;
+
+    expect(logout).toHaveBeenCalledTimes(1);
+    expect(onDisconnected).not.toHaveBeenCalled();
+  });
+
+  // A duplicate native 'disconnected' (whatsapp-web.js can fire it more than once for one underlying
+  // drop) must not re-run clearReadyReconcile, re-enter setStatus(DISCONNECTED), or re-fire
+  // onDisconnected — otherwise the lifecycle schedules a second reconnect. setStatus(DISCONNECTED)
+  // already latches disconnectReported synchronously on the first event; the handler's first line must
+  // check that latch and no-op before any log/status/callback. The first reason is preserved.
+  it('emits exactly one onDisconnected when duplicate client disconnected fires', () => {
+    const adapter = newAdapter();
+    const { client } = attachFakeClient(adapter);
+    const onDisconnected = jest.fn();
+    const onStateChanged = jest.fn();
+    (adapter as unknown as { callbacks: { onDisconnected: jest.Mock; onStateChanged: jest.Mock } }).callbacks = {
+      ...((adapter as unknown as { callbacks: unknown }).callbacks as object),
+      onDisconnected,
+      onStateChanged,
+    };
+
+    client.emit('disconnected', 'NAV_TIMEOUT');
+    client.emit('disconnected', 'NAV_TIMEOUT');
+
+    expect(onDisconnected).toHaveBeenCalledTimes(1);
+    expect(onDisconnected).toHaveBeenLastCalledWith('NAV_TIMEOUT');
+    expect(onStateChanged).toHaveBeenCalledTimes(1);
+    expect(onStateChanged).toHaveBeenLastCalledWith(EngineStatus.DISCONNECTED);
+  });
+
+  // The same #982 window for 'authenticated': the re-injected client can re-authenticate on the browser
+  // that is about to be replaced. Reviving to AUTHENTICATING would also re-arm the 90s ready-reconcile
+  // probe against it.
+  it('ignores an authenticated event fired after a LOGOUT disconnect (before teardown starts)', () => {
+    jest.useFakeTimers();
+
+    const adapter = newAdapter();
+    const { client } = attachFakeClient(adapter);
+
+    client.emit('disconnected', 'LOGOUT');
+    expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
+
+    client.emit('authenticated');
+    expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
+    expect(jest.getTimerCount()).toBe(0); // no ready-reconcile armed on an engine about to be replaced
+  });
+
   // A wedged page can make getState() hang (the exact #251/#273 condition). The probe must keep its
   // own cadence (a hung probe can't stall the loop) and still honor the 90s give-up deadline.
   it('keeps probing and self-heals (clears auth + disconnects) when getState hangs past the deadline', async () => {
@@ -1229,6 +1625,53 @@ describe('WhatsAppWebJsAdapter ready reconciliation (#251/#273)', () => {
     rmSpy.mockRestore();
   });
 
+  // #981: clearing the auth dir destroys the ONLY copy of the session's WhatsApp credentials, and the
+  // loss is permanent — every later start finds an empty profile and can only show a QR. Until now the
+  // adapter logged only the FAILURE to delete, so a successful wipe left no trace at all and triage
+  // could not tell an OpenWA self-heal apart from a WhatsApp-side logout or an untouched profile.
+  it('records the credential deletion, naming the session and the directory removed', async () => {
+    const rmSpy = jest.spyOn(fs.promises, 'rm').mockResolvedValue(undefined);
+    const adapter = newAdapter();
+    const logger = (adapter as unknown as { logger: { warn: jest.Mock } }).logger;
+    const warnSpy = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+
+    await (adapter as unknown as { clearLocalAuth: () => Promise<void> }).clearLocalAuth.call(adapter);
+
+    expect(rmSpy).toHaveBeenCalled();
+    const deletion = warnSpy.mock.calls.find(([message]) => /deleted/i.test(String(message)));
+    expect(deletion).toBeDefined();
+    expect(String(deletion?.[0])).toContain('session-sess-1'); // which profile is gone
+    expect(deletion?.[1]).toMatchObject({ sessionId: 'sess-1' }); // which session, for a multi-session host
+
+    warnSpy.mockRestore();
+    rmSpy.mockRestore();
+  });
+
+  // #981: the reporter saw "all sessions" come back as QR. Without a sessionId on the timeout warning
+  // there is no way to tell from the logs whether one session timed out or every one of them did.
+  it('identifies the session in the readiness-timeout warning that precedes the deletion', async () => {
+    jest.useFakeTimers();
+    const rmSpy = jest.spyOn(fs.promises, 'rm').mockResolvedValue(undefined);
+
+    const adapter = newAdapter();
+    const logger = (adapter as unknown as { logger: { warn: jest.Mock } }).logger;
+    const warnSpy = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const { client } = attachFakeClient(adapter, {
+      getState: jest.fn().mockReturnValue(new Promise<never>(() => {})),
+      destroy: jest.fn().mockResolvedValue(undefined),
+    });
+
+    client.emit('authenticated');
+    await jest.advanceTimersByTimeAsync(95_000); // past the 90s give-up deadline
+
+    const timeout = warnSpy.mock.calls.find(([message]) => /Timed out waiting/i.test(String(message)));
+    expect(timeout).toBeDefined();
+    expect(timeout?.[1]).toMatchObject({ sessionId: 'sess-1' });
+
+    warnSpy.mockRestore();
+    rmSpy.mockRestore();
+  });
+
   it('fails terminally on a second stuck-auth cycle (no QR -> timeout -> clear loop)', async () => {
     const rmSpy = jest.spyOn(fs.promises, 'rm').mockResolvedValue(undefined);
     const adapter = newAdapter();
@@ -1245,6 +1688,113 @@ describe('WhatsAppWebJsAdapter ready reconciliation (#251/#273)', () => {
     expect(onError).toHaveBeenCalled();
     expect(rmSpy).toHaveBeenCalledTimes(1); // auth cleared only once
     rmSpy.mockRestore();
+  });
+
+  // Stuck-auth recovery budget is now owned by the SESSION, not the adapter. The adapter asks the
+  // session's synchronous claim callback before any destructive I/O; a DENIAL is terminal and must
+  // never touch the auth dir. (The instance-local boolean above remains as the fallback for standalone
+  // adapter use/test where no callback is supplied.)
+  describe('stuck-auth recovery claim/deny path', () => {
+    const newAdapter = (): WhatsAppWebJsAdapter =>
+      new WhatsAppWebJsAdapter({ sessionId: 'sess-1', sessionDataPath: './data/sessions', puppeteer: {} });
+
+    // Failing assertions throw before the per-test rmSpy.mockRestore() runs, which would leave the
+    // fs.promises.rm spy installed and let its call count leak into the next test. Restore every spy
+    // after each test so each starts from a clean fs.
+    afterEach(() => {
+      jest.restoreAllMocks();
+    });
+
+    it('does NOT clear auth and goes terminal FAILED when the claim callback DENIES (budget already spent by an earlier generation)', async () => {
+      const rmSpy = jest.spyOn(fs.promises, 'rm').mockResolvedValue(undefined);
+      const adapter = newAdapter();
+      const onError = jest.fn();
+      const onDisconnected = jest.fn();
+      // The session denies: a prior generation already used the one-shot budget.
+      (adapter as unknown as { callbacks: unknown }).callbacks = {
+        onError,
+        onDisconnected,
+        claimStuckAuthRecovery: () => false,
+      };
+      const recover = (adapter as unknown as { recoverFromStuckAuth: () => Promise<void> }).recoverFromStuckAuth.bind(
+        adapter,
+      );
+
+      await recover();
+
+      // The destructive rm must NEVER run — denial is terminal before any I/O.
+      expect(rmSpy).not.toHaveBeenCalled();
+      expect(adapter.getStatus()).toBe(EngineStatus.FAILED);
+      expect(onError).toHaveBeenCalledTimes(1);
+      expect(onError).toHaveBeenCalledWith(expect.stringMatching(/could not reach readiness after re-pairing/i));
+      // A denied claim does NOT drive the reconnect path: no disconnect, no re-pair.
+      expect(onDisconnected).not.toHaveBeenCalled();
+      rmSpy.mockRestore();
+    });
+
+    it('clears auth and disconnects when the claim callback GRANTS (the recovery is allowed to proceed)', async () => {
+      const rmSpy = jest.spyOn(fs.promises, 'rm').mockResolvedValue(undefined);
+      const adapter = newAdapter();
+      const onDisconnected = jest.fn();
+      (adapter as unknown as { callbacks: unknown }).callbacks = {
+        onDisconnected,
+        claimStuckAuthRecovery: () => true,
+      };
+      const recover = (adapter as unknown as { recoverFromStuckAuth: () => Promise<void> }).recoverFromStuckAuth.bind(
+        adapter,
+      );
+
+      await recover();
+
+      expect(rmSpy).toHaveBeenCalledTimes(1);
+      expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
+      expect(onDisconnected).toHaveBeenCalledWith(expect.stringContaining('cleared for re-pairing'));
+      rmSpy.mockRestore();
+    });
+
+    it('still grants only once via the fallback instance-local boolean when NO claim callback is supplied (standalone adapter use stays one-shot)', async () => {
+      const rmSpy = jest.spyOn(fs.promises, 'rm').mockResolvedValue(undefined);
+      const adapter = newAdapter();
+      const onError = jest.fn();
+      // No claimStuckAuthRecovery callback — standalone adapter (no session lifecycle).
+      (adapter as unknown as { callbacks: { onError?: jest.Mock } }).callbacks = { onError };
+      const recover = (adapter as unknown as { recoverFromStuckAuth: () => Promise<void> }).recoverFromStuckAuth.bind(
+        adapter,
+      );
+
+      await recover(); // fallback grants: clears + disconnects
+      expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
+      await recover(); // fallback denies: terminal
+      expect(adapter.getStatus()).toBe(EngineStatus.FAILED);
+      expect(onError).toHaveBeenCalled();
+      expect(rmSpy).toHaveBeenCalledTimes(1);
+      rmSpy.mockRestore();
+    });
+
+    it('treats a claim callback that THROWS as a denial (fail-closed: never wipe credentials on an unsettled claim)', async () => {
+      const rmSpy = jest.spyOn(fs.promises, 'rm').mockResolvedValue(undefined);
+      const adapter = newAdapter();
+      const onError = jest.fn();
+      const onDisconnected = jest.fn();
+      (adapter as unknown as { callbacks: unknown }).callbacks = {
+        onError,
+        onDisconnected,
+        claimStuckAuthRecovery: () => {
+          throw new Error('claim blew up');
+        },
+      };
+      const recover = (adapter as unknown as { recoverFromStuckAuth: () => Promise<void> }).recoverFromStuckAuth.bind(
+        adapter,
+      );
+
+      await recover();
+
+      expect(rmSpy).not.toHaveBeenCalled();
+      expect(adapter.getStatus()).toBe(EngineStatus.FAILED);
+      expect(onError).toHaveBeenCalled();
+      expect(onDisconnected).not.toHaveBeenCalled();
+      rmSpy.mockRestore();
+    });
   });
 });
 
@@ -2512,6 +3062,254 @@ describe('outbound voice note (PTT)', () => {
       expect.anything(),
       expect.not.objectContaining({ sendAudioAsVoice: true }),
     );
+  });
+});
+
+describe('outbound document mode (#989)', () => {
+  const ready = (client: unknown): WhatsAppWebJsAdapter => {
+    const adapter = new WhatsAppWebJsAdapter({ sessionId: 's', sessionDataPath: './data/sessions', puppeteer: {} });
+    (adapter as unknown as { status: EngineStatus }).status = EngineStatus.READY;
+    (adapter as unknown as { client: unknown }).client = client;
+    return adapter;
+  };
+  const sentMessage = { id: { _serialized: 'OUT1' }, timestamp: 1700000001 };
+  const bytes = Buffer.from([1]).toString('base64');
+
+  // The regression itself: an image mimetype is exactly what WA Web would reclassify into a photo
+  // bubble, so the flag — not the mimetype — has to decide that this is a document.
+  it('sendDocumentMessage forces sendMediaAsDocument even for an image mimetype', async () => {
+    const sendMessage = jest.fn().mockResolvedValue(sentMessage);
+    await ready({ sendMessage }).sendDocumentMessage('628@c.us', {
+      mimetype: 'image/png',
+      data: bytes,
+      filename: 'chart.png',
+    });
+    expect(sendMessage).toHaveBeenCalledWith(
+      '628@c.us',
+      expect.objectContaining({ mimetype: 'image/png', filename: 'chart.png' }),
+      expect.objectContaining({ sendMediaAsDocument: true }),
+    );
+  });
+
+  // whatsapp-web.js returns null for ANY @broadcast recipient once the flag is set, and a null send
+  // throws — so these two must keep taking the unflagged path.
+  it.each(['status@broadcast', '1234567890@broadcast'])('withholds sendMediaAsDocument for %s', async chatId => {
+    const sendMessage = jest.fn().mockResolvedValue(sentMessage);
+    await ready({ sendMessage }).sendDocumentMessage(chatId, {
+      mimetype: 'application/pdf',
+      data: bytes,
+      filename: 'report.pdf',
+    });
+    expect(sendMessage).toHaveBeenCalledWith(
+      chatId,
+      expect.anything(),
+      expect.not.objectContaining({ sendMediaAsDocument: true }),
+    );
+  });
+
+  it('defaults a nameless document to "file" (WA Web would otherwise label it "undefined")', async () => {
+    const sendMessage = jest.fn().mockResolvedValue(sentMessage);
+    await ready({ sendMessage }).sendDocumentMessage('628@c.us', { mimetype: 'application/pdf', data: bytes });
+    expect(sendMessage).toHaveBeenCalledWith(
+      '628@c.us',
+      expect.objectContaining({ filename: 'file' }),
+      expect.objectContaining({ sendMediaAsDocument: true }),
+    );
+  });
+
+  it('leaves the other media senders off the document path', async () => {
+    const sendMessage = jest.fn().mockResolvedValue(sentMessage);
+    await ready({ sendMessage }).sendImageMessage('628@c.us', { mimetype: 'image/png', data: bytes });
+    expect(sendMessage).toHaveBeenCalledWith('628@c.us', expect.anything(), { caption: undefined });
+  });
+
+  // A URL fetch can only describe the bytes from the response — content-type and the URL basename —
+  // so it used to overwrite whatever the request actually said. The caller knows better.
+  describe('remote-URL sends honour the metadata the caller declared', () => {
+    const remoteResponse = (headers: Record<string, string>) => ({
+      ok: true,
+      status: 200,
+      headers: { get: (k: string) => headers[k.toLowerCase()] ?? null },
+      body: {
+        getReader: () => {
+          let done = false;
+          return {
+            read: () =>
+              done
+                ? Promise.resolve({ done: true, value: undefined })
+                : ((done = true), Promise.resolve({ done: false, value: new Uint8Array([1, 2]) })),
+            cancel: () => Promise.resolve(),
+          };
+        },
+        cancel: () => Promise.resolve(),
+      },
+    });
+
+    beforeEach(() => {
+      (undiciFetch as jest.Mock).mockReset();
+      process.env.SSRF_ALLOWED_HOSTS = 'files.example.com';
+    });
+    afterEach(() => {
+      (undiciFetch as jest.Mock).mockReset();
+      delete process.env.SSRF_ALLOWED_HOSTS;
+    });
+
+    it('prefers the declared mimetype and filename over what the response advertised', async () => {
+      (undiciFetch as jest.Mock).mockResolvedValue(remoteResponse({ 'content-type': 'image/jpeg' }));
+      const sendMessage = jest.fn().mockResolvedValue(sentMessage);
+
+      await ready({ sendMessage }).sendDocumentMessage('628@c.us', {
+        mimetype: 'application/pdf',
+        filename: 'report.pdf',
+        data: 'https://files.example.com/generated',
+      });
+
+      expect(sendMessage).toHaveBeenCalledWith(
+        '628@c.us',
+        expect.objectContaining({ mimetype: 'application/pdf', filename: 'report.pdf' }),
+        expect.objectContaining({ sendMediaAsDocument: true }),
+      );
+    });
+
+    // A sticker's mimetype is an instruction, not a label: whatsapp-web.js returns the media
+    // unconverted once it reads as webp, so trusting a declared image/webp over bytes that are not
+    // webp ships raw bytes as a sticker. The response saw the bytes; the caller did not.
+    it('keeps the fetched type for a sticker, where the mimetype selects the conversion', async () => {
+      (undiciFetch as jest.Mock).mockResolvedValue(remoteResponse({ 'content-type': 'image/png' }));
+      const sendMessage = jest.fn().mockResolvedValue(sentMessage);
+
+      await ready({ sendMessage }).sendStickerMessage('628@c.us', {
+        mimetype: 'image/webp',
+        data: 'https://files.example.com/not-really-a-webp',
+      });
+
+      expect(sendMessage).toHaveBeenCalledWith(
+        '628@c.us',
+        expect.objectContaining({ mimetype: 'image/png' }),
+        expect.objectContaining({ sendMediaAsSticker: true }),
+      );
+    });
+
+    // A specific fetched image/video MIME stays authoritative — a host that actually says
+    // image/jpeg for the bytes is trusted over a caller that just guessed. Here the declared type
+    // is itself a convertible image type, yet the fetched type still wins.
+    it('keeps the fetched type for a sticker even when the declared type is also convertible', async () => {
+      (undiciFetch as jest.Mock).mockResolvedValue(remoteResponse({ 'content-type': 'image/jpeg' }));
+      const sendMessage = jest.fn().mockResolvedValue(sentMessage);
+
+      await ready({ sendMessage }).sendStickerMessage('628@c.us', {
+        mimetype: 'image/png',
+        data: 'https://files.example.com/actually-a-jpeg',
+      });
+
+      expect(sendMessage).toHaveBeenCalledWith(
+        '628@c.us',
+        expect.objectContaining({ mimetype: 'image/jpeg' }),
+        expect.objectContaining({ sendMediaAsSticker: true }),
+      );
+    });
+
+    // Regression guard: when the fetched MIME says nothing useful (no Content-Type, blank, or the
+    // octet-stream placeholder — including mixed case), the caller's declared convertible image/video
+    // MIME must survive, canonicalized to lowercased/param-stripped. Otherwise whatsapp-web.js rejects
+    // the format before it ever runs the sticker conversion.
+    it.each<[string, string, string, string]>([
+      ['declared image type for a sticker survives a missing Content-Type', '', 'image/png', 'image/png'],
+      ['declared image type for a sticker survives a blank Content-Type', '   ', 'image/png', 'image/png'],
+      [
+        'declared image type for a sticker survives application/octet-stream',
+        'application/octet-stream',
+        'image/png',
+        'image/png',
+      ],
+      [
+        'declared image type for a sticker survives Application/Octet-Stream (mixed case)',
+        'Application/Octet-Stream',
+        'Image/PNG',
+        'image/png',
+      ],
+      ['declared video type for a sticker survives a missing Content-Type', '', 'video/mp4', 'video/mp4'],
+      [
+        'declared image type for a sticker survives a parameterised octet-stream',
+        'application/octet-stream; charset=binary',
+        'image/png',
+        'image/png',
+      ],
+    ])('%s', async (_name, fetchedContentType, declaredMimetype, expectedMimetype) => {
+      (undiciFetch as jest.Mock).mockResolvedValue(remoteResponse({ 'content-type': fetchedContentType }));
+      const sendMessage = jest.fn().mockResolvedValue(sentMessage);
+
+      await ready({ sendMessage }).sendStickerMessage('628@c.us', {
+        mimetype: declaredMimetype,
+        data: 'https://files.example.com/sticker-source',
+      });
+
+      expect(sendMessage).toHaveBeenCalledWith(
+        '628@c.us',
+        expect.objectContaining({ mimetype: expectedMimetype }),
+        expect.objectContaining({ sendMediaAsSticker: true }),
+      );
+    });
+
+    // The fallback is narrow: a generic fetched MIME plus a non-convertible declared type (e.g. the
+    // DTO's own octet-stream placeholder, or any application/*) must NOT be promoted — that would
+    // re-open the "caller can forge any format" hole the trustDeclaredType:false branch closes.
+    it.each<[string, string]>([
+      ['does not promote a declared octet-stream placeholder', 'application/octet-stream'],
+      ['does not promote a declared application/pdf', 'application/pdf'],
+    ])('for a generic fetched response, %s over a sticker send', async (_name, declaredMimetype) => {
+      (undiciFetch as jest.Mock).mockResolvedValue(remoteResponse({ 'content-type': 'application/octet-stream' }));
+      const sendMessage = jest.fn().mockResolvedValue(sentMessage);
+
+      await ready({ sendMessage }).sendStickerMessage('628@c.us', {
+        mimetype: declaredMimetype,
+        data: 'https://files.example.com/sticker-source',
+      });
+
+      // The placeholder sticks — exactly what the DTO would have produced before this change.
+      expect(sendMessage).toHaveBeenCalledWith(
+        '628@c.us',
+        expect.objectContaining({ mimetype: 'application/octet-stream' }),
+        expect.objectContaining({ sendMediaAsSticker: true }),
+      );
+    });
+
+    // The document/image normal path (trustDeclaredType is undefined, not false) is unchanged by the
+    // new fallback: a declared type still wins over the response even when the response is generic.
+    it('does not change the document path when the fetched type is generic (declared type still wins)', async () => {
+      (undiciFetch as jest.Mock).mockResolvedValue(remoteResponse({ 'content-type': 'application/octet-stream' }));
+      const sendMessage = jest.fn().mockResolvedValue(sentMessage);
+
+      await ready({ sendMessage }).sendDocumentMessage('628@c.us', {
+        mimetype: 'application/pdf',
+        filename: 'report.pdf',
+        data: 'https://files.example.com/report',
+      });
+
+      expect(sendMessage).toHaveBeenCalledWith(
+        '628@c.us',
+        expect.objectContaining({ mimetype: 'application/pdf', filename: 'report.pdf' }),
+        expect.objectContaining({ sendMediaAsDocument: true }),
+      );
+    });
+
+    // The DTO fills this in when the client said nothing, so it is a placeholder rather than a claim
+    // about the bytes — the response has to win, or every URL send would go out as a generic blob.
+    it('lets the response win when the declared mimetype is the octet-stream placeholder', async () => {
+      (undiciFetch as jest.Mock).mockResolvedValue(remoteResponse({ 'content-type': 'image/jpeg' }));
+      const sendMessage = jest.fn().mockResolvedValue(sentMessage);
+
+      await ready({ sendMessage }).sendImageMessage('628@c.us', {
+        mimetype: 'application/octet-stream',
+        data: 'https://files.example.com/photo.jpg',
+      });
+
+      expect(sendMessage).toHaveBeenCalledWith(
+        '628@c.us',
+        expect.objectContaining({ mimetype: 'image/jpeg' }),
+        expect.anything(),
+      );
+    });
   });
 });
 
@@ -4053,5 +4851,441 @@ describe('WhatsAppWebJsAdapter honest outcomes (no phantom success)', () => {
       });
       await expect(adapter.getProfilePicture('12345@c.us')).resolves.toBeNull();
     });
+  });
+
+  describe('WhatsAppWebJsAdapter onboarding modal watcher (#982)', () => {
+    type ModalProbe = { modalPresent: boolean; dismissed: boolean };
+
+    const newAdapter = (): WhatsAppWebJsAdapter =>
+      new WhatsAppWebJsAdapter({ sessionId: 'sess-1', sessionDataPath: './data/sessions', puppeteer: {} });
+
+    // Promote the adapter to READY the same way production does (authenticate then let the reconcile
+    // probe flip it), with a controllable pupPage.evaluate shared by both the reconcile probe and the
+    // watcher. Default `evaluate` returns true so the reconcile probe sees window.WWebJS and promotes
+    // to READY; individual tests override the return (mockResolvedValueOnce) for the next watcher tick.
+    const promoteToReady = (): {
+      adapter: WhatsAppWebJsAdapter;
+      client: EventEmitter & {
+        info?: { wid?: { user?: string }; pushname?: string };
+        getState: jest.Mock;
+        pupPage: { evaluate: jest.Mock };
+      };
+      evaluate: jest.Mock;
+      onActionRequired: jest.Mock;
+      onStateChanged: jest.Mock;
+    } => {
+      const adapter = newAdapter();
+      const evaluate = jest.fn();
+      const client = Object.assign(new EventEmitter(), {
+        info: { wid: { user: '628123' }, pushname: 'Tester' },
+        getState: jest.fn().mockResolvedValue(WAState.CONNECTED),
+        pupPage: { evaluate },
+      });
+      const onActionRequired = jest.fn();
+      const onStateChanged = jest.fn();
+      (adapter as unknown as { client: unknown }).client = client;
+      (adapter as unknown as { callbacks: unknown }).callbacks = { onActionRequired, onStateChanged };
+      (adapter as unknown as { setupEventHandlers: () => void }).setupEventHandlers();
+      // Default: window.WWebJS present (reconcile probe) AND no modal (watcher ticks that aren't
+      // overridden). mockResolvedValueOnce in a test takes precedence for exactly the next call.
+      evaluate.mockResolvedValue(true);
+      return { adapter, client, evaluate, onActionRequired, onStateChanged };
+    };
+
+    it('dismisses the modal when the Continue button is present and keeps the session ready (no fallback)', async () => {
+      jest.useFakeTimers();
+      try {
+        const { adapter, evaluate, onActionRequired, client } = promoteToReady();
+
+        (client as EventEmitter).emit('authenticated');
+        await jest.advanceTimersByTimeAsync(2100); // reconcile → READY → watcher armed
+        expect(adapter.getStatus()).toBe(EngineStatus.READY);
+
+        // Next watcher tick sees the modal and clicks Continue.
+        evaluate.mockResolvedValueOnce({ modalPresent: true, dismissed: true } satisfies ModalProbe);
+        await jest.advanceTimersByTimeAsync(5100); // ONBOARDING_MODAL_INTERVAL_MS
+
+        expect(onActionRequired).not.toHaveBeenCalled();
+        expect(adapter.getStatus()).toBe(EngineStatus.READY);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('only falls back to ACTION_REQUIRED once repeated clicks have failed to dismiss the modal', async () => {
+      jest.useFakeTimers();
+      try {
+        const { adapter, evaluate, onActionRequired } = promoteToReady();
+
+        (adapter as unknown as { client: EventEmitter }).client.emit('authenticated');
+        await jest.advanceTimersByTimeAsync(2100);
+        expect(adapter.getStatus()).toBe(EngineStatus.READY);
+
+        // A modal that really goes away is clicked once, so a single click must NOT move the session:
+        // the whole point of the threshold is that only a click which fails to land is evidence.
+        evaluate.mockResolvedValueOnce({ modalPresent: true, dismissed: true } satisfies ModalProbe);
+        await jest.advanceTimersByTimeAsync(5100);
+        expect(adapter.getStatus()).toBe(EngineStatus.READY);
+        expect(onActionRequired).not.toHaveBeenCalled();
+
+        evaluate.mockResolvedValueOnce({ modalPresent: true, dismissed: true } satisfies ModalProbe);
+        await jest.advanceTimersByTimeAsync(5100);
+        expect(adapter.getStatus()).toBe(EngineStatus.READY);
+        expect(onActionRequired).not.toHaveBeenCalled();
+
+        // Clicks three and four still fit a multi-step "What's new" flow being clicked through one
+        // screen per tick — not yet evidence the modal is stuck.
+        evaluate.mockResolvedValueOnce({ modalPresent: true, dismissed: true } satisfies ModalProbe);
+        await jest.advanceTimersByTimeAsync(5100);
+        expect(adapter.getStatus()).toBe(EngineStatus.READY);
+        expect(onActionRequired).not.toHaveBeenCalled();
+
+        evaluate.mockResolvedValueOnce({ modalPresent: true, dismissed: true } satisfies ModalProbe);
+        await jest.advanceTimersByTimeAsync(5100);
+        expect(adapter.getStatus()).toBe(EngineStatus.READY);
+        expect(onActionRequired).not.toHaveBeenCalled();
+
+        // Fifth click on a modal that is still there — the click is not landing, a human must act.
+        evaluate.mockResolvedValueOnce({ modalPresent: true, dismissed: true } satisfies ModalProbe);
+        await jest.advanceTimersByTimeAsync(5100);
+
+        expect(adapter.getStatus()).toBe(EngineStatus.ACTION_REQUIRED);
+        expect(onActionRequired).toHaveBeenCalledTimes(1);
+        expect(onActionRequired).toHaveBeenCalledWith(expect.stringMatching(/onboarding modal/i));
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    // A rejected probe means the page went away (reload, teardown, timeout) — it says nothing about
+    // the modal. Moving the session out of READY on that signal would block every send on a HEALTHY
+    // session for a reason the operator cannot act on, so the probe failure must be inert.
+    it('keeps the session READY when the page evaluate rejects', async () => {
+      jest.useFakeTimers();
+      try {
+        const { adapter, evaluate, onActionRequired } = promoteToReady();
+
+        (adapter as unknown as { client: EventEmitter }).client.emit('authenticated');
+        await jest.advanceTimersByTimeAsync(2100);
+
+        evaluate.mockRejectedValueOnce(new Error('Execution context was destroyed'));
+        await jest.advanceTimersByTimeAsync(5100);
+        evaluate.mockRejectedValueOnce(new Error('Target closed'));
+        await jest.advanceTimersByTimeAsync(5100);
+
+        expect(adapter.getStatus()).toBe(EngineStatus.READY);
+        expect(onActionRequired).not.toHaveBeenCalled();
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('does not fire the fallback when no modal is present (over-suppression guard)', async () => {
+      jest.useFakeTimers();
+      try {
+        const { adapter, onActionRequired } = promoteToReady();
+
+        (adapter as unknown as { client: EventEmitter }).client.emit('authenticated');
+        await jest.advanceTimersByTimeAsync(2100);
+        expect(adapter.getStatus()).toBe(EngineStatus.READY);
+
+        // Several ticks, all reporting no modal — must stay READY and never call onActionRequired.
+        await jest.advanceTimersByTimeAsync(5100);
+        await jest.advanceTimersByTimeAsync(5100);
+        await jest.advanceTimersByTimeAsync(5100);
+
+        expect(adapter.getStatus()).toBe(EngineStatus.READY);
+        expect(onActionRequired).not.toHaveBeenCalled();
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('self-terminates after the lifetime cap with no dangling timer', async () => {
+      jest.useFakeTimers();
+      try {
+        const { adapter, onActionRequired } = promoteToReady();
+
+        (adapter as unknown as { client: EventEmitter }).client.emit('authenticated');
+        await jest.advanceTimersByTimeAsync(2100);
+        expect(adapter.getStatus()).toBe(EngineStatus.READY);
+
+        // Walk just past the 5-minute lifetime cap; every tick sees no modal.
+        await jest.advanceTimersByTimeAsync(5 * 60_000 + 5100);
+
+        expect(adapter.getStatus()).toBe(EngineStatus.READY); // never fell back — the modal never appeared
+        expect(onActionRequired).not.toHaveBeenCalled();
+        expect(jest.getTimerCount()).toBe(0); // watcher self-terminated
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('is idempotent: a single watcher regardless of ready event vs reconcile path', async () => {
+      jest.useFakeTimers();
+      try {
+        const { adapter, client } = promoteToReady();
+
+        (client as EventEmitter).emit('authenticated');
+        await jest.advanceTimersByTimeAsync(2100); // reconcile promotes → watcher #1 armed
+        expect(adapter.getStatus()).toBe(EngineStatus.READY);
+        expect(jest.getTimerCount()).toBe(1);
+
+        // A late 'ready' event runs markReadyFromClientInfo again — it must not arm a second watcher.
+        (client as EventEmitter).emit('ready');
+        expect(adapter.getStatus()).toBe(EngineStatus.READY);
+        expect(jest.getTimerCount()).toBe(1);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('clears the watcher on teardown (no dangling timer across all teardown paths)', async () => {
+      jest.useFakeTimers();
+      try {
+        const { adapter, client } = promoteToReady();
+        (client as EventEmitter & { destroy?: jest.Mock }).destroy = jest.fn().mockResolvedValue(undefined);
+
+        (client as EventEmitter).emit('authenticated');
+        await jest.advanceTimersByTimeAsync(2100);
+        expect(adapter.getStatus()).toBe(EngineStatus.READY);
+        expect(jest.getTimerCount()).toBe(1); // watcher armed
+
+        await adapter.destroy();
+
+        expect(jest.getTimerCount()).toBe(0); // watcher cleared on teardown
+        expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('does not re-promote from ACTION_REQUIRED back to READY', async () => {
+      jest.useFakeTimers();
+      try {
+        const { adapter, evaluate, client, onActionRequired } = promoteToReady();
+
+        (client as EventEmitter).emit('authenticated');
+        await jest.advanceTimersByTimeAsync(2100);
+
+        // Drive it to the fallback the only way that reaches it: clicks that keep failing to land.
+        for (let i = 0; i < 5; i++) {
+          evaluate.mockResolvedValueOnce({ modalPresent: true, dismissed: true } satisfies ModalProbe);
+          await jest.advanceTimersByTimeAsync(5100);
+        }
+        expect(adapter.getStatus()).toBe(EngineStatus.ACTION_REQUIRED);
+
+        // A stray ready event must not resurrect READY from the action-required state.
+        (client as EventEmitter).emit('ready');
+        expect(adapter.getStatus()).toBe(EngineStatus.ACTION_REQUIRED);
+        expect(onActionRequired).toHaveBeenCalledTimes(1);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+  });
+});
+
+// The in-page half of the onboarding watcher. Every other test in this file drives the watcher with a
+// mocked `pupPage.evaluate`, which proves the loop but says nothing about the matching that runs
+// inside the browser — the part that is actually fragile, and the part that decides whether a healthy
+// session keeps working. `probeOnboardingModal` is a self-contained function precisely so it can be
+// executed here against representative DOM shapes.
+describe('probeOnboardingModal (in-page onboarding modal detection)', () => {
+  type FakeEl = {
+    tagName: string;
+    role: string | null;
+    textContent: string;
+    parentElement: FakeEl | null;
+    offsetParent: unknown;
+    getBoundingClientRect: () => { width: number; height: number };
+    click: jest.Mock;
+  };
+
+  const el = (
+    textContent: string,
+    opts: { button?: boolean; roleButton?: boolean; hidden?: boolean } = {},
+  ): FakeEl => ({
+    tagName: opts.button ? 'BUTTON' : 'DIV',
+    role: opts.roleButton ? 'button' : null,
+    textContent,
+    parentElement: null,
+    offsetParent: opts.hidden ? null : {},
+    getBoundingClientRect: () => (opts.hidden ? { width: 0, height: 0 } : { width: 200, height: 40 }),
+    click: jest.fn(),
+  });
+
+  /** Wire children to a parent and return the parent, so ancestor walks have something to walk. */
+  const nest = (parent: FakeEl, ...children: FakeEl[]): FakeEl => {
+    for (const child of children) child.parentElement = parent;
+    return parent;
+  };
+
+  const install = (all: FakeEl[]): void => {
+    (globalThis as unknown as { document: unknown }).document = {
+      // The probe's selector is 'button, [role="button"]'. Mirror the DOM per branch: the tag branch
+      // matches BUTTON elements, the attribute branch matches anything carrying role="button".
+      querySelectorAll: (selector: string) => {
+        const branches = selector.split(',').map(branch => branch.trim());
+        return all.filter(
+          e =>
+            (branches.includes('button') && e.tagName === 'BUTTON') ||
+            (branches.includes('[role="button"]') && e.role === 'button'),
+        );
+      },
+    };
+  };
+
+  afterEach(() => {
+    delete (globalThis as unknown as { document?: unknown }).document;
+  });
+
+  it('clicks Continue when it sits inside the onboarding modal', () => {
+    const button = el('Continue', { button: true });
+    nest(el("What's new on WhatsApp Web"), button);
+    install([button]);
+
+    expect(probeOnboardingModal()).toEqual({ modalPresent: true, dismissed: true });
+    expect(button.click).toHaveBeenCalledTimes(1);
+  });
+
+  // WhatsApp Web renders the typographic apostrophe. Matching only the ASCII form meant the real
+  // modal was never recognised — the fix silently doing nothing at all.
+  it('recognises the typographic apostrophe as well as the ASCII one', () => {
+    const button = el('Continue', { button: true });
+    nest(el('What’s new on WhatsApp Web'), button);
+    install([button]);
+
+    expect(probeOnboardingModal()).toEqual({ modalPresent: true, dismissed: true });
+    expect(button.click).toHaveBeenCalledTimes(1);
+  });
+
+  // The probe's selector covers ARIA buttons too ('button, [role="button"]'): WhatsApp Web has
+  // rendered the control as a div[role="button"] in some builds. A role-button carrying the exact
+  // label inside the modal is the same presence signal as a real <button>.
+  it('detects a div[role="button"] carrying the exact Continue label', () => {
+    const button = el('Continue', { roleButton: true });
+    nest(el("What's new on WhatsApp Web"), button);
+    install([button]);
+
+    expect(probeOnboardingModal()).toEqual({ modalPresent: true, dismissed: true });
+    expect(button.click).toHaveBeenCalledTimes(1);
+  });
+
+  // The regression that matters: an element's text includes all of its descendants, so a chat row
+  // previewing an ordinary message matches a heading-only test. Reporting a modal here took a healthy
+  // session out of READY, which refuses every send.
+  it.each([
+    ['a chat preview of the message "What\'s new?"', "Alice12:34What's new?"],
+    ['a chat preview without an apostrophe', 'Bob09:15whats new with you'],
+    ['a group named after the phrase', "What's New at Acme  09:15  Hi team"],
+    ['the typographic form in a message', 'Carol11:02What’s new?'],
+  ])('reports no modal for %s', (_label, text) => {
+    install([el(text)]); // a div, never a button — the chat list has no "Continue" control
+    expect(probeOnboardingModal()).toEqual({ modalPresent: false, dismissed: false });
+  });
+
+  it('ignores a Continue button that belongs to something other than the onboarding modal', () => {
+    const button = el('Continue', { button: true });
+    nest(el('Update your payment method'), button);
+    install([button]);
+
+    expect(probeOnboardingModal()).toEqual({ modalPresent: false, dismissed: false });
+    expect(button.click).not.toHaveBeenCalled();
+  });
+
+  it('ignores an offscreen Continue button', () => {
+    const button = el('Continue', { button: true, hidden: true });
+    nest(el("What's new on WhatsApp Web"), button);
+    install([button]);
+
+    expect(probeOnboardingModal()).toEqual({ modalPresent: false, dismissed: false });
+    expect(button.click).not.toHaveBeenCalled();
+  });
+
+  // The ancestor walk is bounded so a match against <body> — i.e. the words appearing anywhere on the
+  // page — can never qualify a button that is nowhere near the modal.
+  it('does not match a heading further up the tree than the bounded walk reaches', () => {
+    const button = el('Continue', { button: true });
+    let node = button;
+    for (let i = 0; i < 9; i++) {
+      node = nest(el('wrapper'), node);
+    }
+    node.textContent = "What's new on WhatsApp Web";
+    install([button]);
+
+    expect(probeOnboardingModal()).toEqual({ modalPresent: false, dismissed: false });
+    expect(button.click).not.toHaveBeenCalled();
+  });
+
+  it('reports no modal on a page with nothing to click', () => {
+    install([]);
+    expect(probeOnboardingModal()).toEqual({ modalPresent: false, dismissed: false });
+  });
+
+  // ── Localised modal ─────────────────────────────────────────────────────────
+  // The match is on visible text, so a WhatsApp Web rendering this modal in another language is
+  // invisible to the English default. An operator can add their label; that path deliberately does not
+  // also require the English heading, which would reject the very modal it is meant to reach.
+
+  it('ignores a localised modal with the default English label — the pre-existing behaviour', () => {
+    const button = el('Continuar', { button: true });
+    nest(el('Novedades de WhatsApp Web'), button);
+    install([button]);
+
+    expect(probeOnboardingModal()).toEqual({ modalPresent: false, dismissed: false });
+    expect(button.click).not.toHaveBeenCalled();
+  });
+
+  it('clicks a localised confirm button when the operator supplied its label', () => {
+    const button = el('Continuar', { button: true });
+    nest(el('Novedades de WhatsApp Web'), button);
+    install([button]);
+
+    const result = probeOnboardingModal({
+      labels: ['Continue', 'Continuar'],
+      headingOptionalFor: ['Continuar'],
+    });
+
+    expect(result).toEqual({ modalPresent: true, dismissed: true });
+    expect(button.click).toHaveBeenCalledTimes(1);
+  });
+
+  // The loosening is scoped to the operator's own labels: the default label keeps its heading guard, so
+  // configuring an extra label cannot start matching stray "Continue" buttons elsewhere on the page.
+  it('still requires the heading for the default label even when extra labels are configured', () => {
+    const button = el('Continue', { button: true });
+    nest(el('some unrelated panel'), button);
+    install([button]);
+
+    const result = probeOnboardingModal({
+      labels: ['Continue', 'Continuar'],
+      headingOptionalFor: ['Continuar'],
+    });
+
+    expect(result).toEqual({ modalPresent: false, dismissed: false });
+    expect(button.click).not.toHaveBeenCalled();
+  });
+
+  it('never clicks a hidden localised button', () => {
+    const button = el('Continuar', { button: true, hidden: true });
+    install([button]);
+
+    expect(probeOnboardingModal({ labels: ['Continue', 'Continuar'], headingOptionalFor: ['Continuar'] })).toEqual({
+      modalPresent: false,
+      dismissed: false,
+    });
+    expect(button.click).not.toHaveBeenCalled();
+  });
+
+  it('matches the label exactly, so a longer string containing it is not a confirm button', () => {
+    const button = el('Continuar con la copia de seguridad', { button: true });
+    install([button]);
+
+    expect(probeOnboardingModal({ labels: ['Continue', 'Continuar'], headingOptionalFor: ['Continuar'] })).toEqual({
+      modalPresent: false,
+      dismissed: false,
+    });
+    expect(button.click).not.toHaveBeenCalled();
   });
 });

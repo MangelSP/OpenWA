@@ -23,6 +23,7 @@
                 "session_started",
                 "session_stopped",
                 "session_force_killed",
+                "session_logged_out",
                 "session_deleted",
                 "session_qr_generated",
                 "session_connected",
@@ -449,6 +450,9 @@
           },
           "404": {
             "description": "Session not found"
+          },
+          "409": {
+            "description": "A credential teardown for the same session name is still in flight. Retryable — the body carries `code: 'SESSION_NAME_TEARDOWN_PENDING'`; wait for it to settle and retry. No destructive side effect runs before this refusal."
           }
         },
         "summary": "Delete a session",
@@ -487,6 +491,9 @@
           },
           "404": {
             "description": "Session not found"
+          },
+          "409": {
+            "description": "A credential teardown for the same session name is still in flight (e.g. a prior logout that owns destructive cleanup). Retryable — the body carries `code: SESSION_NAME_TEARDOWN_PENDING`; wait for it to settle and retry. No destructive side effect runs before this refusal."
           }
         },
         "summary": "Start a session and initialize WhatsApp connection",
@@ -530,6 +537,60 @@
         ]
       }
     },
+    "/api/sessions/{id}/logout": {
+      "post": {
+        "description": "Attempts an engine-native unlink of this companion device, then tears the session down locally. `200` means the engine-native unlink operation completed AND the required local credential cleanup completed — for Baileys a valid companion identity, an acknowledged `remove-companion-device` IQ response, and removal of the on-disk auth dir; for whatsapp-web.js the native `Client.logout()` promise settled. `200` is NOT an independent observation that the handset UI no longer shows the linked device. Because a completed unlink wipes the stored credentials, reconnecting after a `200` always requires a fresh QR scan or pairing code.",
+        "operationId": "SessionController_logout",
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "description": "Session ID",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Unlink operation and required local cleanup completed; session is stopped and `phone` is cleared. Recorded in the audit log as `session_logged_out`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionResponseDto"
+                },
+                "example": {
+                  "id": "8f3c2b1a-9d4e-4c7a-8b2f-1e6d5a4c3b2a",
+                  "name": "my-bot",
+                  "status": "disconnected",
+                  "phone": null,
+                  "pushName": null,
+                  "connectedAt": null,
+                  "lastActive": "2026-06-25T09:01:55.000Z",
+                  "createdAt": "2026-06-20T11:30:00.000Z",
+                  "updatedAt": "2026-06-25T09:11:00.000Z",
+                  "lastError": null
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Session is not started (no engine to send through); the row is left untouched"
+          },
+          "404": {
+            "description": "Session not found"
+          },
+          "502": {
+            "description": "Session was stopped locally, but the logout operation is incomplete (no send, no acknowledgement, timeout/transport error, or local-cleanup failure). Retryable — the body carries `code: 'SESSION_LOGOUT_INCOMPLETE'`; `phone` is cleared and no success audit is written. Start the session again and retry the logout."
+          }
+        },
+        "summary": "Log out of WhatsApp (unlinks this device) and stop the session",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
     "/api/sessions/{id}/force-kill": {
       "post": {
         "operationId": "SessionController_forceKill",
@@ -554,6 +615,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "Session is not started"
           },
           "404": {
             "description": "Session not found"
@@ -2495,7 +2559,7 @@
     },
     "/api/infra/status": {
       "get": {
-        "operationId": "InfraController_getStatus",
+        "operationId": "InfraStatusController_getStatus",
         "parameters": [],
         "responses": {
           "200": {
@@ -2510,7 +2574,7 @@
     },
     "/api/infra/engines": {
       "get": {
-        "operationId": "InfraController_getEngines",
+        "operationId": "InfraStatusController_getEngines",
         "parameters": [],
         "responses": {
           "200": {
@@ -2525,7 +2589,7 @@
     },
     "/api/infra/engines/current": {
       "get": {
-        "operationId": "InfraController_getCurrentEngine",
+        "operationId": "InfraStatusController_getCurrentEngine",
         "parameters": [],
         "responses": {
           "200": {
@@ -2538,9 +2602,25 @@
         ]
       }
     },
+    "/api/infra/health": {
+      "get": {
+        "operationId": "InfraStatusController_healthCheck",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "Server is healthy"
+          }
+        },
+        "summary": "Health check endpoint",
+        "tags": [
+          "infrastructure"
+        ],
+        "security": []
+      }
+    },
     "/api/infra/config": {
       "get": {
-        "operationId": "InfraController_getConfig",
+        "operationId": "InfraConfigController_getConfig",
         "parameters": [],
         "responses": {
           "200": {
@@ -2553,7 +2633,7 @@
         ]
       },
       "put": {
-        "operationId": "InfraController_saveConfig",
+        "operationId": "InfraConfigController_saveConfig",
         "parameters": [],
         "requestBody": {
           "required": true,
@@ -2579,7 +2659,7 @@
     },
     "/api/infra/restart": {
       "post": {
-        "operationId": "InfraController_requestRestart",
+        "operationId": "InfraConfigController_requestRestart",
         "parameters": [],
         "requestBody": {
           "required": false,
@@ -2602,25 +2682,9 @@
         ]
       }
     },
-    "/api/infra/health": {
-      "get": {
-        "operationId": "InfraController_healthCheck",
-        "parameters": [],
-        "responses": {
-          "200": {
-            "description": "Server is healthy"
-          }
-        },
-        "summary": "Health check endpoint",
-        "tags": [
-          "infrastructure"
-        ],
-        "security": []
-      }
-    },
     "/api/infra/export-data": {
       "get": {
-        "operationId": "InfraController_exportData",
+        "operationId": "InfraDataController_exportData",
         "parameters": [],
         "responses": {
           "200": {
@@ -2635,7 +2699,7 @@
     },
     "/api/infra/import-data": {
       "post": {
-        "operationId": "InfraController_importData",
+        "operationId": "InfraDataController_importData",
         "parameters": [],
         "requestBody": {
           "required": true,
@@ -2694,7 +2758,7 @@
     },
     "/api/infra/storage/files/count": {
       "get": {
-        "operationId": "InfraController_getStorageFileCount",
+        "operationId": "InfraStorageController_getStorageFileCount",
         "parameters": [],
         "responses": {
           "200": {
@@ -2709,7 +2773,7 @@
     },
     "/api/infra/storage/export": {
       "get": {
-        "operationId": "InfraController_exportStorage",
+        "operationId": "InfraStorageController_exportStorage",
         "parameters": [],
         "responses": {
           "200": {
@@ -2724,7 +2788,7 @@
     },
     "/api/infra/storage/import": {
       "post": {
-        "operationId": "InfraController_importStorage",
+        "operationId": "InfraStorageController_importStorage",
         "parameters": [],
         "requestBody": {
           "required": true,
@@ -4487,11 +4551,8 @@
           }
         ],
         "responses": {
-          "200": {
-            "description": "Always null on whatsapp-web.js: catalog reads are not implemented on either engine."
-          },
           "501": {
-            "description": "Not supported by the active engine: Baileys does not implement catalog reads."
+            "description": "Not supported: neither engine implements catalog reads."
           }
         },
         "summary": "Get business catalog info (not implemented by any engine)",
@@ -4536,11 +4597,8 @@
           }
         ],
         "responses": {
-          "200": {
-            "description": "Always an empty page on whatsapp-web.js: catalog reads are not implemented on either engine."
-          },
           "501": {
-            "description": "Not supported by the active engine: Baileys does not implement catalog reads."
+            "description": "Not supported: neither engine implements catalog reads."
           }
         },
         "summary": "List catalog products (not implemented by any engine)",
@@ -4571,11 +4629,8 @@
           }
         ],
         "responses": {
-          "200": {
-            "description": "Always null on whatsapp-web.js: catalog reads are not implemented on either engine."
-          },
           "501": {
-            "description": "Not supported by the active engine: Baileys does not implement catalog reads."
+            "description": "Not supported: neither engine implements catalog reads."
           }
         },
         "summary": "Get a specific product (not implemented by any engine)",
@@ -4985,6 +5040,9 @@
           },
           "400": {
             "description": "Plugin is global (not session-scoped)"
+          },
+          "403": {
+            "description": "A session-restricted key may not replace the full active set — full activation replacement requires an unrestricted key"
           },
           "404": {
             "description": "Plugin not found"
@@ -5819,7 +5877,7 @@
   "info": {
     "title": "OpenWA API",
     "description": "Open Source WhatsApp API Gateway - Free, Self-Hosted HTTP API",
-    "version": "0.11.0",
+    "version": "0.12.4",
     "contact": {
       "name": "OpenWA",
       "url": "https://github.com/rmyndharis/OpenWA",
@@ -6214,6 +6272,7 @@
               "authenticating",
               "ready",
               "disconnected",
+              "action_required",
               "failed"
             ],
             "example": "ready"
@@ -6252,9 +6311,14 @@
           },
           "lastError": {
             "type": "string",
-            "description": "Human-readable reason for the most recent terminal engine failure (only set when status is FAILED).",
+            "description": "Human-readable reason carried while the status is FAILED (a terminal engine failure) or ACTION_REQUIRED (the engine is running but something needs a human). Cleared on any other status.",
             "example": "Failed to launch the browser process: spawn /usr/bin/chromium ENOENT",
             "nullable": true
+          },
+          "engineLoaded": {
+            "type": "boolean",
+            "description": "Whether the gateway currently holds a live engine for this session. This is the precondition the lifecycle routes actually enforce, and `status` alone does not imply it: a `disconnected` session keeps its engine for the duration of an automatic reconnect backoff, while a session stopped through `POST /sessions/:id/stop` carries the same status with no engine. When `true`, `stop`, `logout` and `force-kill` can act and `start` answers 400; when `false`, the reverse. Derived per request from live process state, so it is never persisted and never historical.",
+            "example": true
           }
         },
         "required": [
@@ -6262,7 +6326,8 @@
           "name",
           "status",
           "createdAt",
-          "updatedAt"
+          "updatedAt",
+          "engineLoaded"
         ]
       },
       "QRCodeResponseDto": {
@@ -6282,6 +6347,7 @@
               "authenticating",
               "ready",
               "disconnected",
+              "action_required",
               "failed"
             ],
             "example": "qr_ready"
@@ -6754,7 +6820,7 @@
           },
           "filename": {
             "type": "string",
-            "description": "Filename for the media",
+            "description": "Filename for the media. Only rendered on document sends — defaults to 'file' when omitted (a URL-based document send on whatsapp-web.js first derives the URL basename)",
             "example": "image.jpg"
           },
           "caption": {
@@ -6802,7 +6868,7 @@
           },
           "filename": {
             "type": "string",
-            "description": "Filename for the media",
+            "description": "Filename for the media. Only rendered on document sends — defaults to 'file' when omitted (a URL-based document send on whatsapp-web.js first derives the URL basename)",
             "example": "image.jpg"
           },
           "caption": {

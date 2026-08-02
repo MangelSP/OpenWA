@@ -228,6 +228,7 @@
     "qr_ready": "Escanear QR",
     "ready": "Conectada",
     "disconnected": "Desconectada",
+    "action_required": "Ação necessária",
     "failed": "Falha",
     "authenticating": "Autenticando..."
   },
@@ -296,6 +297,7 @@
       "start": "Iniciar",
       "stop": "Parar",
       "reconnect": "Reconectar",
+      "unlink": "Desvincular",
       "delete": "Excluir",
       "killStuck": "Forçar encerramento"
     },
@@ -304,6 +306,8 @@
       "readyDesc": "A sessão do WhatsApp está conectada",
       "disconnectedTitle": "Sessão desconectada",
       "disconnectedDesc": "A sessão do WhatsApp foi desconectada",
+      "actionRequiredTitle": "Ação necessária",
+      "actionRequiredDesc": "Esta sessão precisa de sua atenção. Abra a sessão para ver o que fazer.",
       "failedTitle": "Sessão falhou",
       "failedDesc": "A sessão do WhatsApp não pôde ser iniciada. Abra a sessão para ver o motivo."
     },
@@ -323,6 +327,18 @@
       "failedTitle": "Falha no encerramento forçado",
       "failed": "Não foi possível forçar o encerramento da sessão."
     },
+    "unlink": {
+      "title": "Desvincular dispositivo",
+      "message": "Desvincular a sessão <strong>\"{{name}}\"</strong> da conta do WhatsApp?",
+      "warning": "O WhatsApp remove este dispositivo dos Aparelhos conectados da conta e a sessão é encerrada. Para reconectar, é preciso um novo escaneamento de QR ou código de pareamento. Para apagar também todos os dados locais, exclua a sessão depois.",
+      "confirm": "Desvincular",
+      "successTitle": "Dispositivo desvinculado",
+      "success": "Desvinculação concluída: o dispositivo foi desconectado e as credenciais locais da sessão foram apagadas. Reconectar exige um novo QR code ou código de pareamento.",
+      "failedTitle": "Falha ao desvincular",
+      "failed": "Não foi possível desvincular a sessão.",
+      "incompleteTitle": "Desvinculação incompleta",
+      "incomplete": "A sessão foi encerrada localmente, mas a operação de logout está incompleta — o dispositivo pode ainda estar vinculado. Inicie a sessão e tente a desvinculação novamente."
+    },
     "pairing": {
       "tabQr": "Código QR",
       "tabPhone": "Vincular com número de telefone",
@@ -340,6 +356,10 @@
       "step3": "<strong>3.</strong> Toque em <strong>Conectar dispositivo</strong> e depois em <strong>Vincular com número de telefone</strong>",
       "step4": "<strong>4.</strong> Digite no seu celular o código de 8 caracteres mostrado acima",
       "waitingConnection": "Aguardando a conexão do seu celular…"
+    },
+    "start": {
+      "teardownPendingTitle": "Iniciando sessão",
+      "teardownPending": "A remoção de credenciais desta sessão ainda está em andamento. Aguarde um momento e tente novamente."
     }
   },
   "webhooks": {

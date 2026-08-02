@@ -228,6 +228,7 @@
     "qr_ready": "Scansiona QR",
     "ready": "Connesso",
     "disconnected": "Disconnesso",
+    "action_required": "Azione richiesta",
     "failed": "Non riuscita",
     "authenticating": "Autenticazione in corso..."
   },
@@ -296,6 +297,7 @@
       "start": "Avvia",
       "stop": "Ferma",
       "reconnect": "Riconnetti",
+      "unlink": "Scollega",
       "delete": "Elimina",
       "killStuck": "Termina sessione bloccata"
     },
@@ -304,6 +306,8 @@
       "readyDesc": "La sessione WhatsApp è ora connessa",
       "disconnectedTitle": "Sessione Disconnessa",
       "disconnectedDesc": "La sessione WhatsApp è stata disconnessa",
+      "actionRequiredTitle": "Azione richiesta",
+      "actionRequiredDesc": "Questa sessione richiede la tua attenzione. Apri la sessione per vedere cosa fare.",
       "failedTitle": "Sessione Fallita",
       "failedDesc": "Avvio della sessione WhatsApp non riuscito. Apri la sessione per vedere il motivo."
     },
@@ -323,6 +327,18 @@
       "failedTitle": "Terminazione forzata non riuscita",
       "failed": "Impossibile terminare forzatamente la sessione."
     },
+    "unlink": {
+      "title": "Scollega dispositivo",
+      "message": "Scollegare la sessione <strong>\"{{name}}\"</strong> dall'account WhatsApp?",
+      "warning": "WhatsApp rimuove questo dispositivo dai Dispositivi collegati dell'account e la sessione si interrompe. Per riconnettersi è necessaria una nuova scansione del QR o un codice di abbinamento. Per cancellare anche tutti i dati locali, elimina la sessione in seguito.",
+      "confirm": "Scollega",
+      "successTitle": "Dispositivo scollegato",
+      "success": "Scollegamento completato: il dispositivo è stato disconnesso e le credenziali di sessione locali sono state cancellate. La riconnessione richiede una nuova scansione QR o un codice di abbinamento.",
+      "failedTitle": "Scollegamento non riuscito",
+      "failed": "Impossibile scollegare la sessione.",
+      "incompleteTitle": "Scollegamento incompleto",
+      "incomplete": "La sessione si è interrotta localmente, ma l'operazione di disconnessione è incompleta — il dispositivo potrebbe essere ancora collegato. Avvia la sessione e riprova lo scollegamento."
+    },
     "pairing": {
       "tabQr": "Codice QR",
       "tabPhone": "Collega con numero di telefono",
@@ -340,6 +356,10 @@
       "step3": "<strong>3.</strong> Tocca <strong>Collega un dispositivo</strong>, poi tocca <strong>Collega con numero di telefono</strong>",
       "step4": "<strong>4.</strong> Inserisci sul tuo telefono il codice di 8 caratteri mostrato sopra",
       "waitingConnection": "In attesa del collegamento del tuo telefono…"
+    },
+    "start": {
+      "teardownPendingTitle": "Avvio sessione",
+      "teardownPending": "Uno smontaggio delle credenziali per questa sessione è ancora in corso. Attendi un momento e riprova."
     }
   },
   "webhooks": {
