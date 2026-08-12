@@ -5,7 +5,18 @@
 		},
 		{
 			"path": "../../../ankacrm"
+		},
+		{
+			"path": "../../../openwa-cloud-web"
+		},
+		{
+			"path": "../../../openwa-cloud-api"
 		}
 	],
-	"settings": {}
+	"settings": {
+		"i18n-ally.localesPaths": [
+			"dashboard/src/i18n",
+			"dashboard/src/i18n/locales"
+		]
+	}
 }
