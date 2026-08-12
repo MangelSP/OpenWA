@@ -923,7 +923,27 @@ describe('MessageService', () => {
       );
     });
 
-    it('respects a caller-supplied mimetype for a voice note', async () => {
+    it('respects a caller-supplied non-ogg mimetype for a voice note', async () => {
+      await service.sendAudio('sess-1', {
+        chatId: 'test@c.us',
+        url: 'https://example.com/voice.m4a',
+        mimetype: 'audio/mp4',
+        ptt: true,
+      });
+      expect(mockEngine.sendAudioMessage).toHaveBeenCalledWith(
+        'test@c.us',
+        expect.objectContaining({ ptt: true, mimetype: 'audio/mp4' }),
+      );
+    });
+
+    // Regression test: callers (e.g. a browser MediaRecorder/opus-recorder Blob typed just
+    // "audio/ogg") often omit the "codecs=opus" parameter. Baileys only fills in its own
+    // default mimetype when the field is entirely absent (see MIMETYPE_MAP in
+    // @whiskeysockets/baileys/lib/Utils/messages.js) — an incomplete-but-present "audio/ogg"
+    // is passed straight through to WhatsApp, which then silently fails to render/deliver the
+    // voice note on the recipient's device (no error anywhere in the send path; message.ack
+    // still fires "delivered"). See #<audio-ptt-mimetype>.
+    it('normalizes an incomplete "audio/ogg" mimetype to include the opus codec for a voice note', async () => {
       await service.sendAudio('sess-1', {
         chatId: 'test@c.us',
         url: 'https://example.com/voice.ogg',
@@ -932,7 +952,7 @@ describe('MessageService', () => {
       });
       expect(mockEngine.sendAudioMessage).toHaveBeenCalledWith(
         'test@c.us',
-        expect.objectContaining({ ptt: true, mimetype: 'audio/ogg' }),
+        expect.objectContaining({ ptt: true, mimetype: 'audio/ogg; codecs=opus' }),
       );
     });
 

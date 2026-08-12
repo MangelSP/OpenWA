@@ -232,11 +232,18 @@ export class MessageService {
     // already use `finalDto.ptt ? 'voice' : 'audio'`.
     const finalDto = await this.applySendingGate(sessionId, dto.ptt ? 'voice' : 'audio', dto);
     const engine = this.getEngine(sessionId);
-    // Voice notes need a real audio codec; default to ogg/opus when the caller omits a mimetype so the
-    // wire message and the persisted record agree. Resolved BEFORE buildMediaInput so its base64
-    // mimetype guard sees the effective type. buildMediaInput itself stays generic (shared by all media).
+    // Voice notes need a real audio codec; default to ogg/opus when the caller omits a mimetype, and
+    // fill in the "codecs=opus" parameter when they send a bare "audio/ogg" (a common Blob/MediaRecorder
+    // mistake — e.g. a browser Blob typed just "audio/ogg"). Baileys only substitutes its own default
+    // mimetype when the field is entirely absent, so a present-but-incomplete "audio/ogg" would otherwise
+    // reach WhatsApp verbatim and silently fail to render/deliver on the recipient's device, with no
+    // error anywhere in the send path. Other caller-supplied formats (e.g. audio/mp4) pass through as-is.
+    // Resolved BEFORE buildMediaInput so its base64 mimetype guard sees the effective type.
+    // buildMediaInput itself stays generic (shared by all media).
+    const needsOpusCodec =
+      !finalDto.mimetype || (/^audio\/ogg/i.test(finalDto.mimetype) && !/opus/i.test(finalDto.mimetype));
     const audioDto =
-      finalDto.ptt && !finalDto.mimetype ? { ...finalDto, mimetype: 'audio/ogg; codecs=opus' } : finalDto;
+      finalDto.ptt && needsOpusCodec ? { ...finalDto, mimetype: 'audio/ogg; codecs=opus' } : finalDto;
     const media = this.buildMediaInput(audioDto);
     media.ptt = finalDto.ptt;
 
