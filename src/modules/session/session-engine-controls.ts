@@ -6,10 +6,12 @@ import { Message } from '../message/entities/message.entity';
 import { MessageBatch } from '../message/entities/message-batch.entity';
 import { Webhook } from '../webhook/entities/webhook.entity';
 import { Template } from '../template/entities/template.entity';
-import { BaileysStoredMessage } from '../../engine/adapters/baileys-stored-message.entity';
+import { BaileysStoredMessage } from '../../engine';
 import { EngineFactory } from '../../engine/engine.factory';
 import { EngineRegistry } from '../../engine/engine-registry.service';
 import { SessionErrorStore } from './session-error-store.service';
+import { SessionRestrictionStore } from './session-restriction-store.service';
+import { PresenceStore } from './presence-store.service';
 import { type createLogger } from '../../common/services/logger.service';
 import { HookManager } from '../../core/hooks';
 import { SessionLifecycleFences } from './session-lifecycle-fences';
@@ -43,6 +45,8 @@ export interface SessionEngineControlsHost {
   engineFactory: EngineFactory;
   engines: EngineRegistry;
   sessionErrors: SessionErrorStore;
+  sessionRestrictions: SessionRestrictionStore;
+  presence: PresenceStore;
   hookManager: HookManager;
   configService?: ConfigService;
   logger: ReturnType<typeof createLogger>;
@@ -55,6 +59,8 @@ export interface SessionEngineControlsHost {
   isSessionRetired(id: string): Promise<boolean>;
   purgeAuthDirsIfDeleted(id: string, name: string): Promise<void>;
   updateStatus(id: string, status: SessionStatus): Promise<void>;
+  /** Ownership gate, same contract as SessionEngineWiringHost.ownsSession. */
+  ownsSession(id: string): boolean;
   stoppingSessions: Set<string>;
   reconnectStates: Map<string, ReconnectState>;
   stuckAuthRecoveryUsed: Set<string>;
@@ -79,6 +85,8 @@ export class SessionEngineControls {
   private readonly engineFactory: EngineFactory;
   private readonly engines: EngineRegistry;
   private readonly sessionErrors: SessionErrorStore;
+  private readonly sessionRestrictions: SessionRestrictionStore;
+  private readonly presence: PresenceStore;
   private readonly hookManager: HookManager;
   private readonly configService?: ConfigService;
   private readonly logger: ReturnType<typeof createLogger>;
@@ -94,6 +102,8 @@ export class SessionEngineControls {
     this.engineFactory = host.engineFactory;
     this.engines = host.engines;
     this.sessionErrors = host.sessionErrors;
+    this.sessionRestrictions = host.sessionRestrictions;
+    this.presence = host.presence;
     this.hookManager = host.hookManager;
     this.configService = host.configService;
     this.logger = host.logger;
@@ -105,13 +115,13 @@ export class SessionEngineControls {
     this.initializingSessions = host.initializingSessions;
   }
 
-  /** findOne-or-404 with the last-error projection, mirroring SessionService.findOne. */
+  /** findOne-or-404 with the runtime-state projection, mirroring SessionService.findOne. */
   private async requireSession(id: string): Promise<Session> {
     const session = await this.sessionRepository.findOne({ where: { id } });
     if (!session) {
       throw new NotFoundException(`Session with id '${id}' not found`);
     }
-    return this.sessionErrors.attachTo(session);
+    return this.sessionRestrictions.attachTo(this.sessionErrors.attachTo(session));
   }
 
   async start(id: string): Promise<Session> {
@@ -210,8 +220,18 @@ export class SessionEngineControls {
           this.engines.delete(id);
           this.sessionErrors.set(id, err instanceof Error ? err.message : String(err));
           await this.fences.teardownEngineSafely(id, orphan, e => e.forceDestroy(), 'force-destroy');
-          await this.host.updateStatus(id, SessionStatus.FAILED).catch(() => undefined);
+          // Fenced on ownership like the engine callbacks: initializeEngine can await a slow
+          // Chromium launch for minutes, and this node's lease can lapse and be taken over inside
+          // that window. FAILED is excluded from the boot reset AND from the takeover sweep, so
+          // writing it onto a row a peer now owns strands the session on every node.
+          if (this.host.ownsSession(id)) {
+            await this.host.updateStatus(id, SessionStatus.FAILED).catch(() => undefined);
+          }
         }
+        // Drop the reconnect state this start() armed up front: no engine was registered, so
+        // nothing will ever fire it, and leaving it behind is dead state a later liveness check
+        // would have to reason about. A retry builds its own.
+        this.host.cancelReconnect(id);
         throw err;
       }
 
@@ -253,8 +273,35 @@ export class SessionEngineControls {
       // write so a delayed pre-initialize status update can never settle after the retirement and
       // become the last persisted status. Identity-checked: only the captured engine's promise.
       await this.fences.awaitInitialStatus(id, engine);
-      await this.fences.teardownEngineSafely(id, engine, e => e.disconnect(), 'disconnect');
+      let tornDown = await this.fences.teardownEngineSafely(id, engine, e => e.disconnect(), 'disconnect');
+      if (!tornDown) {
+        // The graceful disconnect threw or timed out, so the engine may be half-attached (a leaked
+        // Chromium process or a live socket). Escalate to the hard kill — the same forceDestroy()
+        // forceKill() uses for a wedged engine — before reporting the stop.
+        this.logger.warn(`Graceful disconnect failed for session ${session.name}; escalating to force-destroy`, {
+          sessionId: id,
+          action: 'stop_escalate_force_destroy',
+        });
+        tornDown = await this.fences.teardownEngineSafely(id, engine, e => e.forceDestroy(), 'force-destroy');
+      }
+      // Reconciled regardless of the outcome: a wedged engine must not keep holding a concurrency
+      // slot or read as "already started" to a later start().
       this.engines.deleteIfLive(id, engine);
+      if (!tornDown) {
+        // The hard kill failed too, so the engine's process may still be alive. Local state is
+        // settled (Map reconciled, status DISCONNECTED — mirroring logout()'s incomplete path), but
+        // the stop is reported as incomplete instead of claimed clean: a retryable 502 with a stable
+        // code, and no success log (the controller audits SESSION_STOPPED only after this resolves).
+        await this.host.updateStatus(id, SessionStatus.DISCONNECTED);
+        throw new BadGatewayException({
+          statusCode: HttpStatus.BAD_GATEWAY,
+          message:
+            'Session was stopped locally, but the engine teardown did not complete — the engine ' +
+            'process may still be running. Retry the stop; restart the node to reap a leaked process.',
+          error: 'Bad Gateway',
+          code: 'SESSION_STOP_INCOMPLETE',
+        });
+      }
     }
 
     this.logger.log(`Session stopped: ${session.name}`, {
@@ -303,7 +350,7 @@ export class SessionEngineControls {
     const engine = this.engines.get(id);
 
     if (!engine) {
-      throw new BadRequestException('Session is not started. Call POST /sessions/:id/start first.');
+      throw new BadRequestException('Session is not started. Call POST /sessions/:sessionId/start first.');
     }
 
     // Mark as tearing down BEFORE cleanup so an in-flight reconnect can't resurrect it.
@@ -371,7 +418,7 @@ export class SessionEngineControls {
     // refusal. A wedged engine torn down earlier is reaped by the next start()'s orphan sweep (and
     // by process exit), not by force-kill.
     if (!engine) {
-      throw new BadRequestException('Session is not started. Call POST /sessions/:id/start first.');
+      throw new BadRequestException('Session is not started. Call POST /sessions/:sessionId/start first.');
     }
 
     // Mark as tearing down BEFORE cleanup so an in-flight reconnect can't resurrect it.
@@ -467,13 +514,14 @@ export class SessionEngineControls {
       );
 
       // DB removal is NOT best-effort: a genuine failure must surface (500) rather than be swallowed.
-      // Delete every child row explicitly, in one transaction, children before the parent. messages/
-      // message_batches carry a plain sessionId with no FK. webhooks/templates/baileys_stored_messages
-      // DO declare an ON DELETE CASCADE FK, but the default `data` engine (SQLite) runs with
-      // foreign_keys OFF, so that cascade never fires there — a session delete would otherwise orphan
-      // them forever (webhooks in particular retain the signing secret + custom headers). Deleting them
-      // explicitly is engine-agnostic (redundant-but-harmless on Postgres, where the cascade finds
-      // nothing left) and mirrors the restore path's explicit-clear ordering.
+      // Delete every child row explicitly, in one transaction, children before the parent. For
+      // messages/message_batches this is load-bearing: they carry a plain sessionId with no FK, so
+      // nothing else would ever remove them. webhooks/templates/baileys_stored_messages (and
+      // automation_rules) DO declare an ON DELETE CASCADE FK that fires on BOTH engines —
+      // better-sqlite3 defaults `foreign_keys` ON and TypeORM's driver re-asserts it at connection
+      // creation — so their explicit deletes are belt-and-braces rather than required; they stay
+      // because depending on a pragma neither this file nor a test pins is a thinner guarantee than
+      // an explicit delete, and the ordering mirrors the restore path's explicit-clear.
       await this.host.dataSource().transaction(async manager => {
         await manager.delete(Message, { sessionId: id });
         await manager.delete(MessageBatch, { sessionId: id });
@@ -507,6 +555,12 @@ export class SessionEngineControls {
         // Drop the FAILED-reason entry too: it's keyed by a now-deleted UUID that can never be read
         // again, so leaving it would grow the map without bound across create/fail/delete churn.
         this.sessionErrors.clear(id);
+        // Same unbounded-growth argument for the restriction entry, and the gauge it feeds must not
+        // keep counting an account whose session no longer exists.
+        this.sessionRestrictions.clear(id);
+        // Presence is per-connection state that the deleted session can never receive again, and it
+        // is keyed by an id that will never be read.
+        this.presence.clear(id);
         // The stuck-auth recovery budget is keyed by id; a committed delete frees it (and a recreated
         // session under the same name gets a fresh UUID + fresh budget). Left only on a committed
         // delete so a failed/409 delete — the session still exists — keeps the budget intact.

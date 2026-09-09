@@ -13,16 +13,27 @@ import type { Session } from '../services/api.ts';
 // The fallback below is for a dashboard talking to a gateway that predates the field. It reproduces
 // the old status set, whose known wrong answer is exactly that `disconnected` case — a stale
 // dashboard keeps the old behaviour instead of guessing differently.
-const STARTED_STATUSES_FALLBACK = new Set([
-  'initializing',
-  'qr_ready',
-  'authenticating',
-  'ready',
-  'action_required',
-]);
+const STARTED_STATUSES_FALLBACK = new Set(['initializing', 'qr_ready', 'authenticating', 'ready', 'action_required']);
 
 export function isSessionStarted(session: Pick<Session, 'status' | 'engineLoaded'>): boolean {
   return session.engineLoaded ?? STARTED_STATUSES_FALLBACK.has(session.status);
+}
+
+// Which body the session card gets: the pairing placeholder, or the session's identity rows.
+//
+// `qr_ready` always means a code is on offer, so it always gets the placeholder. `initializing` is the
+// ambiguous one: it covers a never-linked session walking up to its first QR, and it also covers a
+// LINKED session inside the engine's own reconnect backoff (Baileys drops to INITIALIZING on every
+// transient close). The second is still paired to a number, and showing it "Preparing QR code" reads
+// as an account that has been unlinked.
+//
+// `phone` is the discriminator because it tracks the link and nothing else: it is written by a
+// successful ready and cleared exactly when the link dies, on a WhatsApp-side unlink and on logout().
+// `connectedAt` is never cleared, so it would keep claiming "linked" for a session unlinked an hour
+// ago, and `engineLoaded` is dropped to undefined by the Sessions page on every websocket status push,
+// which is the very transition that lands a card here.
+export function awaitsPairing(session: Pick<Session, 'status' | 'phone'>): boolean {
+  return session.status === 'qr_ready' || (session.status === 'initializing' && !session.phone);
 }
 
 // Unlink calls POST /sessions/:id/logout, which needs a live engine to send the unlink through — the

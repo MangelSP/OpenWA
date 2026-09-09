@@ -9,7 +9,7 @@ import {
 } from '../interfaces/whatsapp-engine.interface';
 import { SerializedWid } from '../types/whatsapp-web-js.types';
 import { toMessageMedia } from './wwebjs-messaging';
-import { type WwebjsEngineHost } from './wwebjs-host';
+import { type WwebjsEngineHost, withPage, reportPageDeath } from './wwebjs-host';
 
 /**
  * The status-post counterpart of `toMessageResult`, but its absent-message case is *narrower* than a
@@ -58,9 +58,14 @@ export class WwebjsStatus {
     return this.host.getClient();
   }
 
+  /** See {@link withPage} for what a dead page answers here. */
+  private withPage<T>(context: string, op: () => Promise<T>): Promise<T> {
+    return withPage(this.host, context, op);
+  }
+
   async getContactStatuses(): Promise<Status[]> {
     this.host.ensureReady();
-    return this.collectStatuses(await this.client().getBroadcasts());
+    return this.collectStatuses(await this.withPage('getContactStatuses', () => this.client().getBroadcasts()));
   }
 
   async getContactStatus(contactId: string): Promise<Status[]> {
@@ -68,7 +73,7 @@ export class WwebjsStatus {
     // A contact with no active 24h story resolves to an "empty" Broadcast (id/msgs/getContact
     // undefined — Broadcast._patch only runs when data is truthy). That is the common case, so guard
     // it: return [] rather than dereferencing undefined inside collectStatuses (→ 500).
-    const broadcast = await this.client().getBroadcastById(contactId);
+    const broadcast = await this.withPage('getContactStatus', () => this.client().getBroadcastById(contactId));
     return broadcast?.msgs?.length ? this.collectStatuses([broadcast]) : [];
   }
 
@@ -113,7 +118,16 @@ export class WwebjsStatus {
           // listed status unactionable (#747). The contact id above is a Wid and is unaffected.
           id: ((msg.id as unknown as SerializedWid)?._serialized ?? (msg.id as unknown as SerializedWid)?.$1) || '',
           contact: contactSummary,
-          type: msg.type === MessageTypes.IMAGE ? 'image' : msg.type === MessageTypes.VIDEO ? 'video' : 'text',
+          type:
+            msg.type === MessageTypes.IMAGE
+              ? 'image'
+              : msg.type === MessageTypes.VIDEO
+                ? 'video'
+                : // MessageTypes.VOICE is wwjs' name for 'ptt'. Without this a posted voice status
+                  // reads back as a text status, which is what everything non-image/video collapsed to.
+                  msg.type === MessageTypes.VOICE
+                  ? 'voice'
+                  : 'text',
           ...(msg.body ? { caption: msg.body } : {}),
           ...(media ? { media } : {}),
           timestamp: ts,
@@ -132,12 +146,15 @@ export class WwebjsStatus {
     // whatsapp-web.js posts a text status by messaging status@broadcast with styling in `extra`
     // (Client.js maps options.extra → page extraOptions → sendStatusTextMsgAction in Utils.js).
     // backgroundColor is a #RRGGBB hex; font is the fontStyle index 0-7.
-    const msg = await this.client().sendMessage('status@broadcast', text, {
-      extra: {
-        ...(options.backgroundColor !== undefined ? { backgroundColor: options.backgroundColor } : {}),
-        ...(options.font !== undefined ? { fontStyle: options.font } : {}),
-      },
-    });
+    // Non-idempotent: report a dead page, but keep the error as thrown. See reportPageDeath.
+    const msg = await reportPageDeath(this.host, 'postTextStatus', () =>
+      this.client().sendMessage('status@broadcast', text, {
+        extra: {
+          ...(options.backgroundColor !== undefined ? { backgroundColor: options.backgroundColor } : {}),
+          ...(options.font !== undefined ? { fontStyle: options.font } : {}),
+        },
+      }),
+    );
     return toStatusResult(msg);
   }
 
@@ -149,13 +166,28 @@ export class WwebjsStatus {
     return this.postMediaStatus(media, options);
   }
 
-  private async postMediaStatus(media: MediaInput, options: StatusPostOptions): Promise<StatusResult> {
+  async postVoiceStatus(media: MediaInput, options: StatusPostOptions): Promise<StatusResult> {
+    // `sendAudioAsVoice` is what makes the bubble a voice note rather than an audio file: it becomes
+    // `isPtt` inside the page. The waveform is separate — whatsapp-web.js already generates one for
+    // any audio going to status, so it appears either way, but only this flag changes the bubble.
+    return this.postMediaStatus(media, options, { sendAudioAsVoice: true });
+  }
+
+  private async postMediaStatus(
+    media: MediaInput,
+    options: StatusPostOptions,
+    extra?: { sendAudioAsVoice: true },
+  ): Promise<StatusResult> {
     this.host.ensureReady();
     this.warnStatusRecipientsOnce(options);
     const messageMedia = await toMessageMedia(media);
-    const msg = await this.client().sendMessage('status@broadcast', messageMedia, {
-      ...(options.caption !== undefined ? { caption: options.caption } : {}),
-    });
+    // Non-idempotent: a replayed post would publish the status twice. See reportPageDeath.
+    const msg = await reportPageDeath(this.host, 'postMediaStatus', () =>
+      this.client().sendMessage('status@broadcast', messageMedia, {
+        ...(options.caption !== undefined ? { caption: options.caption } : {}),
+        ...extra,
+      }),
+    );
     return toStatusResult(msg);
   }
 
@@ -173,6 +205,6 @@ export class WwebjsStatus {
     // Revokes the caller's own status post. revokeStatusMessage resolves the message by id and
     // throws if it isn't fromMe/isn't a status — the statusId returned by postText/Image/VideoStatus
     // (msg.id._serialized) is the id it expects.
-    await this.client().revokeStatusMessage(statusId);
+    await this.withPage('deleteStatus', () => this.client().revokeStatusMessage(statusId));
   }
 }

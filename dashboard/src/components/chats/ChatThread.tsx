@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useState, type RefObject } from 'react';
 import { useTranslation } from 'react-i18next';
-import { ChevronDown, CornerUpLeft, Loader2, MessageSquare, Smile, Trash2 } from 'lucide-react';
-import type { Chat } from '../../services/api';
+import { AlertCircle, ChevronDown, CornerUpLeft, Loader2, MessageSquare, Smile, Trash2 } from 'lucide-react';
+import { sessionApi, type Chat } from '../../services/api';
 import { getMediaSrc, senderKey, type ChatMessageView } from '../../utils/chatMessages';
+import { shouldFetchOlderMessages } from '../../utils/scrollDecision';
 import MessageBody from './MessageBody';
 
 // Stable per-sender colour for group message labels, like WhatsApp gives each participant a colour.
@@ -16,12 +17,20 @@ const senderColor = (name: string): string => {
 };
 
 interface ChatThreadProps {
+  /** Needed to fetch a message's media on demand; null before a session is chosen. */
+  sessionId: string | null;
   activeChat: Chat;
   messages: ChatMessageView[];
   loadingMessages: boolean;
   messagesError: boolean;
   messagesContainerRef: RefObject<HTMLDivElement | null>;
-  onMediaLoad: () => void;
+  /** Whether an older page of this chat's history exists. */
+  hasMoreMessages: boolean;
+  loadingOlderMessages: boolean;
+  onLoadOlderMessages: () => void;
+  onMediaLoad: (event?: { currentTarget: Element | null }) => void;
+  /** Seeds each media element's pre-decode height; see useChatScrollPosition.measureMedia. */
+  measureMedia: (el: Element | null) => void;
   onOpenImage: (messageId: string) => void;
   onReply: (message: ChatMessageView) => void;
   onReact: (message: ChatMessageView, emoji: string) => void;
@@ -33,18 +42,64 @@ interface ChatThreadProps {
 // scroll-position hook (its containerRef is handed down); reply/react/delete/lightbox intents go
 // back up as callbacks.
 function ChatThread({
+  sessionId,
   activeChat,
   messages,
   loadingMessages,
   messagesError,
   messagesContainerRef,
+  hasMoreMessages,
+  loadingOlderMessages,
+  onLoadOlderMessages,
   onMediaLoad,
+  measureMedia,
   onOpenImage,
   onReply,
   onReact,
   onDelete,
 }: ChatThreadProps) {
   const { t } = useTranslation();
+
+  // Media the message list did not inline. The route serves the bytes as an attachment
+  // (Content-Disposition), and the list only carries payloads up to
+  // MESSAGE_LIST_INLINE_MEDIA_BUDGET_BYTES — past that a row arrives as `{ omitted: true }`. Without
+  // this fetch the placeholder is terminal: this thread requests the largest page size and caches it
+  // with staleTime Infinity, so an older attachment in a media-heavy chat has no other route to it.
+  // Keyed by message id, not one shared slot: a viewer can click a second placeholder before the
+  // first resolves, and each download owns its own lifecycle. Sharing one slot let the second click
+  // overwrite the first, after which whichever settled first cleared the other's state — re-enabling
+  // a button whose fetch was still open, and landing a failure marker on the wrong bubble.
+  const [mediaFetch, setMediaFetch] = useState<Record<string, 'loading' | 'failed'>>({});
+  const downloadMedia = useCallback(
+    async (message: ChatMessageView) => {
+      const messageId = message.waMessageId;
+      if (!sessionId || !messageId) return;
+      setMediaFetch(prev => ({ ...prev, [messageId]: 'loading' }));
+      let objectUrl: string | null = null;
+      try {
+        const blob = await sessionApi.getMessageMediaBlob(sessionId, activeChat.id, messageId);
+        objectUrl = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = objectUrl;
+        // The stored filename when there is one; the message id is a unique fallback that keeps two
+        // downloads from the same thread apart.
+        link.download = message.metadata?.media?.filename || messageId;
+        link.click();
+        setMediaFetch(prev => {
+          const next = { ...prev };
+          delete next[messageId];
+          return next;
+        });
+      } catch {
+        // 404 covers every "there are no bytes" case the route documents (URL-based send, media
+        // download disabled, over the inbound cap). Say so on the bubble rather than failing mutely.
+        setMediaFetch(prev => ({ ...prev, [messageId]: 'failed' }));
+      } finally {
+        if (objectUrl) URL.revokeObjectURL(objectUrl);
+      }
+    },
+    [sessionId, activeChat.id],
+  );
 
   // Scroll-to-bottom button visibility. The main scroll-position memory is owned by
   // useChatScrollPosition, which doesn't expose its pin state (intentionally — that would re-render
@@ -54,9 +109,20 @@ function ChatThread({
   useEffect(() => {
     const el = messagesContainerRef.current;
     if (!el) return undefined;
-    const onScroll = () => {
+    const onScroll = (event?: Event) => {
       // 120px gap = a couple of message bubbles before counting as "scrolled up".
       setShowJumpToBottom(el.scrollHeight - el.scrollTop - el.clientHeight > 120);
+      const geometry = { scrollTop: el.scrollTop, scrollHeight: el.scrollHeight, clientHeight: el.clientHeight };
+      if (
+        shouldFetchOlderMessages({
+          isUserScroll: Boolean(event),
+          geometry,
+          hasMore: hasMoreMessages,
+          isFetching: loadingOlderMessages,
+        })
+      ) {
+        onLoadOlderMessages();
+      }
     };
     onScroll(); // sync initial position (e.g. saved restore landed above the bottom)
     el.addEventListener('scroll', onScroll, { passive: true });
@@ -97,12 +163,34 @@ function ChatThread({
           <ChevronDown size={22} />
         </button>
       )}
+      {/* Older-page spinner, or the failure in its place. An in-flow sibling before the thread, not
+          an overlay — it pushes the oldest bubble down, which is why useChatScrollPosition reads
+          this container's height at REQUEST time (before this renders), not on whichever commit
+          happens to change it first. Shown whenever there IS a thread to sit above — including a
+          failed older-page fetch with messages already loaded, which must not fall through to the
+          full-screen error below: that would replace the loaded thread with a placeholder,
+          collapsing the scroll container so the failed page can never be retried by scrolling. */}
+      {!loadingMessages && (loadingOlderMessages || (messagesError && messages.length > 0)) && (
+        <div className="messages-loading-older">
+          {loadingOlderMessages ? (
+            <>
+              <Loader2 className="animate-spin" size={18} />
+              <span>{t('chats.loadingOlderMessages')}</span>
+            </>
+          ) : (
+            <>
+              <AlertCircle size={18} />
+              <span>{t('chats.loadOlderMessagesError')}</span>
+            </>
+          )}
+        </div>
+      )}
       {loadingMessages ? (
         <div className="messages-loading">
           <Loader2 className="animate-spin" size={32} />
           <span>{t('chats.loadingMessages')}</span>
         </div>
-      ) : messagesError ? (
+      ) : messagesError && messages.length === 0 ? (
         <div className="messages-empty">
           <MessageSquare size={32} />
           <span>{t('chats.loadMessagesError')}</span>
@@ -115,9 +203,7 @@ function ChatThread({
       ) : (
         messages.map((msg, index) => {
           const isMe = msg.direction === 'outgoing';
-          const formattedTime = formatTime(
-            msg.timestamp || Math.floor(new Date(msg.createdAt).getTime() / 1000),
-          );
+          const formattedTime = formatTime(msg.timestamp || Math.floor(new Date(msg.createdAt).getTime() / 1000));
 
           // Label who posted, WhatsApp-style: only in groups, only on incoming messages,
           // and only on the first of a consecutive run from the same sender (so a burst
@@ -125,11 +211,11 @@ function ChatThread({
           const prev = messages[index - 1];
           const showSender = Boolean(
             activeChat?.isGroup &&
-              !isMe &&
-              msg.chatName &&
-              // Key the run on the stable sender id (participant JID), not the display
-              // name — two participants who share a pushName must still start a new run.
-              (!prev || prev.direction === 'outgoing' || senderKey(prev) !== senderKey(msg)),
+            !isMe &&
+            msg.chatName &&
+            // Key the run on the stable sender id (participant JID), not the display
+            // name — two participants who share a pushName must still start a new run.
+            (!prev || prev.direction === 'outgoing' || senderKey(prev) !== senderKey(msg)),
           );
 
           const isMediaMessage = msg.type !== 'text';
@@ -145,12 +231,7 @@ function ChatThread({
               return (
                 <div className="message-location">
                   {thumb && (
-                    <img
-                      src={thumb}
-                      alt=""
-                      onLoad={onMediaLoad}
-                      style={{ maxWidth: 220, borderRadius: 8, display: 'block', marginBottom: 4 }}
-                    />
+                    <img ref={measureMedia} src={thumb} alt="" onLoad={onMediaLoad} className="chat-location-media" />
                   )}
                   <span className="message-media-omitted">📍 {t('chats.media.location')}</span>
                 </div>
@@ -173,7 +254,23 @@ function ChatThread({
             }
             if (!mediaInfo) return null;
             if (mediaInfo.omitted) {
-              return <div className="message-media-omitted">📎 {t('chats.media.omitted')}</div>;
+              // Not a plain label: the bytes exist behind the per-message media route, so this is the
+              // only handle the viewer has on them.
+              const fetchState = msg.waMessageId ? mediaFetch[msg.waMessageId] : undefined;
+              return (
+                <button
+                  type="button"
+                  className="message-media-omitted"
+                  onClick={() => void downloadMedia(msg)}
+                  disabled={!sessionId || !msg.waMessageId || fetchState === 'loading'}
+                >
+                  {fetchState === 'loading' ? (
+                    <Loader2 size={14} className="animate-spin" />
+                  ) : (
+                    <>📎 {t(fetchState === 'failed' ? 'chats.status.mediaUnavailable' : 'chats.media.omitted')}</>
+                  )}
+                </button>
+              );
             }
             const mediaSrc = getMediaSrc(mediaInfo);
             if (!mediaSrc) return null;
@@ -187,6 +284,7 @@ function ChatThread({
                       src={mediaSrc}
                       alt={mediaInfo.filename || t('chats.media.image')}
                       className="chat-image-media"
+                      ref={measureMedia}
                       onLoad={onMediaLoad}
                       onClick={() => onOpenImage(msg.id)}
                     />
@@ -196,6 +294,7 @@ function ChatThread({
                 return (
                   <div className="message-media-video">
                     <video
+                      ref={measureMedia}
                       src={mediaSrc}
                       controls
                       className="chat-video-media"
@@ -214,11 +313,7 @@ function ChatThread({
               default:
                 return (
                   <div className="message-media-document">
-                    <a
-                      href={mediaSrc}
-                      download={mediaInfo.filename || 'document'}
-                      className="chat-document-media"
-                    >
+                    <a href={mediaSrc} download={mediaInfo.filename || 'document'} className="chat-document-media">
                       📎 {mediaInfo.filename || t('chats.downloadDocument')}
                     </a>
                   </div>
@@ -275,8 +370,16 @@ function ChatThread({
 
                   <div className="message-meta">
                     <span className="message-time">{formattedTime}</span>
+                    {/* delivered and read render the SAME glyph and differ only in colour, which
+                        carries the meaning nowhere a screen reader or a colour-blind reader can
+                        reach it. The status is spelled out for both. */}
                     {isMe && (
-                      <span className={`message-status-icon ${msg.status}`}>
+                      <span
+                        className={`message-status-icon ${msg.status}`}
+                        role="img"
+                        aria-label={t(`chats.messageStatus.${msg.status}`)}
+                        title={t(`chats.messageStatus.${msg.status}`)}
+                      >
                         {msg.status === 'pending' && '🕒'}
                         {msg.status === 'sent' && '✓'}
                         {msg.status === 'delivered' && '✓✓'}
@@ -316,11 +419,7 @@ function ChatThread({
                     </button>
 
                     <div className="reaction-trigger-wrapper">
-                      <button
-                        type="button"
-                        className="action-btn reaction-btn"
-                        title={t('chats.actions.react')}
-                      >
+                      <button type="button" className="action-btn reaction-btn" title={t('chats.actions.react')}>
                         <Smile size={14} />
                       </button>
                       <div className="reaction-quick-popover">

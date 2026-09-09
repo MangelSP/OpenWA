@@ -45,7 +45,35 @@ const SESSION_STALE_ENGINE: Session = {
   updatedAt: '2026-01-01T00:00:00.000Z',
 };
 
-const SESSIONS = [SESSION_QR, SESSION_STALE_ENGINE];
+// `initializing` on a session that is STILL LINKED: the Baileys adapter parks one there for the
+// whole reconnect backoff after a transient close. The card used to branch on status alone and paint
+// it as the pairing placeholder, hiding the phone, so a linked account read as an unlinked one.
+const SESSION_RECONNECTING: Session = {
+  id: 'sess-reconnecting-1',
+  name: 'reconnecting-bot',
+  status: 'initializing',
+  engineLoaded: true,
+  phone: '15550002222',
+  lastActive: '2026-01-01T00:00:00.000Z',
+  createdAt: '2026-01-01T00:00:00.000Z',
+  updatedAt: '2026-01-01T00:00:00.000Z',
+};
+
+// A reachout timelock leaves the account fully connected — `ready` plus a restriction is the normal
+// shape, and the card must show it there. A restriction hidden behind a failed/disconnected status
+// (the rule `lastError` follows) would be invisible in exactly the case that matters.
+const SESSION_TIMELOCKED: Session = {
+  id: 'sess-limited-1',
+  name: 'limited-bot',
+  status: 'ready',
+  engineLoaded: true,
+  phone: '15550001111',
+  createdAt: '2026-01-01T00:00:00.000Z',
+  updatedAt: '2026-01-01T00:00:00.000Z',
+  restriction: { kind: 'reachout_timelock', code: 'BIZ_QUALITY', expiresAt: '2026-08-04T09:00:00.000Z' },
+};
+
+const SESSIONS = [SESSION_QR, SESSION_STALE_ENGINE, SESSION_TIMELOCKED, SESSION_RECONNECTING];
 
 function jsonResponse(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
@@ -64,6 +92,8 @@ const fetchCalls: FetchCall[] = [];
 
 function resetFetchCalls(): void {
   fetchCalls.length = 0;
+  sessionProxy = { enabled: false, proxyType: null, proxyHost: null, hasCredentials: false };
+  proxyGetFails = false;
 }
 
 function findFetchCall(method: string, path: string): FetchCall | undefined {
@@ -74,6 +104,17 @@ function findFetchCall(method: string, path: string): FetchCall | undefined {
 // into a confusing downstream failure. Lifecycle actions (start/stop/logout/force-kill/pairing-code)
 // are stubbed generically even though none of the three cases below trigger them, per the brief's
 // endpoint list — a future case exercising them should not need to touch this stub.
+// Mutable so a test can set the starting value and observe what a PATCH wrote back.
+let sessionConfig = { autoRejectCalls: false, maxReconnectAttempts: null as number | null, reconnectBaseDelay: 5000 };
+let configPatchFails = false;
+let proxyGetFails = false;
+let sessionProxy = {
+  enabled: false,
+  proxyType: null as string | null,
+  proxyHost: null as string | null,
+  hasCredentials: false,
+};
+
 function installFetchStub(): void {
   globalThis.fetch = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
@@ -93,7 +134,8 @@ function installFetchStub(): void {
     if (method === 'GET' && path === '/api/sessions') return Promise.resolve(jsonResponse(SESSIONS));
 
     if (method === 'POST' && path === '/api/sessions') {
-      const name = (body as { name?: string } | undefined)?.name ?? 'unnamed';
+      const payload = body as { name?: string; proxyUrl?: string; proxyType?: string } | undefined;
+      const name = payload?.name ?? 'unnamed';
       return Promise.resolve(
         jsonResponse({
           id: `sess-new-${name}`,
@@ -114,6 +156,40 @@ function installFetchStub(): void {
     }
     if (method === 'DELETE' && sessionIdMatch) {
       return Promise.resolve(new Response(null, { status: 204 }));
+    }
+
+    const configMatch = path.match(/^\/api\/sessions\/([^/]+)\/config$/);
+    if (configMatch) {
+      if (method === 'GET') return Promise.resolve(jsonResponse({ ...sessionConfig }));
+      if (method === 'PATCH') {
+        // Per-test switch: the revert case needs the write to fail while the initial read succeeds,
+        // which a single stub response cannot express.
+        if (configPatchFails) return Promise.resolve(jsonResponse({ message: 'nope' }, 500));
+        Object.assign(sessionConfig, body as Record<string, unknown>);
+        return Promise.resolve(jsonResponse({ ...sessionConfig }));
+      }
+    }
+
+    const proxyMatch = path.match(/^\/api\/sessions\/([^/]+)\/proxy$/);
+    if (proxyMatch) {
+      if (method === 'GET' && proxyGetFails) return Promise.resolve(jsonResponse({ message: 'boom' }, 500));
+      if (method === 'GET') return Promise.resolve(jsonResponse({ ...sessionProxy }));
+      if (method === 'PATCH') {
+        const payload = body as { proxyUrl?: string | null } | undefined;
+        if (payload?.proxyUrl === null) {
+          sessionProxy = { enabled: false, proxyType: null, proxyHost: null, hasCredentials: false };
+        } else if (payload?.proxyUrl) {
+          const parsed = new URL(payload.proxyUrl);
+          const scheme = parsed.protocol.replace(':', '');
+          sessionProxy = {
+            enabled: true,
+            proxyType: scheme,
+            proxyHost: parsed.host,
+            hasCredentials: !!(parsed.username || parsed.password),
+          };
+        }
+        return Promise.resolve(jsonResponse({ ...sessionProxy }));
+      }
     }
 
     const qrMatch = path.match(/^\/api\/sessions\/([^/]+)\/qr$/);
@@ -163,7 +239,10 @@ before(async () => {
   // Deliberately NOT setting sessionStorage['openwa_api_key']: useWebSocket.connect() reads it and
   // bails with a console.warn when it's absent. Setting it would make socket.io actually dial
   // http://localhost/events and hit ECONNREFUSED in this environment.
-  await import('../i18n/index.ts');
+  // Awaited, not just imported: catalogues are fetched now, so the import only starts the load and
+  // the English copy these tests query by name renders as a raw key until it arrives.
+  const { i18nReady } = await import('../i18n/index.ts');
+  await i18nReady;
   rtl = await import('@testing-library/react');
   ({ RoleProvider } = await import('../components/RoleProvider.tsx'));
   ({ ToastProvider } = await import('../components/Toast.tsx'));
@@ -208,6 +287,37 @@ test('the session list renders, and action buttons gate on engineLoaded rather t
 
   const qrCard = screen.getByText('new-device').closest('.session-card') as HTMLElement;
   within(qrCard).getByRole('button', { name: 'Show QR' });
+  within(qrCard).getByRole('button', { name: 'Proxy' });
+});
+
+test('a linked session that is reconnecting keeps its identity rows, not the pairing placeholder', async () => {
+  const { screen, within } = rtl;
+  resetFetchCalls();
+  renderSessions();
+
+  await screen.findByText('reconnecting-bot');
+  const card = screen.getByText('reconnecting-bot').closest('.session-card') as HTMLElement;
+
+  // The pill still says Starting..., which is honest: the engine really is between attempts.
+  within(card).getByText('Starting...');
+  // What must NOT be there: the pairing placeholder, which claims a QR is coming for an account that
+  // is already linked.
+  assert.equal(within(card).queryByText('Preparing QR code...'), null);
+  assert.equal(card.querySelector('.qr-placeholder'), null);
+  // What must be there: the number the operator needs to recognise the account.
+  within(card).getByText('15550002222');
+});
+
+test('a never-linked session still gets the pairing placeholder', async () => {
+  const { screen, within } = rtl;
+  resetFetchCalls();
+  renderSessions();
+
+  // Same status family, no bound phone: this one really is waiting to be paired.
+  await screen.findByText('new-device');
+  const card = screen.getByText('new-device').closest('.session-card') as HTMLElement;
+  assert.ok(card.querySelector('.qr-placeholder'));
+  within(card).getByRole('button', { name: 'Show QR' });
 });
 
 test('creating a session issues POST /api/sessions with the entered name', async () => {
@@ -230,6 +340,47 @@ test('creating a session issues POST /api/sessions with the entered name', async
   });
 
   await screen.findByText('backup-bot');
+});
+
+test('opening the proxy modal fetches GET /api/sessions/:id/proxy', async () => {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  resetFetchCalls();
+  renderSessions();
+
+  await screen.findByText('new-device');
+  const qrCard = screen.getByText('new-device').closest('.session-card') as HTMLElement;
+  fireEvent.click(within(qrCard).getByRole('button', { name: 'Proxy' }));
+
+  await screen.findByRole('dialog');
+  await waitFor(() => {
+    assert.ok(findFetchCall('GET', '/api/sessions/sess-qr-1/proxy'), 'expected a GET to /proxy');
+  });
+});
+
+test('saving proxy settings issues PATCH /api/sessions/:id/proxy', async () => {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  resetFetchCalls();
+  renderSessions();
+
+  await screen.findByText('new-device');
+  const qrCard = screen.getByText('new-device').closest('.session-card') as HTMLElement;
+  fireEvent.click(within(qrCard).getByRole('button', { name: 'Proxy' }));
+
+  const dialog = await screen.findByRole('dialog');
+  const toggle = within(dialog).getByRole('checkbox');
+  fireEvent.click(toggle);
+  fireEvent.change(within(dialog).getByLabelText('Proxy URL'), {
+    target: { value: 'http://user:pass@proxy.internal:8080' },
+  });
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Save' }));
+
+  await waitFor(() => {
+    const call = findFetchCall('PATCH', '/api/sessions/sess-qr-1/proxy');
+    assert.ok(call, 'expected a PATCH to /proxy');
+    assert.deepEqual(call!.body, {
+      proxyUrl: 'http://user:pass@proxy.internal:8080',
+    });
+  });
 });
 
 test('a typed pairing phone number survives toggling to the QR tab and back', async () => {
@@ -257,5 +408,157 @@ test('a typed pairing phone number survives toggling to the QR tab and back', as
     (screen.getByLabelText('Phone Number') as HTMLInputElement).value,
     '919876543210',
     'the typed pairing phone number was lost after toggling tabs',
+  );
+});
+
+test('stopping a session dismisses its own open QR modal', async () => {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  resetFetchCalls();
+  renderSessions();
+
+  await screen.findByText('new-device');
+  const qrCard = screen.getByText('new-device').closest('.session-card') as HTMLElement;
+  fireEvent.click(within(qrCard).getByRole('button', { name: 'Show QR' }));
+
+  // Wait for the eager GET .../qr fetch triggered by opening the modal to settle, same as the
+  // toggle-persistence case above, so the assertion below isn't racing that fetch's state update.
+  await screen.findByAltText('QR');
+  assert.ok(screen.getByRole('dialog'), 'expected the QR modal to be open before stopping the session');
+
+  // SESSION_QR has engineLoaded: true, so isSessionStarted puts a no-confirmation Stop button on
+  // this same card (see the first test's engineLoaded-gate assertion) — the simplest deterministic
+  // trigger for applySessionResponse, which is what calls the pairing hook's dismissQrForSession.
+  // A neutered dismisser would leave this modal open, pointed at a session with no engine left.
+  fireEvent.click(within(qrCard).getByRole('button', { name: 'Stop' }));
+
+  await waitFor(() => {
+    assert.ok(findFetchCall('POST', '/api/sessions/sess-qr-1/stop'), 'expected a POST to the stop endpoint');
+  });
+
+  await waitFor(() => {
+    // Never hand a live DOM node to assert.equal/deepEqual: on failure Node's assert machinery
+    // inspects it for the diff, and a jsdom element wired up by React (parentNode/ownerDocument/the
+    // internal fiber back-references) is cyclic enough that the inspection can hang the process
+    // instead of failing fast. Reduce to a boolean first.
+    assert.ok(!screen.queryByRole('dialog'), 'the QR modal stayed open after its session stopped');
+  });
+});
+
+test('a restricted session shows the restriction on its card, even while it is ready', async () => {
+  const { screen, within } = rtl;
+  resetFetchCalls();
+  renderSessions();
+
+  const card = (await screen.findByText('limited-bot')).closest('.session-card') as HTMLElement;
+
+  within(card).getByText('Restriction');
+  const value = within(card).getByText('New chats blocked');
+  // The raw engine token and the expiry ride in the tooltip: `code` is searchable but not readable,
+  // so it must not become the visible label.
+  assert.match(value.getAttribute('title') ?? '', /BIZ_QUALITY/);
+  assert.match(value.getAttribute('title') ?? '', /until/);
+});
+
+test('an unrestricted session shows no restriction row', async () => {
+  const { screen, within } = rtl;
+  resetFetchCalls();
+  renderSessions();
+
+  const card = (await screen.findByText('stale-engine')).closest('.session-card') as HTMLElement;
+
+  assert.equal(within(card).queryByText('Restriction'), null);
+});
+
+// ── Auto-reject toggle ───────────────────────────────────────────────────────
+
+async function openDetailFor(name: string): Promise<HTMLInputElement> {
+  const { screen, within } = rtl;
+  const card = (await screen.findByText(name)).closest('.session-card') as HTMLElement;
+  rtl.fireEvent.click(within(card).getByRole('button', { name: 'View' }));
+  // The config is fetched when the modal opens, so the toggle only appears once that read lands —
+  // findBy, not getBy.
+  return (await screen.findByRole('checkbox')) as HTMLInputElement;
+}
+
+test('the auto-reject toggle reflects the stored config and patches only the key it owns', async () => {
+  resetFetchCalls();
+  sessionConfig = { autoRejectCalls: false, maxReconnectAttempts: null, reconnectBaseDelay: 5000 };
+  configPatchFails = false;
+  renderSessions();
+
+  const toggle = await openDetailFor('new-device');
+  assert.equal(toggle.checked, false);
+
+  rtl.fireEvent.click(toggle);
+  await rtl.waitFor(() => assert.ok(fetchCalls.some(c => c.method === 'PATCH')));
+
+  const patch = fetchCalls.find(c => c.method === 'PATCH');
+  assert.match(patch?.path ?? '', /\/api\/sessions\/[^/]+\/config$/);
+  // Only autoRejectCalls: sending the whole object would rewrite the two reconnect keys this screen
+  // never showed the operator, and a merge patch exists precisely to avoid that.
+  assert.deepEqual(patch?.body, { autoRejectCalls: true });
+  await rtl.waitFor(() => assert.equal((rtl.screen.getByRole('checkbox') as HTMLInputElement).checked, true));
+});
+
+test('a rejected write reverts the toggle instead of leaving it showing a state the gateway never accepted', async () => {
+  resetFetchCalls();
+  sessionConfig = { autoRejectCalls: false, maxReconnectAttempts: null, reconnectBaseDelay: 5000 };
+  configPatchFails = true;
+  renderSessions();
+
+  const toggle = await openDetailFor('new-device');
+  assert.equal(toggle.checked, false);
+
+  rtl.fireEvent.click(toggle);
+  await rtl.waitFor(() => assert.ok(fetchCalls.some(c => c.method === 'PATCH')));
+
+  // The optimistic flip must not survive the failure: a toggle left on would tell the operator calls
+  // are being auto-rejected when the gateway still has it off.
+  await rtl.waitFor(() => assert.equal((rtl.screen.getByRole('checkbox') as HTMLInputElement).checked, false));
+  configPatchFails = false;
+});
+
+test('a failed proxy read offers no Save, so it cannot clear a proxy nobody could see', async () => {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  resetFetchCalls();
+  // The session HAS a proxy, with credentials the API deliberately never returns. Reading it fails.
+  sessionProxy = { enabled: true, proxyType: 'socks5', proxyHost: 'proxy.internal:1080', hasCredentials: true };
+  proxyGetFails = true;
+  renderSessions();
+
+  await screen.findByText('new-device');
+  const qrCard = screen.getByText('new-device').closest('.session-card') as HTMLElement;
+  fireEvent.click(within(qrCard).getByRole('button', { name: 'Proxy' }));
+
+  const dialog = await screen.findByRole('dialog');
+  await waitFor(() => assert.ok(findFetchCall('GET', '/api/sessions/sess-qr-1/proxy')));
+
+  // No editable form and no Save: an "off" toggle here would read as "no proxy configured", and
+  // saving from that state sends proxyUrl:null, destroying the stored URL and its credentials.
+  await waitFor(() => assert.equal(within(dialog).queryByRole('button', { name: 'Save' }), null));
+  assert.equal(within(dialog).queryByRole('checkbox'), null);
+  assert.equal(findFetchCall('PATCH', '/api/sessions/sess-qr-1/proxy'), undefined);
+});
+
+test('saving without retyping the URL leaves the stored proxy and its credentials alone', async () => {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  resetFetchCalls();
+  sessionProxy = { enabled: true, proxyType: 'http', proxyHost: 'proxy.internal:8080', hasCredentials: true };
+  renderSessions();
+
+  await screen.findByText('new-device');
+  const qrCard = screen.getByText('new-device').closest('.session-card') as HTMLElement;
+  fireEvent.click(within(qrCard).getByRole('button', { name: 'Proxy' }));
+
+  const dialog = await screen.findByRole('dialog');
+  await waitFor(() => assert.ok(findFetchCall('GET', '/api/sessions/sess-qr-1/proxy')));
+  // The URL field is deliberately empty: credentials are never sent back to render.
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Save' }));
+
+  await waitFor(() => assert.equal(screen.queryByRole('dialog'), null));
+  assert.equal(
+    findFetchCall('PATCH', '/api/sessions/sess-qr-1/proxy'),
+    undefined,
+    'an untouched form must not write, or it would replace a credentialed URL with nothing',
   );
 });

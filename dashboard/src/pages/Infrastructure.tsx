@@ -47,7 +47,7 @@ export function Infrastructure() {
   const { data: currentEngineData } = useCurrentEngineQuery();
   const currentEngine = currentEngineData?.engineType ?? '';
 
-  const configForm = useInfraConfigForm(infraStatus, savedConfig, currentEngine);
+  const configForm = useInfraConfigForm(infraStatus, savedConfig);
   const restartFlow = useRestartFlow();
   const dataBackup = useDataBackup();
 
@@ -124,27 +124,31 @@ export function Infrastructure() {
     );
   }
 
-  // A setting whose RUNNING value (/status) differs from the SAVED file (/config) is being pinned by a
-  // host/.env environment variable, which wins at runtime — so a dashboard change to it won't apply
-  // until that variable is unset. Surface that honestly instead of letting the control look effective.
-  const dbPinnedByEnv =
-    !configSave.savePending &&
-    !!infraStatus &&
-    !!savedConfig &&
-    infraStatus.database.type !== savedConfig.database.type;
-  const redisPinnedByEnv =
-    !configSave.savePending &&
-    !!infraStatus &&
-    !!savedConfig &&
-    infraStatus.redis.enabled !== savedConfig.redis.enabled;
-  const storagePinnedByEnv =
-    !configSave.savePending && !!infraStatus && !!savedConfig && infraStatus.storage.type !== savedConfig.storage.type;
-  const envPinNote = (pinned: boolean) =>
-    pinned ? (
+  // A control here can be ineffective for two different reasons, and they need OPPOSITE advice:
+  //   - an environment variable (or a project .env) supplies the value, so it outranks anything saved
+  //     here until the deployment changes — the gateway reports this in `envPinned`;
+  //   - the value WAS saved and the server has not been restarted yet — a restart applies it.
+  // Both look identical as "running differs from saved", which is why drift alone used to be reported
+  // as an environment pin even on a stock stack with no variable set anywhere (#1082).
+  const settingNote = (envKey: string, running: unknown, saved: unknown) => {
+    if (infraStatus?.envPinned?.includes(envKey)) {
+      return (
+        <p className="env-pin-note">
+          <AlertTriangle size={14} /> {t('infrastructure.envPinNote', { name: envKey })}
+        </p>
+      );
+    }
+    // Suppressed only while the request is actually in flight. `saving` is that flag; `savePending` is
+    // a latch set once a save SUCCEEDS and cleared only by a restart's page reload, so gating on it
+    // hid this note for the whole life of the page from the first successful save — which is exactly
+    // the state it exists to report, and exactly what the operator who chose "Restart Later" is in.
+    const pendingRestart = !configSave.saving && !!infraStatus && !!savedConfig && running !== saved;
+    return pendingRestart ? (
       <p className="env-pin-note">
-        <AlertTriangle size={14} /> {t('infrastructure.envPinNote')}
+        <AlertTriangle size={14} /> {t('infrastructure.pendingRestartNote')}
       </p>
     ) : null;
+  };
 
   return (
     <div className="infrastructure-page">
@@ -162,7 +166,7 @@ export function Infrastructure() {
               ● {configForm.dbConfig.type === 'postgres' ? 'PostgreSQL' : 'SQLite'}
             </span>
           </div>
-          {envPinNote(dbPinnedByEnv)}
+          {settingNote('DATABASE_TYPE', infraStatus.database.type, savedConfig?.database.type)}
 
           <div className="radio-group">
             <label className={`radio-option ${configForm.dbConfig.type === 'sqlite' ? 'selected' : ''}`}>
@@ -193,12 +197,13 @@ export function Infrastructure() {
             <>
               <div className="toggle-row toggle-row-spaced">
                 <div className="toggle-info">
-                  <span>{t('infrastructure.database.useBuiltIn')}</span>
+                  <span id="toggle-db-builtin">{t('infrastructure.database.useBuiltIn')}</span>
                   <small>{t('infrastructure.database.builtInDesc')}</small>
                 </div>
                 <label className="toggle-switch">
                   <input
                     type="checkbox"
+                    aria-labelledby="toggle-db-builtin"
                     checked={configForm.dbConfig.builtIn}
                     onChange={e => configForm.updateDbConfig('builtIn', e.target.checked)}
                   />
@@ -210,16 +215,18 @@ export function Infrastructure() {
                 <div className="config-form">
                   <div className="form-row">
                     <div className="form-group">
-                      <label>{t('common.host')}</label>
+                      <label htmlFor="infra-1">{t('common.host')}</label>
                       <input
+                        id="infra-1"
                         type="text"
                         value={configForm.dbConfig.host}
                         onChange={e => configForm.updateDbConfig('host', e.target.value)}
                       />
                     </div>
                     <div className="form-group small">
-                      <label>{t('common.port')}</label>
+                      <label htmlFor="infra-2">{t('common.port')}</label>
                       <input
+                        id="infra-2"
                         type="text"
                         value={configForm.dbConfig.port}
                         onChange={e => configForm.updateDbConfig('port', e.target.value)}
@@ -228,16 +235,18 @@ export function Infrastructure() {
                   </div>
                   <div className="form-row">
                     <div className="form-group">
-                      <label>{t('common.username')}</label>
+                      <label htmlFor="infra-3">{t('common.username')}</label>
                       <input
+                        id="infra-3"
                         type="text"
                         value={configForm.dbConfig.username}
                         onChange={e => configForm.updateDbConfig('username', e.target.value)}
                       />
                     </div>
                     <div className="form-group">
-                      <label>{t('common.password')}</label>
+                      <label htmlFor="infra-4">{t('common.password')}</label>
                       <input
+                        id="infra-4"
                         type="password"
                         value={configForm.dbConfig.password}
                         onChange={e => configForm.updateDbConfig('password', e.target.value)}
@@ -246,16 +255,18 @@ export function Infrastructure() {
                   </div>
                   <div className="form-row">
                     <div className="form-group">
-                      <label>{t('infrastructure.database.dbName')}</label>
+                      <label htmlFor="infra-5">{t('infrastructure.database.dbName')}</label>
                       <input
+                        id="infra-5"
                         type="text"
                         value={configForm.dbConfig.database}
                         onChange={e => configForm.updateDbConfig('database', e.target.value)}
                       />
                     </div>
                     <div className="form-group small">
-                      <label>{t('infrastructure.database.poolSize')}</label>
+                      <label htmlFor="infra-6">{t('infrastructure.database.poolSize')}</label>
                       <input
+                        id="infra-6"
                         type="number"
                         min="1"
                         max="50"
@@ -266,8 +277,9 @@ export function Infrastructure() {
                   </div>
                   <div className="form-row">
                     <div className="form-group">
-                      <label>{t('infrastructure.database.schema')}</label>
+                      <label htmlFor="infra-7">{t('infrastructure.database.schema')}</label>
                       <input
+                        id="infra-7"
                         type="text"
                         value={configForm.dbConfig.schema}
                         onChange={e => configForm.updateDbConfig('schema', e.target.value)}
@@ -278,12 +290,13 @@ export function Infrastructure() {
                   </div>
                   <div className="toggle-row">
                     <div className="toggle-info">
-                      <span>{t('infrastructure.database.ssl')}</span>
+                      <span id="toggle-db-ssl">{t('infrastructure.database.ssl')}</span>
                       <small>{t('infrastructure.database.sslDesc')}</small>
                     </div>
                     <label className="toggle-switch">
                       <input
                         type="checkbox"
+                        aria-labelledby="toggle-db-ssl"
                         checked={configForm.dbConfig.sslEnabled}
                         onChange={e => configForm.updateDbConfig('sslEnabled', e.target.checked)}
                       />
@@ -293,12 +306,13 @@ export function Infrastructure() {
                   {configForm.dbConfig.sslEnabled && (
                     <div className="toggle-row">
                       <div className="toggle-info">
-                        <span>{t('infrastructure.database.sslRejectUnauthorized')}</span>
+                        <span id="toggle-db-ssl-reject">{t('infrastructure.database.sslRejectUnauthorized')}</span>
                         <small>{t('infrastructure.database.sslRejectUnauthorizedDesc')}</small>
                       </div>
                       <label className="toggle-switch">
                         <input
                           type="checkbox"
+                          aria-labelledby="toggle-db-ssl-reject"
                           checked={configForm.dbConfig.sslRejectUnauthorized}
                           onChange={e => configForm.updateDbConfig('sslRejectUnauthorized', e.target.checked)}
                         />
@@ -364,6 +378,9 @@ export function Infrastructure() {
             </div>
             <span className="status-indicator connected">● {currentEngine || configForm.engineConfig.type}</span>
           </div>
+          {/* The radio re-seeds from the RUNNING engine, so without this a pinned engine silently
+              snapped back after a restart and read as "the save did nothing" (#1082). */}
+          {settingNote('ENGINE_TYPE', infraStatus.engine.type, savedConfig?.engine.type)}
 
           <div className="radio-group">
             {engines.map(engine => (
@@ -406,12 +423,13 @@ export function Infrastructure() {
             <div className="config-form">
               <div className="toggle-row">
                 <div className="toggle-info">
-                  <span>{t('infrastructure.engine.headless')}</span>
+                  <span id="toggle-engine-headless">{t('infrastructure.engine.headless')}</span>
                   <small>{t('infrastructure.engine.headlessDesc')}</small>
                 </div>
                 <label className="toggle-switch">
                   <input
                     type="checkbox"
+                    aria-labelledby="toggle-engine-headless"
                     checked={configForm.engineConfig.headless}
                     onChange={e => configForm.updateEngineConfig('headless', e.target.checked)}
                   />
@@ -419,16 +437,18 @@ export function Infrastructure() {
                 </label>
               </div>
               <div className="form-group">
-                <label>{t('infrastructure.engine.sessionDataPath')}</label>
+                <label htmlFor="infra-8">{t('infrastructure.engine.sessionDataPath')}</label>
                 <input
+                  id="infra-8"
                   type="text"
                   value={configForm.engineConfig.sessionDataPath}
                   onChange={e => configForm.updateEngineConfig('sessionDataPath', e.target.value)}
                 />
               </div>
               <div className="form-group">
-                <label>{t('infrastructure.engine.browserArgs')}</label>
+                <label htmlFor="infra-9">{t('infrastructure.engine.browserArgs')}</label>
                 <input
+                  id="infra-9"
                   type="text"
                   value={configForm.engineConfig.browserArgs}
                   onChange={e => configForm.updateEngineConfig('browserArgs', e.target.value)}
@@ -463,7 +483,7 @@ export function Infrastructure() {
                 : t('infrastructure.statusLabels.disabled')}
             </span>
           </div>
-          {envPinNote(redisPinnedByEnv)}
+          {settingNote('REDIS_ENABLED', infraStatus.redis.enabled, savedConfig?.redis.enabled)}
 
           <div
             className="toggle-row"
@@ -474,12 +494,13 @@ export function Infrastructure() {
             }}
           >
             <div className="toggle-info">
-              <span>{t('infrastructure.redis.enable')}</span>
+              <span id="toggle-redis-enable">{t('infrastructure.redis.enable')}</span>
               <small>{t('infrastructure.redis.enableDesc')}</small>
             </div>
             <label className="toggle-switch">
               <input
                 type="checkbox"
+                aria-labelledby="toggle-redis-enable"
                 checked={configForm.redisEnabled}
                 onChange={e => configForm.setRedisEnabled(e.target.checked)}
               />
@@ -491,12 +512,13 @@ export function Infrastructure() {
             <>
               <div className="toggle-row toggle-row-spaced-bottom">
                 <div className="toggle-info">
-                  <span>{t('infrastructure.redis.useBuiltIn')}</span>
+                  <span id="toggle-redis-builtin">{t('infrastructure.redis.useBuiltIn')}</span>
                   <small>{t('infrastructure.redis.builtInDesc')}</small>
                 </div>
                 <label className="toggle-switch">
                   <input
                     type="checkbox"
+                    aria-labelledby="toggle-redis-builtin"
                     checked={configForm.redisConfig.builtIn}
                     onChange={e => configForm.updateRedisConfig('builtIn', e.target.checked)}
                   />
@@ -508,24 +530,27 @@ export function Infrastructure() {
                 <div className="config-form">
                   <div className="form-row">
                     <div className="form-group">
-                      <label>{t('common.host')}</label>
+                      <label htmlFor="infra-10">{t('common.host')}</label>
                       <input
+                        id="infra-10"
                         type="text"
                         value={configForm.redisConfig.host}
                         onChange={e => configForm.updateRedisConfig('host', e.target.value)}
                       />
                     </div>
                     <div className="form-group small">
-                      <label>{t('common.port')}</label>
+                      <label htmlFor="infra-11">{t('common.port')}</label>
                       <input
+                        id="infra-11"
                         type="text"
                         value={configForm.redisConfig.port}
                         onChange={e => configForm.updateRedisConfig('port', e.target.value)}
                       />
                     </div>
                     <div className="form-group">
-                      <label>{t('common.password')}</label>
+                      <label htmlFor="infra-12">{t('common.password')}</label>
                       <input
+                        id="infra-12"
                         type="password"
                         value={configForm.redisConfig.password}
                         onChange={e => configForm.updateRedisConfig('password', e.target.value)}
@@ -538,12 +563,13 @@ export function Infrastructure() {
 
               <div className="toggle-row queue-toggle-row">
                 <div className="toggle-info">
-                  <span>{t('infrastructure.redis.queueTitle')}</span>
+                  <span id="toggle-queue-enable">{t('infrastructure.redis.queueTitle')}</span>
                   <small>{t('infrastructure.redis.queueDesc')}</small>
                 </div>
                 <label className="toggle-switch">
                   <input
                     type="checkbox"
+                    aria-labelledby="toggle-queue-enable"
                     checked={configForm.queueEnabled}
                     onChange={e => configForm.setQueueEnabled(e.target.checked)}
                   />
@@ -634,7 +660,7 @@ export function Infrastructure() {
               );
             })()}
           </div>
-          {envPinNote(storagePinnedByEnv)}
+          {settingNote('STORAGE_TYPE', infraStatus.storage.type, savedConfig?.storage.type)}
 
           <div className="radio-group">
             <label className={`radio-option ${configForm.storageConfig.type === 'local' ? 'selected' : ''}`}>
@@ -664,8 +690,9 @@ export function Infrastructure() {
           <div className="config-form">
             {configForm.storageConfig.type === 'local' && (
               <div className="form-group">
-                <label>{t('infrastructure.storage.storagePath')}</label>
+                <label htmlFor="infra-13">{t('infrastructure.storage.storagePath')}</label>
                 <input
+                  id="infra-13"
                   type="text"
                   value={configForm.storageConfig.localPath}
                   onChange={e => configForm.updateStorageConfig('localPath', e.target.value)}
@@ -677,12 +704,13 @@ export function Infrastructure() {
               <>
                 <div className="toggle-row toggle-row-spaced">
                   <div className="toggle-info">
-                    <span>{t('infrastructure.storage.useBuiltIn')}</span>
+                    <span id="toggle-storage-builtin">{t('infrastructure.storage.useBuiltIn')}</span>
                     <small>{t('infrastructure.storage.builtInDesc')}</small>
                   </div>
                   <label className="toggle-switch">
                     <input
                       type="checkbox"
+                      aria-labelledby="toggle-storage-builtin"
                       checked={configForm.storageConfig.builtIn}
                       onChange={e => configForm.updateStorageConfig('builtIn', e.target.checked)}
                     />
@@ -694,16 +722,18 @@ export function Infrastructure() {
                   <>
                     <div className="form-row">
                       <div className="form-group">
-                        <label>{t('infrastructure.storage.bucket')}</label>
+                        <label htmlFor="infra-14">{t('infrastructure.storage.bucket')}</label>
                         <input
+                          id="infra-14"
                           type="text"
                           value={configForm.storageConfig.s3Bucket}
                           onChange={e => configForm.updateStorageConfig('s3Bucket', e.target.value)}
                         />
                       </div>
                       <div className="form-group">
-                        <label>{t('infrastructure.storage.region')}</label>
+                        <label htmlFor="infra-15">{t('infrastructure.storage.region')}</label>
                         <input
+                          id="infra-15"
                           type="text"
                           value={configForm.storageConfig.s3Region}
                           onChange={e => configForm.updateStorageConfig('s3Region', e.target.value)}
@@ -712,16 +742,18 @@ export function Infrastructure() {
                     </div>
                     <div className="form-row">
                       <div className="form-group">
-                        <label>{t('infrastructure.storage.accessKey')}</label>
+                        <label htmlFor="infra-16">{t('infrastructure.storage.accessKey')}</label>
                         <input
+                          id="infra-16"
                           type="text"
                           value={configForm.storageConfig.s3AccessKey}
                           onChange={e => configForm.updateStorageConfig('s3AccessKey', e.target.value)}
                         />
                       </div>
                       <div className="form-group">
-                        <label>{t('infrastructure.storage.secretKey')}</label>
+                        <label htmlFor="infra-17">{t('infrastructure.storage.secretKey')}</label>
                         <input
+                          id="infra-17"
                           type="password"
                           value={configForm.storageConfig.s3SecretKey}
                           onChange={e => configForm.updateStorageConfig('s3SecretKey', e.target.value)}
@@ -729,8 +761,9 @@ export function Infrastructure() {
                       </div>
                     </div>
                     <div className="form-group">
-                      <label>{t('infrastructure.storage.endpoint')}</label>
+                      <label htmlFor="infra-18">{t('infrastructure.storage.endpoint')}</label>
                       <input
+                        id="infra-18"
                         type="text"
                         value={configForm.storageConfig.s3Endpoint}
                         onChange={e => configForm.updateStorageConfig('s3Endpoint', e.target.value)}

@@ -5,7 +5,9 @@ jest.mock('archiver', () => ({ default: jest.fn() }));
 
 // saveConfig writes the generated env via fs.writeFileSync and reads the existing file
 // via fs.existsSync/readFileSync; mock those so tests assert produced content without
-// touching the filesystem. existsSync defaults to false (no prior config).
+// touching the filesystem. existsSync defaults to false (no prior config) — except for
+// .node probes, which better-sqlite3's binding loader uses to locate its prebuilt binary;
+// a blanket false would send it after a node-gyp build that isn't there.
 jest.mock('fs', () => {
   const actual = jest.requireActual<typeof import('fs')>('fs');
   return {
@@ -14,15 +16,17 @@ jest.mock('fs', () => {
     // saveConfig now writes the generated env via writeSecretFile, which chmods 0600 — mock it
     // so the secret-hygiene path never touches the real filesystem.
     chmodSync: jest.fn(),
-    existsSync: jest.fn().mockReturnValue(false),
+    existsSync: jest.fn((p: unknown) => (typeof p === 'string' && p.endsWith('.node') ? actual.existsSync(p) : false)),
     readFileSync: jest.fn().mockReturnValue(''),
     createReadStream: jest.fn(() => jest.requireActual<typeof import('stream')>('stream').Readable.from([])),
   };
 });
 
-import { DataSource, QueryFailedError } from 'typeorm';
+import { DataSource, IsNull, QueryFailedError } from 'typeorm';
 import { ConflictException } from '@nestjs/common';
 import { InfraDataController } from './infra-data.controller';
+import { InfraDataService, restoreSessionOwnership } from './infra-data.service';
+import { EXPORT_TABLES } from './export-tables';
 import { Session, SessionStatus } from '../session/entities/session.entity';
 import { Webhook } from '../webhook/entities/webhook.entity';
 import { Message, MessageDirection, MessageStatus } from '../message/entities/message.entity';
@@ -30,13 +34,17 @@ import { MessageBatch, BatchStatus } from '../message/entities/message-batch.ent
 import { Template } from '../template/entities/template.entity';
 import { BaileysStoredMessage } from '../../engine/adapters/baileys-stored-message.entity';
 import { LidMapping } from '../../engine/identity/lid-mapping.entity';
+import { ChatState } from '../../engine/adapters/baileys-chat-state.entity';
 import { PluginInstance } from '../integration/entities/plugin-instance.entity';
 import { ConversationMapping } from '../integration/entities/conversation-mapping.entity';
 import { IngressEvent } from '../integration/entities/ingress-event.entity';
 import { WebhookDeliveryFailure } from '../webhook/entities/webhook-delivery-failure.entity';
+import { WebhookOutboxEvent } from '../webhook/entities/webhook-outbox-event.entity';
 import { IntegrationDeliveryFailure } from '../integration/entities/integration-delivery-failure.entity';
 import { StatusUpdate } from '../status-store/entities/status-update.entity';
+import { AutomationRule } from '../automation/entities/automation-rule.entity';
 import { AuditAction } from '../audit/entities/audit-log.entity';
+import { BadRequestException } from '@nestjs/common';
 
 describe('InfraDataController.importData round-trips export-data (no silent message/batch loss)', () => {
   let ds: DataSource;
@@ -44,7 +52,13 @@ describe('InfraDataController.importData round-trips export-data (no silent mess
   // exportData only reads dataDatabase.type off the config; everything else is unused here.
   const cfg = { get: (key: string, def?: unknown) => (key === 'dataDatabase.type' ? 'sqlite' : def) };
 
-  const newController = () => new InfraDataController(cfg as never, ds);
+  // The full data-connection entity set: exportData validates its table registry against the
+  // DataSource's entity metadata before reading anything, so a partial entity list would fail the
+  // export as registry drift rather than exercise the round-trip.
+  const newController = (ownership?: unknown) =>
+    new InfraDataController(
+      new InfraDataService(cfg as never, ds, undefined, undefined, undefined, ownership as never),
+    );
 
   beforeEach(async () => {
     ds = new DataSource({
@@ -55,11 +69,18 @@ describe('InfraDataController.importData round-trips export-data (no silent mess
         Webhook,
         Message,
         MessageBatch,
+        Template,
+        BaileysStoredMessage,
+        LidMapping,
+        ChatState,
         PluginInstance,
         ConversationMapping,
         IngressEvent,
         WebhookDeliveryFailure,
+        WebhookOutboxEvent,
         IntegrationDeliveryFailure,
+        StatusUpdate,
+        AutomationRule,
       ],
       synchronize: true,
     });
@@ -86,6 +107,367 @@ describe('InfraDataController.importData round-trips export-data (no silent mess
         lastActiveAt: null,
       }),
     );
+
+  it('keeps the session ownership lease across a replace, and never takes it from the payload', async () => {
+    await seedSession('s1');
+    // Seeded far in the past ON PURPOSE, so the claim is unambiguously LAPSED whatever day the suite
+    // runs: a lapsed claim must survive verbatim, because shifting it would resurrect a dead node's
+    // hold on the session. (The previous fixture used a same-day stamp, so whether this exercised the
+    // lapsed or the live path depended on the wall clock.) The live path is covered below.
+    const claimedAt = new Date('2020-01-01T10:00:00.000Z');
+    const leaseExpiresAt = new Date('2020-01-01T10:05:00.000Z');
+    // A live claim held by THIS node, exactly as SessionOwnershipService would have written it.
+    await ds
+      .getRepository(Session)
+      .update({ id: 's1' }, { nodeId: 'node-a', claimedAt, leaseExpiresAt, nodeUrl: 'http://10.0.0.5:2785' });
+
+    // export-data does SELECT *, so the dump genuinely carries the ownership columns. Rewriting them
+    // to a FOREIGN node proves the restore ignores the payload: taking them from the backup would
+    // install another host's claim with a still-future lease and 409 every start until it lapsed.
+    const dump = await controller.exportData();
+    for (const row of dump.tables.sessions as unknown as Record<string, unknown>[]) {
+      row.nodeId = 'node-from-another-host';
+      row.nodeUrl = 'http://198.51.100.9:2785';
+      row.leaseExpiresAt = new Date('2099-01-01T00:00:00.000Z').toISOString();
+    }
+
+    const res = await controller.importData({ tables: dump.tables });
+    expect(res.warnings).toEqual([]);
+    expect(res.imported).toBe(true);
+
+    const restored = await ds.getRepository(Session).findOneByOrFail({ id: 's1' });
+    expect(restored.nodeId).toBe('node-a');
+    expect(restored.nodeUrl).toBe('http://10.0.0.5:2785');
+    expect(new Date(restored.claimedAt as unknown as string).toISOString()).toBe(claimedAt.toISOString());
+    expect(new Date(restored.leaseExpiresAt as unknown as string).toISOString()).toBe(leaseExpiresAt.toISOString());
+  });
+
+  it('carries LIVE claims forward by their remaining time, including a peer node’s', async () => {
+    await seedSession('s1');
+    await seedSession('s2');
+    const dump = await controller.exportData();
+
+    // Seeded AFTER the export on purpose: the sessions importer writes 12 columns and none of them is
+    // ownership, so the dump cannot carry these values — and stamping them here keeps the assertion
+    // margin free of the export's cost. That margin is consumed by the import preamble and the
+    // commit, NOT by the stall below: a late timer moves the committed lease and `Date.now()` by the
+    // same amount, so lengthening the sleep buys nothing.
+    const readAt = Date.now();
+    // Scaled down from the real 60s TTL so the test costs a second, not a minute — the transaction
+    // outliving the remaining time is the property under test, not the size of either number.
+    const remainingMs = 1_000;
+    await ds.getRepository(Session).update(
+      { id: 's1' },
+      {
+        nodeId: 'node-a',
+        claimedAt: new Date(readAt),
+        leaseExpiresAt: new Date(readAt + remainingMs),
+        nodeUrl: 'http://10.0.0.5:2785',
+      },
+    );
+    // A claim this node does NOT own. The import reads every row with a nodeId, so without the carry
+    // it commits a live peer's lease as expired — and `lapsedHeldByOthers` excludes only `nodeId =
+    // me`, so the importing node's own takeover sweep is what would then adopt a session whose engine
+    // never stopped on the peer.
+    await ds.getRepository(Session).update(
+      { id: 's2' },
+      {
+        nodeId: 'node-b',
+        claimedAt: new Date(readAt),
+        leaseExpiresAt: new Date(readAt + remainingMs * 2),
+        nodeUrl: 'http://10.0.0.9:2785',
+      },
+    );
+
+    // Hold the transaction open past the original expiry, the way a large restore does. Re-binding
+    // the stamp verbatim would then commit a lease this request already knows has expired: nodeId
+    // still names the live owner, so the row reads as an adoptable orphan to a peer's takeover sweep
+    // — a lapse manufactured by the restore, on a claim it observed live moments earlier.
+    const realCreate = ds.createQueryRunner.bind(ds);
+    let stalled = false;
+    jest.spyOn(ds, 'createQueryRunner').mockImplementation(() => {
+      const runner = realCreate();
+      const realQuery = runner.query.bind(runner) as (...args: unknown[]) => Promise<unknown>;
+      runner.query = (async (...args: unknown[]): Promise<unknown> => {
+        if (!stalled && typeof args[0] === 'string' && args[0].startsWith('DELETE FROM sessions')) {
+          stalled = true;
+          // Wait until the original lease has genuinely expired, polling the clock instead of
+          // sleeping a fixed multiple of the TTL: the property under test is "the transaction
+          // outlived the remaining time", so wait for exactly that — no shorter (the lease would
+          // still be live) and no longer (extra sleep only eats the assertion margin below).
+          const expiredAt = readAt + remainingMs;
+          while (Date.now() < expiredAt) {
+            await new Promise(resolve => setTimeout(resolve, 25));
+          }
+        }
+        return realQuery(...args);
+      }) as typeof runner.query;
+      return runner;
+    });
+
+    const res = await controller.importData({ tables: dump.tables });
+    jest.restoreAllMocks();
+    expect(res.imported).toBe(true);
+
+    const own = await ds.getRepository(Session).findOneByOrFail({ id: 's1' });
+    const peer = await ds.getRepository(Session).findOneByOrFail({ id: 's2' });
+    const ownLease = new Date(own.leaseExpiresAt as unknown as string).getTime();
+    const peerLease = new Date(peer.leaseExpiresAt as unknown as string).getTime();
+
+    expect(own.nodeId).toBe('node-a');
+    expect(peer.nodeId).toBe('node-b');
+    // Both still in the future: they were live when read, so they must be live when written back.
+    expect(ownLease).toBeGreaterThan(Date.now());
+    expect(peerLease).toBeGreaterThan(Date.now());
+    // Carried, not renewed: each keeps its OWN remaining time rather than being reset to a full TTL,
+    // so the restore extends nobody's hold and the two do not collapse onto the same deadline.
+    expect(ownLease).toBeLessThanOrEqual(Date.now() + remainingMs);
+    expect(peerLease).toBeGreaterThan(ownLease);
+  });
+
+  it('holds the ownership loss-detection token for the whole transaction, and releases it', async () => {
+    await seedSession('s1');
+    const dump = await controller.exportData();
+
+    const events: string[] = [];
+    let held = 0;
+    const ownership = {
+      suspendLossDetection: () => {
+        held++;
+        events.push('suspend');
+        return () => {
+          held--;
+          events.push('release');
+        };
+      },
+      claimableWhere: () => [],
+      heldByOtherNodes: () => Promise.resolve([]),
+    };
+    // Observe from inside the transaction: the token must already be held by the time rows move.
+    const realCreate = ds.createQueryRunner.bind(ds);
+    jest.spyOn(ds, 'createQueryRunner').mockImplementation((...args: Parameters<typeof realCreate>) => {
+      const runner = realCreate(...args);
+      const realQuery = runner.query.bind(runner);
+      runner.query = ((...callArgs: Parameters<typeof realQuery>) => {
+        if (/DELETE FROM sessions/.test(callArgs[0])) events.push(`delete(held=${held})`);
+        return realQuery(...callArgs);
+      }) as typeof runner.query;
+      return runner;
+    });
+
+    const withOwnership = newController(ownership);
+    const res = await withOwnership.importData({ tables: dump.tables });
+    jest.restoreAllMocks();
+
+    expect(res.imported).toBe(true);
+    expect(events).toEqual(['suspend', 'delete(held=1)', 'release']);
+    expect(held).toBe(0);
+  });
+
+  it('refuses outright when another transaction already holds the connection, before deleting anything', async () => {
+    await seedSession('s1');
+    const dump = await controller.exportData();
+
+    // better-sqlite3 hands out a SINGLETON runner, so an import started while a session create or
+    // delete holds a transaction becomes a SAVEPOINT inside it: its commit issues RELEASE SAVEPOINT,
+    // not COMMIT. The result is genuinely indeterminate — the enclosing transaction may commit (the
+    // replace lands) or roll back (it vanishes) — so detecting it afterwards cannot produce a
+    // truthful answer, and by then every row is already deleted. Refuse before touching anything.
+    const outer = ds.createQueryRunner();
+    await outer.connect();
+    await outer.startTransaction();
+
+    const refusal = await controller.importData({ tables: dump.tables }).catch((e: unknown) => e);
+    expect((refusal as ConflictException).getStatus()).toBe(409);
+    // The dashboard decides whether to offer the destructive stop-orphans retry by matching this
+    // code positively, so which code this refusal carries is a cross-tier contract, not a detail.
+    expect((refusal as ConflictException).getResponse()).toMatchObject({ code: 'IMPORT_NESTED_TRANSACTION' });
+    // Asserted alongside the code because `message` is the field the dashboard renders when it
+    // withholds the retry — dropping it degrades the operator's toast to a bare "HTTP 409".
+    expect((refusal as ConflictException).message).toContain('Another database transaction');
+
+    // The decisive assertion: nothing was destroyed on the way to the refusal.
+    const survived = await ds.getRepository(Session).findOneBy({ id: 's1' });
+    expect(survived).not.toBeNull();
+
+    await outer.rollbackTransaction();
+    await outer.release();
+  });
+
+  it('runs normally once no other transaction holds the connection', async () => {
+    await seedSession('s1');
+    const dump = await controller.exportData();
+
+    const outer = ds.createQueryRunner();
+    await outer.connect();
+    await outer.startTransaction();
+    await outer.rollbackTransaction();
+    await outer.release();
+
+    await expect(controller.importData({ tables: dump.tables })).resolves.toMatchObject({ imported: true });
+  });
+
+  it('refuses a second concurrent import instead of letting two share one transaction', async () => {
+    await seedSession('s1');
+    const dump = await controller.exportData();
+
+    // Why this matters on the default dialect: BetterSqlite3Driver.createQueryRunner() returns a
+    // SINGLETON runner, so two overlapping imports share one transaction. The second startTransaction
+    // nests as SAVEPOINT, its commit issues RELEASE SAVEPOINT rather than COMMIT, and a rollback at
+    // depth 1 issues a full ROLLBACK — discarding a restore the other call already reported as
+    // imported:true.
+    //
+    // No gating needed to make this deterministic: the first call runs synchronously up to its first
+    // await, so the guard must be set before any await for the second call to see it. That ordering
+    // is the property under test as much as the 409 is.
+    const first = controller.importData({ tables: dump.tables });
+    const second = controller.importData({ tables: dump.tables });
+
+    const refusal = await second.catch((e: unknown) => e);
+    expect((refusal as ConflictException).getStatus()).toBe(409);
+    expect((refusal as ConflictException).getResponse()).toMatchObject({ code: 'IMPORT_ALREADY_RUNNING' });
+    expect((refusal as ConflictException).message).toContain('already running');
+    await expect(first).resolves.toMatchObject({ imported: true });
+  });
+
+  it('accepts an import again once the previous one has finished', async () => {
+    await seedSession('s1');
+    const dump = await controller.exportData();
+
+    await expect(controller.importData({ tables: dump.tables })).resolves.toMatchObject({ imported: true });
+    await expect(controller.importData({ tables: dump.tables })).resolves.toMatchObject({ imported: true });
+  });
+
+  it('releases the loss-detection token even when the transaction never opens', async () => {
+    await seedSession('s1');
+    const dump = await controller.exportData();
+
+    let held = 0;
+    const ownership = {
+      suspendLossDetection: () => {
+        held++;
+        return () => {
+          held--;
+        };
+      },
+      heldByOtherNodes: () => Promise.resolve([]),
+      claimableWhere: () => [],
+    };
+    // Stubbed rather than provoked: TypeORM nests a second startTransaction as SAVEPOINT, so no
+    // dialect here rejects it today. What is pinned is the STRUCTURE — the pre-body span sits
+    // outside the release, so any future throw there would strand the token, and a stranded token
+    // disables loss detection for the lifetime of the process, silently.
+    const realCreate = ds.createQueryRunner.bind(ds);
+    jest.spyOn(ds, 'createQueryRunner').mockImplementation((...args: Parameters<typeof realCreate>) => {
+      const runner = realCreate(...args);
+      runner.startTransaction = () => Promise.reject(new Error('cannot start a transaction within a transaction'));
+      return runner;
+    });
+
+    const withOwnership = newController(ownership);
+    await expect(withOwnership.importData({ tables: dump.tables })).rejects.toThrow('within a transaction');
+    jest.restoreAllMocks();
+
+    expect(held).toBe(0);
+  });
+
+  it('releases the loss-detection token even when the query runner cannot be created', async () => {
+    await seedSession('s1');
+    const dump = await controller.exportData();
+
+    let held = 0;
+    const ownership = {
+      suspendLossDetection: () => {
+        held++;
+        return () => {
+          held--;
+        };
+      },
+      heldByOtherNodes: () => Promise.resolve([]),
+      claimableWhere: () => [],
+    };
+    jest.spyOn(ds, 'createQueryRunner').mockImplementation(() => {
+      throw new Error('no connection available');
+    });
+
+    const withOwnership = newController(ownership);
+    await expect(withOwnership.importData({ tables: dump.tables })).rejects.toThrow('no connection available');
+    jest.restoreAllMocks();
+
+    expect(held).toBe(0);
+  });
+
+  it('does not suspend loss detection on a dialect where each query runner has its own connection', async () => {
+    await seedSession('s1');
+    const dump = await controller.exportData();
+
+    let suspends = 0;
+    const ownership = {
+      suspendLossDetection: () => {
+        suspends++;
+        return () => {};
+      },
+      heldByOtherNodes: () => Promise.resolve([]),
+      claimableWhere: () => [],
+    };
+    // Postgres hands every runner a dedicated pooled client, so the heartbeat cannot see the
+    // import's uncommitted DELETE. Suspending there would disable genuine loss detection in exactly
+    // the multi-node deployment that depends on it.
+    // Only the pre-transaction suspend decision is under test. Flipping the type also switches off
+    // the SQLite `$N`→`?` rewrite, so the import itself is expected to fail — that failure is not
+    // what this asserts, and the .catch() below is deliberate rather than defensive.
+    const realOptions = ds.options;
+    Object.defineProperty(ds, 'options', { value: { ...realOptions, type: 'postgres' }, configurable: true });
+
+    const withOwnership = newController(ownership);
+    await withOwnership.importData({ tables: dump.tables }).catch(() => undefined);
+    Object.defineProperty(ds, 'options', { value: realOptions, configurable: true });
+
+    expect(suspends).toBe(0);
+  });
+
+  it('rolls the whole import back when ownership cannot be re-applied, instead of reporting success', async () => {
+    await seedSession('s1');
+    await ds.getRepository(Session).update({ id: 's1' }, { nodeId: 'node-a', nodeUrl: 'http://10.0.0.5:2785' });
+    const dump = await controller.exportData();
+
+    // Fail only the ownership UPDATE, leaving every other statement alone. On PostgreSQL a failed
+    // statement aborts the transaction, so a caller that degraded this to a notice and committed
+    // anyway would have the COMMIT execute as a ROLLBACK and still answer imported:true.
+    const realCreate = ds.createQueryRunner.bind(ds);
+    jest.spyOn(ds, 'createQueryRunner').mockImplementation((...args: Parameters<typeof realCreate>) => {
+      const runner = realCreate(...args);
+      const realQuery = runner.query.bind(runner);
+      // Pass EVERY argument through: TypeORM's query builder calls query(sql, params,
+      // useStructuredResult) and silently misreads a raw array when the third is dropped.
+      runner.query = ((...callArgs: Parameters<typeof realQuery>) =>
+        /UPDATE sessions SET "nodeId"/.test(callArgs[0])
+          ? Promise.reject(new Error('ownership write failed'))
+          : realQuery(...callArgs)) as typeof runner.query;
+      return runner;
+    });
+
+    const res = await controller.importData({ tables: dump.tables });
+    jest.restoreAllMocks();
+
+    expect(res.imported).toBe(false);
+    expect(res.warnings.join(' ')).toContain('session ownership');
+    // The rollback must have restored the pre-import row, ownership and all.
+    const stored = await ds.getRepository(Session).findOneByOrFail({ id: 's1' });
+    expect(stored.nodeId).toBe('node-a');
+  });
+
+  it('leaves a session that had no claim unclaimed rather than inventing one', async () => {
+    await seedSession('s1');
+
+    const dump = await controller.exportData();
+    const res = await controller.importData({ tables: dump.tables });
+    expect(res.imported).toBe(true);
+
+    const restored = await ds.getRepository(Session).findOneByOrFail({ id: 's1' });
+    expect(restored.nodeId).toBeNull();
+    expect(restored.leaseExpiresAt).toBeNull();
+  });
 
   it('restores messages and message_batches faithfully — not silently to zero', async () => {
     await seedSession('s1');
@@ -149,6 +531,318 @@ describe('InfraDataController.importData round-trips export-data (no silent mess
     expect(b.status).toBe(BatchStatus.COMPLETED);
   });
 
+  // The export is unbounded while the import rides the 25mb body limit, so inline base64 can produce
+  // a backup this gateway cannot restore. What bounds it is an aggregate budget, not a blanket strip:
+  // a small photo costs nothing and is the ONLY copy when the chat-media archive is off (the default),
+  // so dropping it would trade a 413 for silent data loss.
+  const withBudget = async (bytes: number, run: () => Promise<void>): Promise<void> => {
+    const prev = process.env.EXPORT_INLINE_MEDIA_BUDGET_BYTES;
+    process.env.EXPORT_INLINE_MEDIA_BUDGET_BYTES = String(bytes);
+    try {
+      await run();
+    } finally {
+      if (prev === undefined) delete process.env.EXPORT_INLINE_MEDIA_BUDGET_BYTES;
+      else process.env.EXPORT_INLINE_MEDIA_BUDGET_BYTES = prev;
+    }
+  };
+
+  const exportedMeta = (
+    dump: Awaited<ReturnType<typeof controller.exportData>>,
+    id: string,
+  ): Record<string, unknown> => {
+    const row = dump.tables.messages.find(r => r.id === id);
+    return (typeof row?.metadata === 'string' ? JSON.parse(row.metadata) : row?.metadata) as Record<string, unknown>;
+  };
+
+  it('keeps inline media that fits the export budget — it is the only copy when the archive is off', async () => {
+    const base64 = Buffer.from('a small photo, three orders of magnitude under any limit').toString('base64');
+    await seedSession('s1');
+    await ds.getRepository(Message).save(
+      ds.getRepository(Message).create({
+        id: 'm-small',
+        sessionId: 's1',
+        waMessageId: 'WA-SMALL',
+        chatId: 'c1@s.whatsapp.net',
+        from: 'a@s.whatsapp.net',
+        to: 'b@s.whatsapp.net',
+        body: null as never,
+        type: 'image',
+        direction: MessageDirection.INCOMING,
+        timestamp: 1700000000,
+        metadata: { media: { mimetype: 'image/jpeg', data: base64 }, ack: 2 },
+        status: MessageStatus.DELIVERED,
+      }),
+    );
+
+    await withBudget(1_000_000, async () => {
+      const meta = exportedMeta(await controller.exportData(), 'm-small');
+      expect(meta.media).toEqual({ mimetype: 'image/jpeg', data: base64 });
+    });
+  });
+
+  it('never strips a URL-referenced payload — `data` holds either base64 OR a URL', async () => {
+    // message.service.ts persists `data: base64 || dto.url!`, and the URL form is the only one the
+    // Swagger examples offer. A URL is a pointer, not bytes: stripping it destroys the reference and
+    // reports a sizeBytes that is Buffer.byteLength of URL text read as base64 — the size of nothing.
+    const url = 'https://cdn.example.com/promo.png';
+    await seedSession('s1');
+    await ds.getRepository(Message).save(
+      ds.getRepository(Message).create({
+        id: 'm-url',
+        sessionId: 's1',
+        waMessageId: 'WA-URL',
+        chatId: 'c1@s.whatsapp.net',
+        from: 'a@s.whatsapp.net',
+        to: 'b@s.whatsapp.net',
+        body: null as never,
+        type: 'image',
+        direction: MessageDirection.OUTGOING,
+        timestamp: 1700000000,
+        metadata: { media: { mimetype: 'image/png', filename: 'promo.png', data: url } },
+        status: MessageStatus.SENT,
+      }),
+    );
+
+    // Budget of zero: everything strippable WOULD be stripped, so surviving proves the URL guard.
+    await withBudget(0, async () => {
+      const meta = exportedMeta(await controller.exportData(), 'm-url');
+      expect(meta.media).toEqual({ mimetype: 'image/png', filename: 'promo.png', data: url });
+    });
+  });
+
+  it('never strips a URL whose scheme is uppercase — both engines fetch it, so it is a pointer too', async () => {
+    // `@IsUrl()` accepts it and both adapters match the scheme case-insensitively (wwebjs-messaging.ts
+    // `isHttpUrl`, baileys-messaging.ts `resolveMediaBuffer`), so this URL sends successfully and the
+    // row is its only record. Classifying it as bytes destroys that reference for good.
+    const url = 'HTTPS://cdn.example.com/PROMO.png';
+    await seedSession('s1');
+    await ds.getRepository(Message).save(
+      ds.getRepository(Message).create({
+        id: 'm-url-upper',
+        sessionId: 's1',
+        waMessageId: 'WA-URL-UPPER',
+        chatId: 'c1@s.whatsapp.net',
+        from: 'a@s.whatsapp.net',
+        to: 'b@s.whatsapp.net',
+        body: null as never,
+        type: 'image',
+        direction: MessageDirection.OUTGOING,
+        timestamp: 1700000000,
+        metadata: { media: { mimetype: 'image/png', filename: 'promo.png', data: url } },
+        status: MessageStatus.SENT,
+      }),
+    );
+
+    await withBudget(0, async () => {
+      const meta = exportedMeta(await controller.exportData(), 'm-url-upper');
+      expect(meta.media).toEqual({ mimetype: 'image/png', filename: 'promo.png', data: url });
+    });
+  });
+
+  it('spends the export budget on the newest media first', async () => {
+    // `SELECT *` has no ORDER BY, so the rows arrive in rowid order on SQLite — oldest first, the
+    // exact inverse of what a backup wants. Both photos fit alone; only one fits the budget.
+    const olderPhoto = Buffer.from('o'.repeat(600)).toString('base64');
+    const newerPhoto = Buffer.from('n'.repeat(600)).toString('base64');
+    await seedSession('s1');
+    const seedPhoto = async (id: string, timestamp: number, data: string): Promise<void> => {
+      await ds.getRepository(Message).save(
+        ds.getRepository(Message).create({
+          id,
+          sessionId: 's1',
+          waMessageId: `WA-${id}`,
+          chatId: 'c1@s.whatsapp.net',
+          from: 'a@s.whatsapp.net',
+          to: 'b@s.whatsapp.net',
+          body: null as never,
+          type: 'image',
+          direction: MessageDirection.INCOMING,
+          timestamp,
+          metadata: { media: { mimetype: 'image/jpeg', data } },
+          status: MessageStatus.DELIVERED,
+        }),
+      );
+    };
+    // Inserted oldest-first, which is also how SQLite hands them back.
+    await seedPhoto('m-older', 1700000000, olderPhoto);
+    await seedPhoto('m-newer', 1800000000, newerPhoto);
+
+    await withBudget(Buffer.byteLength(newerPhoto, 'utf8'), async () => {
+      const dump = await controller.exportData();
+      expect(exportedMeta(dump, 'm-newer').media).toEqual({ mimetype: 'image/jpeg', data: newerPhoto });
+      expect(exportedMeta(dump, 'm-older').media).toMatchObject({ omitted: true });
+    });
+  });
+
+  it('does not 500 the export when a metadata column holds the JSON text `null`', async () => {
+    // The import accepts a hand-edited archive verbatim (table-importers.ts), so this row is
+    // reachable — and `JSON.parse('null')` returns null, whose `.media` read throws.
+    await seedSession('s1');
+    await ds.query(
+      `INSERT INTO messages (id, "sessionId", "waMessageId", "chatId", "from", "to", body, type, direction, timestamp, metadata, status, "createdAt")
+       VALUES ('m-null', 's1', 'WA-NULL', 'c1@s.whatsapp.net', 'a@x', 'b@x', 'hi', 'text', 'incoming', 1700000000, 'null', 'delivered', '2026-01-01T00:00:00.000Z')`,
+    );
+
+    await withBudget(0, async () => {
+      const dump = await controller.exportData();
+      expect(dump.tables.messages.find(r => r.id === 'm-null')?.metadata).toBe('null');
+    });
+  });
+
+  it('drops inline media past the export budget, leaving the omitted marker and the rest intact', async () => {
+    // The marker shape is the engine's own (capInboundMedia), so a restored row is indistinguishable
+    // from one whose media was skipped on the way in: the schema survives, only the pixels go.
+    const base64 = Buffer.from('not really a jpeg, but bytes all the same').toString('base64');
+    await seedSession('s1');
+    await ds.getRepository(Message).save(
+      ds.getRepository(Message).create({
+        id: 'm-media',
+        sessionId: 's1',
+        waMessageId: 'WA-MEDIA',
+        chatId: 'c1@s.whatsapp.net',
+        from: 'a@s.whatsapp.net',
+        to: 'b@s.whatsapp.net',
+        body: null as never,
+        type: 'image',
+        direction: MessageDirection.INCOMING,
+        timestamp: 1700000000,
+        metadata: { media: { mimetype: 'image/jpeg', filename: 'holiday.jpg', data: base64 }, ack: 2 },
+        status: MessageStatus.DELIVERED,
+      }),
+    );
+
+    let dump!: Awaited<ReturnType<typeof controller.exportData>>;
+    await withBudget(0, async () => {
+      dump = await controller.exportData();
+    });
+    const exported = dump.tables.messages.find(r => r.id === 'm-media');
+    const meta = exportedMeta(dump, 'm-media') as { media: Record<string, unknown>; ack: number };
+
+    expect(meta.media).not.toHaveProperty('data');
+    expect(meta.media).toEqual({
+      mimetype: 'image/jpeg',
+      filename: 'holiday.jpg',
+      omitted: true,
+      sizeBytes: Buffer.byteLength(base64, 'base64'),
+    });
+    // Everything else on the row, and everything else in metadata, is untouched.
+    expect(meta.ack).toBe(2);
+    expect(exported?.type).toBe('image');
+    expect(exported?.waMessageId).toBe('WA-MEDIA');
+
+    // The count is what tells a truncated backup from a complete one: the marker alone is
+    // indistinguishable from media that was never downloaded in the first place.
+    expect(dump.omittedInlineMedia).toEqual({ messages: 1, messageBatches: 0 });
+
+    // And the backup still restores.
+    const res = await controller.importData({ tables: dump.tables });
+    expect(res.imported).toBe(true);
+    const restored = await ds.getRepository(Message).findOneByOrFail({ id: 'm-media' });
+    expect(restored.metadata).toEqual({
+      media: {
+        mimetype: 'image/jpeg',
+        filename: 'holiday.jpg',
+        omitted: true,
+        sizeBytes: Buffer.byteLength(base64, 'base64'),
+      },
+      ack: 2,
+    });
+  });
+
+  it('drops base64 from a bulk batch past the budget but keeps its URL and descriptive fields', async () => {
+    // message_batches carries the whole outbound list, base64 included, for the WHOLE duration of a
+    // run — stripBatchMediaPayloads only fires on the four terminal transitions. So the export has to
+    // bound it too, or the 413 the messages strip was written for simply arrives by another route.
+    await seedSession('s1');
+    await ds.getRepository(MessageBatch).save(
+      ds.getRepository(MessageBatch).create({
+        id: 'b-media',
+        batchId: 'BATCH-MEDIA',
+        sessionId: 's1',
+        status: BatchStatus.PROCESSING,
+        messages: [
+          {
+            chatId: 'c1',
+            type: 'image',
+            content: { image: { base64: 'QUJDREVG', mimetype: 'image/png', caption: 'hi' } },
+          },
+          {
+            chatId: 'c2',
+            type: 'image',
+            content: { image: { url: 'https://cdn.example.com/x.png', mimetype: 'image/png' } },
+          },
+        ] as never,
+        options: null as never,
+        progress: null as never,
+        results: null as never,
+        currentIndex: 0,
+        startedAt: null,
+        completedAt: null,
+      }),
+    );
+
+    await withBudget(0, async () => {
+      const dump = await controller.exportData();
+      const row = dump.tables.messageBatches.find(r => r.id === 'b-media');
+      const msgs = (typeof row?.messages === 'string' ? JSON.parse(row.messages) : row?.messages) as Array<{
+        content: { image: Record<string, unknown> };
+      }>;
+      expect(msgs[0].content.image).not.toHaveProperty('base64');
+      expect(msgs[0].content.image).toMatchObject({ mimetype: 'image/png', caption: 'hi' });
+      expect(msgs[1].content.image).toEqual({ url: 'https://cdn.example.com/x.png', mimetype: 'image/png' });
+      // Attributed to the batches arm, not lumped in with messages — an operator restoring this needs
+      // to know WHICH history came back without its media.
+      expect(dump.omittedInlineMedia).toEqual({ messages: 0, messageBatches: 1 });
+    });
+  });
+
+  it('spends the export budget on the newest bulk batch first', async () => {
+    // Same defect the `messages` pass was fixed for: `SELECT *` has no ORDER BY, so on SQLite the
+    // batches arrive oldest-first and an exhausted budget keeps the stalest run's payloads.
+    const olderPayload = Buffer.from('o'.repeat(600)).toString('base64');
+    const newerPayload = Buffer.from('n'.repeat(600)).toString('base64');
+    await seedSession('s1');
+    const seedBatch = async (id: string, createdAt: string, base64: string): Promise<void> => {
+      await ds.getRepository(MessageBatch).save(
+        ds.getRepository(MessageBatch).create({
+          id,
+          batchId: `BATCH-${id}`,
+          sessionId: 's1',
+          status: BatchStatus.PROCESSING,
+          messages: [{ chatId: 'c1', type: 'image', content: { image: { base64, mimetype: 'image/png' } } }] as never,
+          options: null as never,
+          progress: null as never,
+          results: null as never,
+          currentIndex: 0,
+          startedAt: null,
+          completedAt: null,
+        }),
+      );
+      // `created_at` is a @CreateDateColumn, so it cannot be seeded through the entity.
+      await ds.query(`UPDATE message_batches SET created_at = ? WHERE id = ?`, [createdAt, id]);
+    };
+    // Inserted oldest-first, which is also how SQLite hands them back.
+    await seedBatch('b-older', '2026-01-01T00:00:00.000Z', olderPayload);
+    await seedBatch('b-newer', '2026-06-01T00:00:00.000Z', newerPayload);
+
+    const batchImage = (
+      dump: Awaited<ReturnType<typeof controller.exportData>>,
+      id: string,
+    ): Record<string, unknown> => {
+      const row = dump.tables.messageBatches.find(r => r.id === id);
+      const msgs = (typeof row?.messages === 'string' ? JSON.parse(row.messages) : row?.messages) as Array<{
+        content: { image: Record<string, unknown> };
+      }>;
+      return msgs[0].content.image;
+    };
+
+    await withBudget(Buffer.byteLength(newerPayload, 'utf8'), async () => {
+      const dump = await controller.exportData();
+      expect(batchImage(dump, 'b-newer')).toEqual({ base64: newerPayload, mimetype: 'image/png' });
+      expect(batchImage(dump, 'b-older')).not.toHaveProperty('base64');
+    });
+  });
+
   it('round-trips plugin instances + integration delivery failures (Integration Fabric + DLQ)', async () => {
     await seedSession('s1');
     await ds.getRepository(PluginInstance).save(
@@ -196,6 +890,83 @@ describe('InfraDataController.importData round-trips export-data (no silent mess
     const dlf = await ds.getRepository(IntegrationDeliveryFailure).findOneByOrFail({ deliveryId: 'd1' });
     expect(dlf.lastError).toBe('boom');
     expect(dlf.payload).toEqual({ foo: 'bar' });
+  });
+
+  // conversation_mappings' map() was never invoked by any prior test — a param transcription slip
+  // (e.g. swapping pluginId/instanceId) would leave the whole suite green. Every mapped column gets
+  // a distinct value so a swap of any two adjacent params is guaranteed to flip an assertion.
+  it('round-trips conversation mappings (handover state survives a restore)', async () => {
+    await seedSession('s1');
+    const cmRepo = ds.getRepository(ConversationMapping);
+    await cmRepo.save(
+      cmRepo.create({
+        sessionId: 's1',
+        chatId: '628111@s.whatsapp.net',
+        pluginId: 'chatwoot',
+        instanceId: 'acct1',
+        providerConversationId: 'conv-42',
+        handoverState: 'human',
+        metadata: { agent: 'alice' },
+      }),
+    );
+
+    const dump = await controller.exportData();
+    expect(dump.counts.conversationMappings).toBe(1);
+
+    const res = await controller.importData({ tables: dump.tables });
+
+    expect(res.warnings).toEqual([]);
+    expect(res.imported).toBe(true);
+    expect(res.counts.conversationMappings).toBe(1);
+
+    const restored = await cmRepo.findOneByOrFail({ chatId: '628111@s.whatsapp.net' });
+    expect(restored.sessionId).toBe('s1');
+    expect(restored.chatId).toBe('628111@s.whatsapp.net');
+    expect(restored.pluginId).toBe('chatwoot');
+    expect(restored.instanceId).toBe('acct1');
+    expect(restored.providerConversationId).toBe('conv-42');
+    expect(restored.handoverState).toBe('human');
+    expect(restored.metadata).toEqual({ agent: 'alice' });
+  });
+
+  // webhook_delivery_failures' map() was never invoked by any prior test either — same risk as
+  // conversation_mappings above. Every mapped column gets a distinct value for the same reason.
+  it('round-trips webhook delivery failures (webhook DLQ survives a restore)', async () => {
+    await seedSession('s1');
+    const wdfRepo = ds.getRepository(WebhookDeliveryFailure);
+    await wdfRepo.save(
+      wdfRepo.create({
+        webhookId: 'w1',
+        sessionId: 's1',
+        event: 'message',
+        url: 'https://example.com/hook',
+        idempotencyKey: 'idem-1',
+        deliveryId: 'dlv-7',
+        attempts: 5,
+        lastStatusCode: 502,
+        lastError: 'Bad Gateway',
+      }),
+    );
+
+    const dump = await controller.exportData();
+    expect(dump.counts.webhookDeliveryFailures).toBe(1);
+
+    const res = await controller.importData({ tables: dump.tables });
+
+    expect(res.warnings).toEqual([]);
+    expect(res.imported).toBe(true);
+    expect(res.counts.webhookDeliveryFailures).toBe(1);
+
+    const restored = await wdfRepo.findOneByOrFail({ deliveryId: 'dlv-7' });
+    expect(restored.webhookId).toBe('w1');
+    expect(restored.sessionId).toBe('s1');
+    expect(restored.event).toBe('message');
+    expect(restored.url).toBe('https://example.com/hook');
+    expect(restored.idempotencyKey).toBe('idem-1');
+    expect(restored.deliveryId).toBe('dlv-7');
+    expect(restored.attempts).toBe(5);
+    expect(restored.lastStatusCode).toBe(502);
+    expect(restored.lastError).toBe('Bad Gateway');
   });
 
   it('round-trips the ingress dispatch-lifecycle columns so a restored pending event still replays', async () => {
@@ -252,10 +1023,18 @@ describe('InfraDataController.importData round-trips export-data (no silent mess
     expect(pending.lastDispatchAt).toEqual(new Date('2026-01-02T03:04:05.000Z'));
     expect(pending.payloadHash).toBe('abc123');
     expect(pending.payload).toEqual({ headers: {}, query: {}, body: '{}', rawBody: '{}' });
+    // These columns were never pinned before — the map() param order is the whole point of the
+    // descriptor, and each value here is distinct so a swap of any two adjacent params fails.
+    expect(pending.instanceId).toBe('acct1');
+    expect(pending.pluginId).toBe('chatwoot');
+    expect(pending.providerDeliveryId).toBe('dlv-1');
+    expect(pending.route).toBe('chatwoot/acct1');
+    expect(pending.sessionId).toBe('s1');
 
     const retired = await ingressRepo.findOneByOrFail({ id: 'ie-retired' });
     expect(retired.dispatchState).toBe('dispatched');
     expect(retired.payloadHash).toBe('def456');
+    expect(retired.providerDeliveryId).toBe('dlv-2');
     // A retired payload must stay NULL — re-materializing it as '{}' would make the slimmed dedup
     // row read as a pending event with an empty body.
     expect(retired.payload).toBeNull();
@@ -418,13 +1197,32 @@ describe('InfraDataController.import/export preserves every data-DB table', () =
   let ds: DataSource;
   let controller: InfraDataController;
   const cfg = { get: (key: string, def?: unknown) => (key === 'dataDatabase.type' ? 'sqlite' : def) };
-  const newController = () => new InfraDataController(cfg as never, ds);
+  const newController = () => new InfraDataController(new InfraDataService(cfg as never, ds));
 
   beforeEach(async () => {
     ds = new DataSource({
       type: 'better-sqlite3',
       database: ':memory:',
-      entities: [Session, Webhook, Message, MessageBatch, Template, BaileysStoredMessage, LidMapping],
+      // The full data-connection entity set, matching app.module.ts: exportData validates its table
+      // registry against the DataSource's entity metadata, so a subset would read as registry drift.
+      entities: [
+        Session,
+        Webhook,
+        Message,
+        MessageBatch,
+        Template,
+        BaileysStoredMessage,
+        LidMapping,
+        ChatState,
+        PluginInstance,
+        ConversationMapping,
+        IngressEvent,
+        WebhookDeliveryFailure,
+        WebhookOutboxEvent,
+        IntegrationDeliveryFailure,
+        StatusUpdate,
+        AutomationRule,
+      ],
       synchronize: true,
     });
     await ds.initialize();
@@ -473,6 +1271,38 @@ describe('InfraDataController.import/export preserves every data-DB table', () =
     expect((await lidRepo.findOneByOrFail({ lid: '222' })).phone).toBeNull();
   });
 
+  // Restoring ONTO the instance that produced the archive is the rollback flow, and it is the one the
+  // outbox broke. The table carries no FK to sessions, so the sessions DELETE never reached it, and
+  // UNIQUE(webhookId, idempotencyKey) then collided on every row until the all-or-nothing gate rolled
+  // the entire import back. Every other table's test clears first, which is why nothing caught it;
+  // this one deliberately does not.
+  it('restores webhook_outbox_events onto an instance that already holds them', async () => {
+    await seedSession('s1');
+    const outboxRepo = ds.getRepository(WebhookOutboxEvent);
+    await outboxRepo.save(
+      outboxRepo.create({
+        webhookId: 'wh-1',
+        sessionId: 's1',
+        event: 'message.received',
+        idempotencyKey: 'key-1',
+        deliveryId: 'del-1',
+        payload: { from: '628111@c.us' },
+        state: 'pending',
+        attempts: 0,
+      }),
+    );
+
+    const dump = await controller.exportData();
+    expect((dump.tables as unknown as { webhookOutboxEvents?: unknown[] }).webhookOutboxEvents).toHaveLength(1);
+
+    const res = await controller.importData({ tables: dump.tables });
+
+    expect(res.warnings).toEqual([]);
+    expect(res.imported).toBe(true);
+    expect(await outboxRepo.count()).toBe(1);
+    expect((await outboxRepo.findOneByOrFail({ idempotencyKey: 'key-1' })).state).toBe('pending');
+  });
+
   // The messages import column list must carry every later-added column; `author` (the group
   // sender identity) was the one that drifted — a restored backup silently lost all attribution.
   it('restores the group-sender author column on a backup→restore', async () => {
@@ -502,6 +1332,40 @@ describe('InfraDataController.import/export preserves every data-DB table', () =
     expect(res.warnings).toEqual([]);
     const restored = await msgRepo.findOneByOrFail({ waMessageId: 'WA-A1' });
     expect(restored.author).toBe('628111@c.us');
+  });
+
+  // Same drift, next column along. These two matter more than most: the archived media FILES ride
+  // along in the storage export, so restoring rows without their pointers leaves every file
+  // referenced by nothing — and the chat-media orphan sweep deletes exactly that after its grace
+  // window. The loss would surface hours after a restore that reported success.
+  it('restores the chat-media archive pointers on a backup→restore', async () => {
+    await seedSession('s1');
+    const msgRepo = ds.getRepository(Message);
+    await msgRepo.save(
+      msgRepo.create({
+        sessionId: 's1',
+        waMessageId: 'WA-M1',
+        chatId: '628111@c.us',
+        from: '628111@c.us',
+        to: 'me@c.us',
+        body: '',
+        type: 'image',
+        direction: MessageDirection.INCOMING,
+        status: MessageStatus.DELIVERED,
+        timestamp: 1700000000,
+        mediaPath: 'chat-media/s1/1f0c8f4e-0000-4000-8000-000000000000.png',
+        mediaMimetype: 'image/png',
+      }),
+    );
+
+    const dump = await controller.exportData();
+    await msgRepo.clear();
+    const res = await controller.importData({ tables: dump.tables });
+
+    expect(res.warnings).toEqual([]);
+    const restored = await msgRepo.findOneByOrFail({ waMessageId: 'WA-M1' });
+    expect(restored.mediaPath).toBe('chat-media/s1/1f0c8f4e-0000-4000-8000-000000000000.png');
+    expect(restored.mediaMimetype).toBe('image/png');
   });
 
   // DELETE FROM sessions cascades to templates + baileys_stored_messages (both FK ON DELETE CASCADE),
@@ -561,28 +1425,68 @@ describe('InfraDataController.import/export preserves every data-DB table', () =
     // The active flag (exported as integer 1 from SQLite) must round-trip as a real boolean.
     expect((await ds.getRepository(Webhook).findOneByOrFail({ id: 'w1' })).active).toBe(true);
   });
+
+  it('omits webhook credentials (secret, headers) from the export but keeps the row restorable', async () => {
+    await seedSession('s1');
+    await ds.getRepository(Webhook).save(
+      ds.getRepository(Webhook).create({
+        id: 'w1',
+        sessionId: 's1',
+        url: 'https://example.com/hook',
+        events: ['message'],
+        secret: 'hmac-secret',
+        headers: { Authorization: 'Bearer receiver-token' },
+        active: true,
+        retryCount: 3,
+      }),
+    );
+
+    const dump = await controller.exportData();
+    expect(dump.tables.webhooks).toHaveLength(1);
+    const exported = dump.tables.webhooks[0] as unknown as Record<string, unknown>;
+    expect(exported).not.toHaveProperty('secret');
+    expect(exported).not.toHaveProperty('headers');
+    expect(exported.url).toBe('https://example.com/hook');
+
+    // The redacted archive still restores: the webhook comes back unsigned, with no custom headers.
+    const res = await controller.importData({ tables: dump.tables });
+    expect(res.warnings).toEqual([]);
+    expect(res.imported).toBe(true);
+    const restored = await ds.getRepository(Webhook).findOneByOrFail({ id: 'w1' });
+    expect(restored.secret).toBeNull();
+    expect(restored.headers).toEqual({});
+  });
 });
 
-describe('InfraDataController C002 audit trail — import emits only on a committed restore', () => {
+describe('InfraDataController audit trail — import emits only on a committed restore', () => {
   let ds: DataSource;
   const cfg = { get: (key: string, def?: unknown) => (key === 'dataDatabase.type' ? 'sqlite' : def) };
   const build = (audit: { logInfo: jest.Mock }): InfraDataController =>
-    new InfraDataController(cfg as never, ds, audit as never);
+    new InfraDataController(new InfraDataService(cfg as never, ds, audit as never));
 
   beforeEach(async () => {
     ds = new DataSource({
       type: 'better-sqlite3',
       database: ':memory:',
+      // The full data-connection entity set: exportData validates its table registry against the
+      // DataSource's entity metadata, so a subset would read as registry drift.
       entities: [
         Session,
         Webhook,
         Message,
         MessageBatch,
+        Template,
+        BaileysStoredMessage,
+        LidMapping,
+        ChatState,
         PluginInstance,
         ConversationMapping,
         IngressEvent,
         WebhookDeliveryFailure,
+        WebhookOutboxEvent,
         IntegrationDeliveryFailure,
+        StatusUpdate,
+        AutomationRule,
       ],
       synchronize: true,
     });
@@ -633,7 +1537,15 @@ describe('InfraDataController C002 audit trail — import emits only on a commit
 
 describe('InfraDataController.exportData optional-table strictness', () => {
   const cfg = { get: (key: string, def?: unknown) => (key === 'dataDatabase.type' ? 'sqlite' : def) };
-  const build = (query: jest.Mock) => new InfraDataController(cfg as never, { query } as never);
+  // exportData validates its table registry against the DataSource's entity metadata before reading;
+  // the fake stands in for a fully-migrated connection so the registry check passes and the tests
+  // below pin the QUERY-time strictness instead.
+  const fakeDataSource = (query: jest.Mock): unknown => ({
+    query,
+    entityMetadatas: EXPORT_TABLES.map(entry => ({ tableName: entry.table })),
+  });
+  const build = (query: jest.Mock) =>
+    new InfraDataController(new InfraDataService(cfg as never, fakeDataSource(query) as never));
 
   it('rethrows a non-missing-table error (lock/IO/timeout) instead of reporting a partial export as complete', async () => {
     // A lock on ONE optional table must fail the whole export: silently exporting without that table
@@ -692,11 +1604,13 @@ describe('InfraDataController.importData status_updates + runtime reconciliation
   let ds: DataSource;
   const cfg = { get: (key: string, def?: unknown) => (key === 'dataDatabase.type' ? 'sqlite' : def) };
 
-  // Positional constructor: (config, dataDs, auditService?, sessionService?, lidMappingStore?).
+  // Positional service constructor: (config, dataDs, auditService?, sessionService?, lidMappingStore?).
   // The @Optional args trail the required ones; auditService is unused in these tests, so its slot
   // stays undefined.
   const build = (opts: { sessionService?: unknown; lidMappingStore?: unknown } = {}) =>
-    new InfraDataController(cfg as never, ds, undefined, opts.sessionService as never, opts.lidMappingStore as never);
+    new InfraDataController(
+      new InfraDataService(cfg as never, ds, undefined, opts.sessionService as never, opts.lidMappingStore as never),
+    );
 
   beforeEach(async () => {
     ds = new DataSource({
@@ -710,12 +1624,15 @@ describe('InfraDataController.importData status_updates + runtime reconciliation
         Template,
         BaileysStoredMessage,
         LidMapping,
+        ChatState,
         PluginInstance,
         ConversationMapping,
         IngressEvent,
         WebhookDeliveryFailure,
+        WebhookOutboxEvent,
         IntegrationDeliveryFailure,
         StatusUpdate,
+        AutomationRule,
       ],
       synchronize: true,
     });
@@ -741,6 +1658,78 @@ describe('InfraDataController.importData status_updates + runtime reconciliation
         lastActiveAt: null,
       }),
     );
+
+  // automation_rules FKs sessions ON DELETE CASCADE, so the import's `DELETE FROM sessions` takes
+  // every rule with it — on SQLite too, where better-sqlite3 enforces foreign keys. Without export +
+  // re-insert the documented backup/restore silently destroyed every autoreply rule.
+  it('restores an active session status as disconnected: the backup describes the source host engines', async () => {
+    await seedSession('s1');
+    const repo = ds.getRepository(Session);
+    const dump = await build().exportData();
+    // seedSession writes READY; the export carries it. With no ownership service (single-node
+    // default), every row is claimable, so the import must normalize it.
+    expect(dump.tables.sessions?.[0]?.status).toBe(SessionStatus.READY);
+
+    const res = await build().importData({ tables: dump.tables });
+
+    expect(res.imported).toBe(true);
+    await expect(repo.findOneByOrFail({ id: 's1' })).resolves.toMatchObject({ status: SessionStatus.DISCONNECTED });
+    expect(res.notices?.some(n => n.includes('restored as disconnected'))).toBe(true);
+  });
+
+  it('keeps the backup status of a session held by a PEER (its live engine backs the row)', async () => {
+    await seedSession('held');
+    const repo = ds.getRepository(Session);
+    // A peer's unexpired claim: not claimable by this node, so the normalization must skip it.
+    // The import re-applies the preserved claim after the inserts (restoreSessionOwnership), which
+    // is what keeps the row excluded when the normalization runs.
+    await repo.update({ id: 'held' }, { nodeId: 'node-b', leaseExpiresAt: new Date(Date.now() + 60_000) });
+    const dump = await build().exportData();
+
+    const ownership = {
+      nodeId: 'node-a',
+      heldByOtherNodes: () => Promise.resolve(['held']),
+      suspendLossDetection: () => () => undefined,
+      claimableWhere: () => [{ nodeId: IsNull() }, { nodeId: 'node-a' }],
+    };
+    const res = await new InfraDataController(
+      new InfraDataService(cfg as never, ds, undefined, undefined, undefined, ownership as never),
+    ).importData({ tables: dump.tables });
+
+    expect(res.imported).toBe(true);
+    await expect(repo.findOneByOrFail({ id: 'held' })).resolves.toMatchObject({ status: SessionStatus.READY });
+  });
+
+  it('exports and restores automation_rules, which the session wipe would otherwise cascade away', async () => {
+    await seedSession('s1');
+    const ruleRepo = ds.getRepository(AutomationRule);
+    await ruleRepo.save(
+      ruleRepo.create({
+        id: 'rule-1',
+        sessionId: 's1',
+        name: 'office hours',
+        enabled: true,
+        conditions: { bodyContains: ['hello'] } as never,
+        replyText: 'We are closed',
+        cooldownSeconds: 120,
+      }),
+    );
+
+    const controller = build();
+    const dump = await controller.exportData();
+    expect(dump.counts.automationRules).toBe(1);
+    expect(dump.skippedTables).toEqual([]);
+
+    const res = await controller.importData({ tables: dump.tables });
+
+    expect(res.imported).toBe(true);
+    expect(res.counts.automationRules).toBe(1);
+    const restored = await ruleRepo.findOneByOrFail({ id: 'rule-1' });
+    expect(restored.replyText).toBe('We are closed');
+    expect(restored.cooldownSeconds).toBe(120);
+    expect(restored.enabled).toBe(true);
+    expect(restored.conditions).toEqual({ bodyContains: ['hello'] });
+  });
 
   it('exports and restores status_updates (the table the docs promise is covered)', async () => {
     await seedSession('s1');
@@ -783,6 +1772,14 @@ describe('InfraDataController.importData status_updates + runtime reconciliation
     expect(restored.font).toBe(2);
     expect(restored.postedAt).toBe(1750000000000);
     expect(restored.expiresAt).toBe(1750086400000);
+    // These columns were never pinned before — the map() param order is the whole point of the
+    // descriptor, and each value here is distinct so a swap of any two adjacent params fails.
+    expect(restored.sessionId).toBe('s1');
+    expect(restored.contactJid).toBe('628111@c.us');
+    expect(restored.contactName).toBe('Alice');
+    expect(restored.contactPushName).toBe('alice');
+    expect(restored.type).toBe('text');
+    expect(restored.backgroundColor).toBe('#FF0000');
   });
 
   it('tolerates body_ts on imported message rows (backup made before the strip)', async () => {
@@ -850,6 +1847,11 @@ describe('InfraDataController.importData status_updates + runtime reconciliation
     expect(err).toBeInstanceOf(ConflictException);
     expect((err as ConflictException).getStatus()).toBe(409);
     expect((err as ConflictException).message).toContain('ghost');
+    // This is the ONLY refusal on this route whose documented retry (stopOrphans=true) is a real
+    // decision the operator can act on, and it is the only one the dashboard may offer a destructive
+    // retry for. It carries its own code so that identification is positive: an unrecognised code and
+    // a 409 that never reached this method both fail closed instead of opening the confirm.
+    expect((err as ConflictException).getResponse()).toMatchObject({ code: 'IMPORT_WOULD_ORPHAN_ENGINES' });
     expect(await ds.getRepository(Session).count()).toBe(1); // nothing deleted
 
     // With force: the restore proceeds and the response tells the operator a restart is required
@@ -993,13 +1995,14 @@ describe('InfraDataController.importData status_updates + runtime reconciliation
   });
 });
 
-// C002: the infra module exposed sensitive ADMIN operations (credential config write, restart/Docker
-// orchestration, full-DB + storage export/import) with no audit trail. Each now emits an AuditAction.
-describe('InfraDataController C002 audit trail (light-dependency handlers)', () => {
+// The infra module's sensitive ADMIN operations (credential config write, restart/Docker
+// orchestration, full-DB + storage export/import) must leave an audit trail — each emits an AuditAction.
+describe('InfraDataController audit trail (light-dependency handlers)', () => {
   const makeAudit = (): { logInfo: jest.Mock } => ({ logInfo: jest.fn().mockResolvedValue(null) });
 
-  // Positional constructor: (config, dataDs, auditService?, sessionService?, lidMappingStore?).
-  // auditService is the first trailing @Optional arg.
+  // Positional service constructor: (config, dataDs, auditService?, sessionService?, lidMappingStore?).
+  // auditService is the first trailing @Optional arg. The dataDs override needs entityMetadatas so
+  // exportData's registry check sees a fully-migrated connection.
   const build = (
     audit: { logInfo: jest.Mock },
     overrides: Partial<{
@@ -1007,17 +2010,188 @@ describe('InfraDataController C002 audit trail (light-dependency handlers)', () 
       dataDs: unknown;
     }> = {},
   ): InfraDataController =>
-    new InfraDataController((overrides.config ?? {}) as never, (overrides.dataDs ?? {}) as never, audit as never);
+    new InfraDataController(
+      new InfraDataService((overrides.config ?? {}) as never, (overrides.dataDs ?? {}) as never, audit as never),
+    );
 
   it('exportData emits INFRA_DATA_EXPORTED with per-table counts', async () => {
     const audit = makeAudit();
     const controller = build(audit, {
       config: { get: (k: string, d?: unknown) => (k === 'dataDatabase.type' ? 'sqlite' : d) },
-      dataDs: { query: jest.fn().mockResolvedValue([]) },
+      dataDs: {
+        query: jest.fn().mockResolvedValue([]),
+        entityMetadatas: EXPORT_TABLES.map(entry => ({ tableName: entry.table })),
+      },
     });
     await controller.exportData();
     const calls = audit.logInfo.mock.calls as Array<[AuditAction, { metadata: { counts: { sessions: number } } }]>;
     expect(calls[0][0]).toBe(AuditAction.INFRA_DATA_EXPORTED);
     expect(calls[0][1].metadata.counts.sessions).toBe(0);
+  });
+});
+
+describe('restoreSessionOwnership', () => {
+  const claim = { id: 's1', nodeId: 'node-a', claimedAt: 'c', leaseExpiresAt: 'l', nodeUrl: 'u' };
+
+  it('propagates a failure instead of swallowing it, so the caller can roll the import back', async () => {
+    // Swallowing it would be worse than the bug: on PostgreSQL a failed statement aborts the
+    // transaction, so the COMMIT that followed would execute as a ROLLBACK and the endpoint would
+    // report a fully discarded import as a success.
+    await expect(
+      restoreSessionOwnership([claim], () => Promise.reject(new Error('db went away')), new Date()),
+    ).rejects.toThrow('db went away');
+  });
+
+  it('does nothing when there is no ownership to carry', async () => {
+    const calls: unknown[][] = [];
+    const insert = (_sql: string, params: unknown[]): Promise<unknown> => {
+      calls.push(params);
+      return Promise.resolve();
+    };
+
+    await restoreSessionOwnership(null, insert, new Date());
+    await restoreSessionOwnership([], insert, new Date());
+
+    expect(calls).toEqual([]);
+  });
+
+  it('binds the values it read, never values from the payload', async () => {
+    const bound: unknown[][] = [];
+    const statements: string[] = [];
+    const insert = (sql: string, params: unknown[]): Promise<unknown> => {
+      statements.push(sql);
+      bound.push(params);
+      return Promise.resolve();
+    };
+
+    await restoreSessionOwnership([claim], insert, new Date());
+
+    // 'l' is not a parseable deadline, so it is written back untouched: a value this function cannot
+    // interpret is not one it may rewrite.
+    expect(bound).toEqual([['node-a', 'c', 'l', 'u', 's1']]);
+    expect(statements[0]).toContain('UPDATE sessions SET "nodeId"');
+    expect(statements[0]).toContain('"claimedAt"');
+    expect(statements[0]).toContain('"leaseExpiresAt"');
+    expect(statements[0]).toContain('"nodeUrl"');
+  });
+
+  // The lease is a DEADLINE, and the transaction re-applying it can outlive what the deadline has
+  // left. These three cases pin which way each kind of claim moves.
+  const bindLease = async (leaseExpiresAt: unknown, readAt: Date, now: Date): Promise<unknown> => {
+    const bound: unknown[][] = [];
+    await restoreSessionOwnership(
+      [{ id: 's1', nodeId: 'node-a', claimedAt: 'c', leaseExpiresAt, nodeUrl: 'u' }],
+      (_sql, params) => {
+        bound.push(params);
+        return Promise.resolve();
+      },
+      readAt,
+      now,
+    );
+    return bound[0][2];
+  };
+
+  it('carries a live claim by its remaining time, so a long import cannot expire it', async () => {
+    const readAt = new Date('2026-08-06T10:00:00.000Z');
+    const commitAt = new Date('2026-08-06T10:02:00.000Z'); // a two-minute restore
+    // 30s left when read → 30s left when written, not an expiry two minutes in the past.
+    expect(await bindLease('2026-08-06T10:00:30.000Z', readAt, commitAt)).toBe('2026-08-06T10:02:30.000Z');
+  });
+
+  it('leaves an already-lapsed claim exactly where it was, so a dead node stays dead', async () => {
+    const readAt = new Date('2026-08-06T10:00:00.000Z');
+    const commitAt = new Date('2026-08-06T10:02:00.000Z');
+    // Shifting this one would resurrect a crashed peer's hold on the session.
+    expect(await bindLease('2026-08-06T09:59:00.000Z', readAt, commitAt)).toBe('2026-08-06T09:59:00.000Z');
+  });
+
+  it('refuses to carry text that is not the UTC form the writers emit', async () => {
+    const readAt = new Date('2026-08-06T10:00:00.000Z');
+    const commitAt = new Date('2026-08-06T10:02:00.000Z');
+    // `DateTransformer.to` and `leaseParam` both emit toISOString(), so a space-separated stamp can
+    // only come from somewhere that does not know this contract — e.g. a future migration DEFAULT of
+    // datetime('now'), the shape other columns in this repo already use. new Date() would read it as
+    // LOCAL time, and carrying it would write the host's UTC offset back into the column for good.
+    //
+    // Two days ahead, not seconds: parsed as local time this lands within ±14h of that instant, so it
+    // stays in the FUTURE under every timezone and would therefore be carried if the guard were gone.
+    // A near stamp would fall through to the already-lapsed branch on a positive-offset host and pass
+    // for the wrong reason — which is exactly what it did before this comment existed.
+    expect(await bindLease('2026-08-08 10:00:00', readAt, commitAt)).toBe('2026-08-08 10:00:00');
+  });
+
+  it('never carries a lease to an earlier instant than the one it read', async () => {
+    // A backward clock step between the read and the write-back. Without the clamp the carry would
+    // land before the original deadline — re-creating the expired-on-commit state it exists to avoid.
+    const readAt = new Date('2026-08-06T10:00:00.000Z');
+    const steppedBack = new Date('2026-08-06T09:58:00.000Z');
+    expect(await bindLease('2026-08-06T10:00:30.000Z', readAt, steppedBack)).toBe('2026-08-06T10:00:30.000Z');
+  });
+
+  it('falls back to the original value when the carry would overflow the Date range', async () => {
+    // A throw here would reach the caller's catch, which records a warning — and every claim after
+    // this row in the loop would silently never be re-applied.
+    const readAt = new Date('2026-08-06T10:00:00.000Z');
+    const commitAt = new Date('2026-08-06T10:02:00.000Z');
+    const nearMax = '+275760-09-13T00:00:00.000Z'; // the maximum representable Date
+    await expect(bindLease(nearMax, readAt, commitAt)).resolves.toBe(nearMax);
+  });
+
+  it('preserves the stored shape — Date in, Date out (Postgres); text in, text out (SQLite)', async () => {
+    const readAt = new Date('2026-08-06T10:00:00.000Z');
+    const commitAt = new Date('2026-08-06T10:02:00.000Z');
+    const asDate = await bindLease(new Date('2026-08-06T10:00:30.000Z'), readAt, commitAt);
+    expect(asDate).toBeInstanceOf(Date);
+    expect((asDate as Date).toISOString()).toBe('2026-08-06T10:02:30.000Z');
+    expect(typeof (await bindLease('2026-08-06T10:00:30.000Z', readAt, commitAt))).toBe('string');
+    expect(await bindLease(null, readAt, commitAt)).toBeNull();
+  });
+});
+
+/**
+ * `data.tables.sessions` was dereferenced with `.map()` before anything checked it was an array, so a
+ * hand-edited or truncated archive whose table value is a string (or an array of nulls) produced a
+ * TypeError — a 500 that tells the operator the server broke, when what actually happened is that
+ * their file is malformed. It fires before the transaction opens, so nothing was written; only the
+ * answer was wrong.
+ */
+describe('InfraDataController.importData rejects a malformed table value', () => {
+  const controller = () =>
+    new InfraDataController(new InfraDataService({ get: () => undefined } as never, {} as never));
+
+  it.each([
+    ['a string', 'not-an-array'],
+    ['a number', 7],
+    ['an object', { id: 'x' }],
+  ])('answers 400 when tables.sessions is %s', async (_label, value) => {
+    await expect(controller().importData({ tables: { sessions: value } } as never)).rejects.toThrow(
+      BadRequestException,
+    );
+  });
+
+  // Array.isArray alone let `[null]` through, and the RED comment above claimed this case was
+  // covered when it was not — the row then died on its first property read, the same 500 with a
+  // longer fuse.
+  it.each([
+    ['a null row', [null]],
+    ['a string row', ['nope']],
+    ['a nested array', [[]]],
+  ])('answers 400 for %s rather than dying on the first property read', async (_label, rows) => {
+    await expect(controller().importData({ tables: { sessions: rows } } as never)).rejects.toThrow(BadRequestException);
+  });
+
+  it('names the offending table so the operator can fix the file', async () => {
+    await expect(controller().importData({ tables: { messages: 'nope' } } as never)).rejects.toThrow(/messages/);
+  });
+
+  // Negative twin. It guards OVER-rejection, not deletion: a "must not reject" assertion can never
+  // fail when the guard is removed — that is what the four cases above are for. What it does catch is
+  // the guard hardening into refusing shapes the endpoint supports: an absent table (a partial
+  // archive) and an empty one (a table that legitimately has no rows).
+  it.each([
+    ['omits a table', { sessions: [{ id: 's1' }] }],
+    ['carries an empty table', { sessions: [], messages: [] }],
+  ])('does not reject an archive that %s', async (_label, tables) => {
+    await expect(controller().importData({ tables } as never)).rejects.not.toThrow(/must be an array/);
   });
 });

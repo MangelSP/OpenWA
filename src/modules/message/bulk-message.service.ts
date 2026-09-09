@@ -1,7 +1,16 @@
-import { Injectable, Logger, BadRequestException, NotFoundException, OnApplicationBootstrap } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  BadRequestException,
+  NotFoundException,
+  Optional,
+  OnApplicationBootstrap,
+} from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { In, Not, QueryDeepPartialEntity, Repository } from 'typeorm';
 import { createHash, randomUUID } from 'crypto';
+import { setTimeout } from 'node:timers/promises';
 import {
   MessageBatch,
   BatchStatus,
@@ -12,7 +21,14 @@ import {
 import { SendBulkMessageDto } from './dto/bulk-message.dto';
 import { MessageStatus } from './entities/message.entity';
 import { EngineRegistry } from '../../engine/engine-registry.service';
-import { MessageService } from './message.service';
+import { MessageService, DEFAULT_TEMPLATE_RENDER_MAX_CHARS } from './message.service';
+import {
+  SendPacingService,
+  isPacingLimitedError,
+  countsTowardSendBreaker,
+  SEND_PACING_LIMITED,
+} from './send-pacing.service';
+import { SessionOwnershipService } from '../session/session-ownership.service';
 import { HookManager } from '../../core/hooks';
 import { assertBase64WithinMediaCap, stripBase64DataUri } from './media-cap.util';
 import { SsrfBlockedError, SSRF_BLOCKED_CLIENT_MESSAGE } from '../../common/security/ssrf-guard';
@@ -24,6 +40,7 @@ import { resolveNonNegativeIntEnv } from '../../config/configuration';
 interface BulkMessageContent {
   text?: string;
   caption?: string;
+  mentions?: string[];
   image?: { url?: string; base64?: string; mimetype?: string; filename?: string };
   video?: { url?: string; base64?: string; mimetype?: string; filename?: string };
   audio?: { url?: string; base64?: string; mimetype?: string; filename?: string; ptt?: boolean };
@@ -50,11 +67,15 @@ export function resolveFinalBatchStatus(
 /**
  * Build the error stored on a batch result. An SSRF block names the internal host/IP it refused, so
  * it must never be persisted/returned verbatim — it would be readable via GET batch status. Map it to
- * a generic, code-tagged message; ordinary errors keep their (non-sensitive) message.
+ * a generic, code-tagged message; a pacing refusal keeps its own code so batch results distinguish
+ * policy 429s from engine refusals; ordinary errors keep their (non-sensitive) message.
  */
 export function sanitizeBatchError(error: unknown): { code: string; message: string } {
   if (error instanceof SsrfBlockedError) {
     return { code: 'SEND_BLOCKED', message: SSRF_BLOCKED_CLIENT_MESSAGE };
+  }
+  if (isPacingLimitedError(error)) {
+    return { code: SEND_PACING_LIMITED, message: error instanceof Error ? error.message : String(error) };
   }
   return { code: 'SEND_FAILED', message: error instanceof Error ? error.message : String(error) };
 }
@@ -89,6 +110,16 @@ export class BulkMessageService implements OnApplicationBootstrap {
     private readonly engines: EngineRegistry,
     private readonly messageService: MessageService,
     private readonly hookManager: HookManager,
+    private readonly pacing: SendPacingService,
+    // Trailing @Optional, matching the convention used elsewhere here: the running app always
+    // provides it, while direct-construction unit tests omit it and every batch then reads as this
+    // node's — which is exactly a single-process deployment.
+    @Optional()
+    private readonly ownership?: SessionOwnershipService,
+    // Same trailing-@Optional convention: supplies template.renderMaxChars for the substitution cap
+    // below. Absent in direct-construction unit tests, which then fall back to the shared default.
+    @Optional()
+    private readonly configService?: ConfigService,
   ) {}
 
   /**
@@ -96,19 +127,63 @@ export class BulkMessageService implements OnApplicationBootstrap {
    * previous (crashed/restarted) process — this fresh process is not driving it, so it would
    * otherwise be stuck in PROCESSING forever. Mark it FAILED. Auto-resume is intentionally NOT
    * done here: resuming risks re-sending messages already delivered before the crash.
+   *
+   * "A previous process" is not the same as "any process". A batch is only ever driven by whichever
+   * process holds its session's engine, so a batch belongs to a peer exactly when its session does.
+   * Without that distinction a booting replica declares a live peer's in-flight batches FAILED
+   * while they are still sending — the caller is told the send failed, and the messages go out
+   * anyway. Batch ownership follows session ownership rather than being tracked separately,
+   * because the two cannot diverge: only the engine holder can send.
    */
   async onApplicationBootstrap(): Promise<void> {
-    const orphaned = await this.batchRepository.find({ where: { status: BatchStatus.PROCESSING } });
+    const processing = await this.batchRepository.find({ where: { status: BatchStatus.PROCESSING } });
+    const orphaned = await this.ownedByThisNode(processing);
     for (const batch of orphaned) {
-      batch.status = BatchStatus.FAILED;
-      this.stripBatchMediaPayloads(batch.messages);
-      await this.batchRepository.save(batch);
+      await this.failOrphanedBatch(batch);
     }
     if (orphaned.length > 0) {
       this.logger.warn(
         `Marked ${orphaned.length} orphaned PROCESSING batch(es) FAILED on startup (interrupted by a restart)`,
       );
     }
+    const skipped = processing.length - orphaned.length;
+    if (skipped > 0) {
+      this.logger.log(`Left ${skipped} PROCESSING batch(es) alone: their sessions are held by another node`);
+    }
+  }
+
+  private async failOrphanedBatch(batch: MessageBatch): Promise<void> {
+    batch.status = BatchStatus.FAILED;
+    this.stripBatchMediaPayloads(batch.messages);
+    await this.batchRepository.save(batch);
+  }
+
+  /**
+   * Fail a session's stuck PROCESSING batches after the session was adopted from a lapsed node.
+   * Same policy as the boot reaper and for the same reason: the dead node's already-sent messages
+   * are unknowable, so resuming risks double-sends — FAILED with the payloads stripped is the
+   * honest terminal state, and the caller can re-issue the batch knowingly.
+   */
+  async reapProcessingBatches(sessionId: string, reason: string): Promise<number> {
+    const processing = await this.batchRepository.find({ where: { status: BatchStatus.PROCESSING, sessionId } });
+    for (const batch of processing) {
+      await this.failOrphanedBatch(batch);
+    }
+    if (processing.length > 0) {
+      this.logger.warn(`Marked ${processing.length} PROCESSING batch(es) FAILED for session ${sessionId} (${reason})`);
+    }
+    return processing.length;
+  }
+
+  /**
+   * Narrow to the batches this process may act on. With no ownership service — a single-process
+   * deployment, or a directly-constructed unit test — every batch qualifies, which is the behaviour
+   * that existed before ownership was recorded at all.
+   */
+  private async ownedByThisNode(batches: MessageBatch[]): Promise<MessageBatch[]> {
+    if (!this.ownership || batches.length === 0) return batches;
+    const claimable = new Set(await this.ownership.claimable([...new Set(batches.map(b => b.sessionId))]));
+    return batches.filter(batch => claimable.has(batch.sessionId));
   }
 
   async createBatch(sessionId: string, dto: SendBulkMessageDto): Promise<MessageBatch> {
@@ -377,6 +452,11 @@ export class BulkMessageService implements OnApplicationBootstrap {
       // Apply template variables
       content = this.applyVariables(msg.content, msg.variables);
 
+      // Pacing runs BEFORE the moderation gate, matching MessageService: a send policy forbids is not
+      // offered to plugins at all. A refusal is a 429 that fails THIS item (honouring stopOnError),
+      // not the batch — the allowance may free up, and a batch killed outright could not resume.
+      await this.pacing.assertSendAllowed(batch.sessionId, msg.chatId);
+
       // Per-message moderation gate — the SAME message:sending hook single sends use, so a
       // compliance/moderation plugin sees bulk traffic too (bulk previously bypassed it entirely).
       // A block fails just THIS message (honouring stopOnError below); a plugin may also rewrite it.
@@ -389,15 +469,49 @@ export class BulkMessageService implements OnApplicationBootstrap {
         blockedByPlugin = true;
         throw new BadRequestException('Message sending blocked by plugin');
       }
-      content = (gate.data as { input: BulkMessageContent }).input;
+      // Same envelope check as applySendingGate, which this is the second copy of (see its doc).
+      // Reading `.input` unchecked handed `undefined` to every send below, or threw on a null — one
+      // plugin authoring mistake turning a whole batch into an opaque failure. Fails CLOSED: a
+      // moderation handler whose reply cannot be read may have been redacting something.
+      const envelope = gate.data as { input?: unknown } | null | undefined;
+      if (envelope === undefined) {
+        // Nothing changed: keep the content we already had.
+      } else if (
+        typeof envelope !== 'object' ||
+        envelope === null ||
+        typeof envelope.input !== 'object' ||
+        envelope.input === null
+      ) {
+        blockedByPlugin = true;
+        throw new BadRequestException(
+          'A message:sending handler returned a payload without a usable `input`; the send was refused rather than sent unmoderated',
+        );
+      } else {
+        content = envelope.input;
+      }
 
       // Re-validate the ACTUAL outbound payload against the media cap: template variables and a
       // gate rewrite can grow base64 media past the limit createBatch verified on the raw input.
       // A violation fails just this item (honouring stopOnError) instead of sending it.
       this.assertContentMediaWithinCap(content);
 
-      // Send message based on type
-      const messageResult = await this.sendMessage(engine, msg.chatId, msg.type, content);
+      // Send message based on type. The engine call is bracketed on its own so the pacing breaker
+      // hears exactly what the single-send path feeds it (message.service failSend/persistSentState):
+      // recordSendFailure only when the ENGINE was asked and refused — never for the pre-engine
+      // pacing/plugin/media-cap throws above — and recordSendSuccess the moment it accepts. Without
+      // this the breaker was blind to bulk, the highest-volume path it exists to protect.
+      let messageResult;
+      try {
+        messageResult = await this.sendMessage(engine, msg.chatId, msg.type, content);
+      } catch (engineError) {
+        // Same filter the single-send path applies: adapters also raise client-fault and
+        // engine-state errors from inside this call, and those say nothing about the account.
+        if (countsTowardSendBreaker(engineError)) {
+          this.pacing.recordSendFailure(batch.sessionId);
+        }
+        throw engineError;
+      }
+      this.pacing.recordSendSuccess(batch.sessionId);
 
       result.status = BatchMessageStatus.SENT;
       result.messageId = messageResult.id;
@@ -405,9 +519,10 @@ export class BulkMessageService implements OnApplicationBootstrap {
       batch.progress.sent++;
       batch.progress.pending--;
 
-      // Persist like a single send so the message shows in chat history + stats. The engine echo
-      // (onMessageCreate) fires the webhook/WS but does NOT write the DB, so without this the
-      // bulk-sent message is invisible to the messages table.
+      // Persist like a single send so the row carries the media payload and the batch's type
+      // mapping — the engine echo (onMessageCreate) writes its own OUTGOING row, but only with what
+      // the engine reported, and a Baileys API send echoes a media-less marker. The two writers
+      // dedup on UNIQUE(sessionId, waMessageId).
       await this.persistSentMessage(batch.sessionId, msg.chatId, msg.type, content, messageResult);
 
       this.logger.debug(`Batch ${batch.batchId}: Sent message ${i + 1}/${batch.messages.length} to ${msg.chatId}`);
@@ -420,9 +535,10 @@ export class BulkMessageService implements OnApplicationBootstrap {
       batch.progress.pending--;
 
       // Fire message:failed so alerting/analytics plugins observe bulk failures too (previously
-      // none) — but NOT for a plugin gate-block, which is a moderation decision, not a delivery
-      // failure (matches single send, where a block is a 400 with no message:failed).
-      if (!blockedByPlugin) {
+      // none) — but NOT for a plugin gate-block (a moderation decision) nor a pacing refusal (a
+      // policy 429, thrown before the engine was asked): neither is a delivery failure, matching
+      // single send where a block is a 400 and a pacing refusal is a 429, neither firing the hook.
+      if (!blockedByPlugin && !isPacingLimitedError(error)) {
         await this.hookManager.execute(
           'message:failed',
           { sessionId: batch.sessionId, error: sanitized.message, input: content, type: msg.type },
@@ -464,7 +580,7 @@ export class BulkMessageService implements OnApplicationBootstrap {
     // Delay before next message (except for last)
     if (i < batch.messages.length - 1 && this.processingBatches.get(batch.id)) {
       const delay = this.calculateDelay(batch.options);
-      await this.sleep(delay);
+      await setTimeout(delay);
     }
     return true;
   }
@@ -553,6 +669,16 @@ export class BulkMessageService implements OnApplicationBootstrap {
   private applyVariables(content: BulkMessageContent, variables?: Record<string, string>): BulkMessageContent {
     if (!variables) return content;
 
+    // Cap the RENDERED result, mirroring the single-send template path. `content.text` is
+    // @MaxLength(4096)-validated on the way in, but that runs BEFORE substitution, so a caller-supplied
+    // variable inflates a small item without bound: the request body stays far under the in-flight body
+    // budget while each rendered item does not. Rejected (never truncated), which fails this item the
+    // way a pacing refusal does rather than handing the engine and the messages.body column a string
+    // of arbitrary size.
+    const maxChars =
+      this.configService?.get<number>('template.renderMaxChars', DEFAULT_TEMPLATE_RENDER_MAX_CHARS) ??
+      DEFAULT_TEMPLATE_RENDER_MAX_CHARS;
+
     // Delegate to the shared renderer so the gateway exposes one templating syntax (#69). It
     // substitutes canonical `{{name}}` placeholders and still honors the legacy single-brace
     // `{name}` this endpoint historically used (deprecated — prefer `{{name}}`).
@@ -575,7 +701,23 @@ export class BulkMessageService implements OnApplicationBootstrap {
       return value;
     };
 
-    return processValue(content) as BulkMessageContent;
+    const rendered = processValue(content) as BulkMessageContent;
+
+    // Cap the MESSAGE, not the payload. Substitution runs over the whole content tree (a URL or a
+    // filename may carry a placeholder too), but only the text-bearing fields are bounded: `base64`
+    // holds media, which `assertBase64WithinMediaCap` governs at up to MEDIA_DOWNLOAD_MAX_BYTES —
+    // three orders of magnitude above this cap. Capping every string rejected the most natural bulk
+    // request there is, a personalised media send, because a 100 KB image is ~137,000 base64
+    // characters.
+    for (const field of ['text', 'caption'] as const) {
+      const value = rendered[field];
+      if (typeof value === 'string' && value.length > maxChars) {
+        throw new BadRequestException(
+          `Rendered ${field} is ${value.length} characters, over the ${maxChars}-character limit`,
+        );
+      }
+    }
+    return rendered;
   }
 
   /**
@@ -612,6 +754,8 @@ export class BulkMessageService implements OnApplicationBootstrap {
           : undefined,
       });
     } catch (error) {
+      // Losing the dedup race to the own-send echo is no longer an error here — saveOutgoingMessage
+      // merges onto the echo's row. Anything reaching this point is a real persistence fault.
       this.logger.warn(`Batch message persisted-after-send failed: ${String(error)}`);
     }
   }
@@ -624,24 +768,33 @@ export class BulkMessageService implements OnApplicationBootstrap {
   ): Promise<MessageResult> {
     switch (type) {
       case 'text':
-        return engine.sendTextMessage(chatId, content.text || '');
+        return content.mentions?.length
+          ? engine.sendTextMessage(chatId, content.text || '', content.mentions)
+          : engine.sendTextMessage(chatId, content.text || '');
       case 'image':
         return engine.sendImageMessage(chatId, {
           mimetype: content.image?.mimetype || 'image/jpeg',
           data: stripBase64DataUri(content.image?.base64) || content.image?.url || '',
           caption: content.caption,
+          mentions: content.mentions,
         });
       case 'video':
         return engine.sendVideoMessage(chatId, {
           mimetype: content.video?.mimetype || 'video/mp4',
           data: stripBase64DataUri(content.video?.base64) || content.video?.url || '',
           caption: content.caption,
+          mentions: content.mentions,
         });
       case 'audio':
+        // Forwarded even though audio carries no caption: a mention tags the recipient through
+        // contextInfo without visible @text, which is why the single-send audio route accepts it too
+        // (see sendAudioMessage in baileys-messaging.ts). Dropping it here would accept the field and
+        // then deliver an untagged voice note with nothing to say so.
         return engine.sendAudioMessage(chatId, {
           mimetype: content.audio?.mimetype || (content.audio?.ptt ? 'audio/ogg; codecs=opus' : 'audio/mpeg'),
           data: stripBase64DataUri(content.audio?.base64) || content.audio?.url || '',
           ptt: content.audio?.ptt,
+          mentions: content.mentions,
         });
       case 'document':
         return engine.sendDocumentMessage(chatId, {
@@ -649,6 +802,7 @@ export class BulkMessageService implements OnApplicationBootstrap {
           data: stripBase64DataUri(content.document?.base64) || content.document?.url || '',
           filename: content.document?.filename,
           caption: content.caption,
+          mentions: content.mentions,
         });
       default:
         return Promise.reject(new Error(`Unsupported message type: ${type}`));
@@ -661,9 +815,5 @@ export class BulkMessageService implements OnApplicationBootstrap {
       delay += Math.random() * 2000; // Add 0-2 seconds random
     }
     return delay;
-  }
-
-  private sleep(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms));
   }
 }

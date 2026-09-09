@@ -44,7 +44,23 @@ backed by `localStorage` — there is no Zustand store.
 1. **Minimalist** - Clean, uncluttered interface
 2. **Responsive** - Works on desktop and mobile
 3. **Real-time** - Live updates via WebSocket
-4. **Accessible** - WCAG 2.1 AA compliant
+4. **Accessible** - built to WCAG 2.1 AA as the target. Shipped: full keyboard reachability of
+   the chat/channel/status lists (role, focus, Enter/Space activation), focus-visible styling, the
+   form labels in the settings and config surfaces associated with their controls via `htmlFor`/`id`,
+   toggle switches and button groups that expose an accessible name and their selected state, and a
+   muted-text token that meets AA on both themes. `dashboard/src/a11y-controls.test.ts` fails the
+   build when a toggle switch, a button toggle-group or a plugin config field loses its name; other
+   control shapes are not covered by it.
+   Brand and status colours are split in two: `--primary`, `--error`, `--success` and `--warning` are
+   fill colours for buttons, borders and tints, and `--primary-text`, `--error-text`, `--success-text`
+   and `--warning-text` are darkened twins for anything rendered as text or an icon. As foregrounds
+   the originals measure 1.98:1, 3.76:1, 2.28:1 and 2.15:1 on white. Each twin is set from the
+   darkest surface it actually lands on, which is the 10 to 20 percent tint of its own hue that the
+   badges and callouts paint behind it, not white. Dark restates them as the originals, which are
+   already 6:1 or better on the dark surfaces.
+   Known gap: the exclusive button groups report `aria-pressed` without arrow-key roving focus. Four
+   pages have a render harness, so the rest are checked structurally. Treat the claim as directional,
+   not certified.
 5. **Dark mode** - Support for light/dark themes
 
 ## 17.2 Information Architecture
@@ -86,7 +102,8 @@ a non-admin hitting the path falls through to the `*` redirect.
 /                  → Dashboard (overview + charts)
 /sessions          → Sessions (create / start / stop / QR / delete)
 /chats             → Chats (Chats / Channels / Status tabs; chat list + message thread live via
-                     WebSocket; read-only channel feed on whatsapp-web.js)
+                     WebSocket; thread pages older history in on scroll-up; read-only channel
+                     feed on whatsapp-web.js)
 /webhooks          → Webhooks (per-session webhook endpoints)
 /templates         → Message Templates
 /message-tester    → Message Tester (ad-hoc send-* + check-number)
@@ -199,12 +216,13 @@ a non-admin hitting the path falls through to the `*` redirect.
 │  └─────────────────────────────────────────────────────────────┘    │
 │                                                                      │
 │  Unlink Device attempts an engine-native unlink of this companion   │
-│  device (POST /sessions/:id/logout), then stops the session. A 200  │
-│  means the unlink + local cleanup completed (not an independent      │
-│  Linked-Devices observation) — reconnecting then requires a fresh   │
-│  QR scan or pairing code. A 502 (SESSION_LOGOUT_INCOMPLETE) stops   │
-│  locally but leaves the operation incomplete; retry after starting. │
-│  Delete only clears the local data; it does NOT unlink.             │
+│  device (POST /sessions/:sessionId/logout), then stops the          │
+│  session. A 200 means the unlink + local cleanup completed (not an  │
+│  independent Linked-Devices observation) — reconnecting then        │
+│  requires a fresh QR scan or pairing code. A 502                    │
+│  (SESSION_LOGOUT_INCOMPLETE) stops locally but leaves the           │
+│  operation incomplete; retry after starting. Delete only clears     │
+│  the local data; it does NOT unlink.                                │
 │                                                                      │
 │  ┌─────────────────────┬─────────────────────┐                      │
 │  │  📊 Statistics      │  ⚙️ Configuration    │                      │
@@ -384,6 +402,13 @@ package to pull from.
 Chat-specific pieces live one level down in `components/chats/`: `MessageBody` (WhatsApp text
 formatting + link detection) and `MediaLightbox` (the media viewer, built on
 `yet-another-react-lightbox`).
+
+The message thread is paged. `useChatMessages` is a `useInfiniteQuery` whose cursor is the number
+of DB rows fetched so far, not the length of the rendered list — the thread also carries engine
+history and drops the duplicates between the two, so its length is not an offset the gateway would
+agree with. Reaching the top requests the next page; the reading position is held across the
+prepend rather than jumping. Both rules are pure functions with tests: `utils/messagePages.ts` for
+the cursor, `shouldFetchOlderMessages` in `utils/scrollDecision.ts` for when to ask.
 
 Pages live under `dashboard/src/pages/`, each as a `*.tsx` + `*.css` pair (e.g. `Sessions.tsx` +
 `Sessions.css`). Pages are lazy-loaded in `App.tsx` via `React.lazy` + `Suspense`.

@@ -10,6 +10,8 @@ import { EventsGateway } from '../events/events.gateway';
 import { WebhookService } from '../webhook/webhook.service';
 import { HookManager } from '../../core/hooks';
 import { StatusStoreService } from '../status-store/status-store.service';
+import { ChatMediaArchiveService } from '../chat-media/chat-media-archive.service';
+import { AutomationRulesService } from '../automation/automation-rules.service';
 import { SessionLidResolver } from './session-lid-resolver.service';
 import type { IncomingMessage, IWhatsAppEngine } from '../../engine/interfaces/whatsapp-engine.interface';
 
@@ -21,6 +23,12 @@ const settle = (): Promise<void> => new Promise(resolve => setImmediate(resolve)
 const dedupIds = (find: jest.Mock, call = 0): string[] => {
   const calls = find.mock.calls as Array<[{ where: { waMessageId: { _value: string[] } } }]>;
   return calls[call][0].where.waMessageId._value;
+};
+
+// The payload a webhook dispatch carried, reached without an `any` hop — same reason as dedupIds.
+const dispatchPayload = (dispatch: jest.Mock, call = 0): Record<string, unknown> => {
+  const calls = dispatch.mock.calls as Array<[string, string, Record<string, unknown>]>;
+  return calls[call][2];
 };
 
 const historyMessage = (over: Partial<IncomingMessage> = {}): IncomingMessage =>
@@ -37,7 +45,12 @@ const historyMessage = (over: Partial<IncomingMessage> = {}): IncomingMessage =>
 
 describe('MessageProjector', () => {
   let messageRepository: { find: jest.Mock; findOne: jest.Mock; create: jest.Mock; update: jest.Mock };
-  let eventsGateway: { emitMessage: jest.Mock; emitMessageSent: jest.Mock; emitMessageRevoked: jest.Mock };
+  let eventsGateway: {
+    emitMessage: jest.Mock;
+    emitMessageSent: jest.Mock;
+    emitMessageRevoked: jest.Mock;
+    emitMessageReaction: jest.Mock;
+  };
   let webhookService: { dispatch: jest.Mock };
   let engines: EngineRegistry;
   let engine: IWhatsAppEngine;
@@ -50,7 +63,12 @@ describe('MessageProjector', () => {
       create: jest.fn((x: unknown) => x),
       update: jest.fn().mockResolvedValue({ affected: 1 }),
     };
-    eventsGateway = { emitMessage: jest.fn(), emitMessageSent: jest.fn(), emitMessageRevoked: jest.fn() };
+    eventsGateway = {
+      emitMessage: jest.fn(),
+      emitMessageSent: jest.fn(),
+      emitMessageRevoked: jest.fn(),
+      emitMessageReaction: jest.fn(),
+    };
     webhookService = { dispatch: jest.fn().mockResolvedValue(undefined) };
     engines = new EngineRegistry();
     engine = {} as IWhatsAppEngine;
@@ -122,6 +140,72 @@ describe('MessageProjector', () => {
       await settle();
 
       expect(messageRepository.findOne).not.toHaveBeenCalled();
+    });
+
+    it('still notifies consumers when the reacted message has no stored row', async () => {
+      // Same contract as handleMessageRevoked: the stored copy is best-effort, but message.reaction is
+      // a declared webhook event and the dashboard stream is the point of it. A row is absent whenever
+      // the message was never persisted — an ephemeral message under STORE_EPHEMERAL_MESSAGES=false,
+      // or one that arrived before the session went live.
+      messageRepository.findOne.mockResolvedValue(null);
+
+      projector.applyReactionQueued('s1', {
+        messageId: 'WA1',
+        chatId: 'c1@c.us',
+        senderId: '628@c.us',
+        reaction: '👍',
+      });
+
+      await settle();
+      await settle();
+
+      expect(webhookService.dispatch).toHaveBeenCalledWith('s1', 'message.reaction', expect.anything());
+      expect(eventsGateway.emitMessageReaction).toHaveBeenCalledTimes(1);
+    });
+
+    it('omits the reactions snapshot when there is no stored row to compute it from', async () => {
+      // `reactions` is the post-apply snapshot of EVERY reaction on the message, and consumers replace
+      // their copy with it. Without the row that snapshot is unknowable, and sending this one reaction
+      // as if it were the whole set would tell them the other senders had withdrawn theirs. Absent
+      // means "we hold no copy", which is the truth.
+      messageRepository.findOne.mockResolvedValue(null);
+
+      projector.applyReactionQueued('s1', {
+        messageId: 'WA1',
+        chatId: 'c1@c.us',
+        senderId: '628@c.us',
+        reaction: '👍',
+      });
+
+      await settle();
+      await settle();
+
+      const payload = dispatchPayload(webhookService.dispatch);
+      expect(payload).not.toHaveProperty('reactions');
+      expect(payload).toMatchObject({ messageId: 'WA1', senderId: '628@c.us', reaction: '👍' });
+    });
+
+    it('still carries the full snapshot, and still writes it, when the row IS there', async () => {
+      // The other half of the branch above: making the snapshot conditional must not make it optional
+      // in the case that has always produced it. A prior sender's reaction survives in the map.
+      messageRepository.findOne.mockResolvedValue({ metadata: { reactions: { '627@c.us': '❤️' } } });
+
+      projector.applyReactionQueued('s1', {
+        messageId: 'WA1',
+        chatId: 'c1@c.us',
+        senderId: '628@c.us',
+        reaction: '👍',
+      });
+
+      await settle();
+      await settle();
+
+      const payload = dispatchPayload(webhookService.dispatch);
+      expect(payload.reactions).toEqual({ '627@c.us': '❤️', '628@c.us': '👍' });
+      expect(messageRepository.update).toHaveBeenCalledWith(
+        { sessionId: 's1', waMessageId: 'WA1' },
+        { metadata: { reactions: { '627@c.us': '❤️', '628@c.us': '👍' } } },
+      );
     });
   });
 
@@ -211,6 +295,8 @@ describe('MessageProjector (inbound projection)', () => {
   let hookManager: { execute: jest.Mock };
   let statusStore: { ingest: jest.Mock };
   let lidResolver: { resolveSenderPhone: jest.Mock };
+  let chatMediaArchive: { archive: jest.Mock };
+  let automationRules: { evaluateInbound: jest.Mock };
 
   const SESSION_ID = 'session-1';
 
@@ -250,6 +336,8 @@ describe('MessageProjector (inbound projection)', () => {
     hookManager = { execute: jest.fn((_event: string, data: unknown) => Promise.resolve({ continue: true, data })) };
     statusStore = { ingest: jest.fn().mockResolvedValue({ row: {}, created: false }) };
     lidResolver = { resolveSenderPhone: jest.fn().mockResolvedValue(null) };
+    chatMediaArchive = { archive: jest.fn().mockResolvedValue(null) };
+    automationRules = { evaluateInbound: jest.fn().mockResolvedValue(undefined) };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -265,6 +353,8 @@ describe('MessageProjector (inbound projection)', () => {
         { provide: StatusStoreService, useValue: statusStore },
         { provide: SessionLidResolver, useValue: lidResolver },
         { provide: ConfigService, useValue: { get: jest.fn() } },
+        { provide: ChatMediaArchiveService, useValue: chatMediaArchive },
+        { provide: AutomationRulesService, useValue: automationRules },
       ],
     }).compile();
 
@@ -348,6 +438,77 @@ describe('MessageProjector (inbound projection)', () => {
 
       expect(statusStore.ingest).toHaveBeenCalledTimes(1);
       expect(messageRepository.insert).not.toHaveBeenCalled();
+    });
+
+    describe('chat-media archiving', () => {
+      it('hands the persisted row to the archive', async () => {
+        const engine = makeEngine();
+        engines.set(SESSION_ID, engine);
+
+        projector.handleInboundMessage(SESSION_ID, engine, makeIncoming());
+        await new Promise(resolve => setImmediate(resolve));
+
+        // The row, not the engine message: the archive updates by row id, which only the
+        // persisted entity carries.
+        expect(chatMediaArchive.archive).toHaveBeenCalledWith(
+          expect.objectContaining({ sessionId: SESSION_ID, chatId: '15550001111@c.us' }),
+        );
+      });
+
+      it('does not archive when the insert never landed', async () => {
+        const engine = makeEngine();
+        engines.set(SESSION_ID, engine);
+        // A transient non-unique failure: the row has no id, so there is nothing to point at a file.
+        messageRepository.insert.mockRejectedValueOnce(new Error('SQLITE_BUSY'));
+
+        projector.handleInboundMessage(SESSION_ID, engine, makeIncoming());
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(chatMediaArchive.archive).not.toHaveBeenCalled();
+        // Fail-open is unchanged: a real message is still dispatched on a transient DB fault.
+        expect(webhookService.dispatch).toHaveBeenCalledWith(SESSION_ID, 'message.received', expect.anything());
+      });
+
+      it('keeps delivering when archiving rejects — storage must never break the receive path', async () => {
+        const engine = makeEngine();
+        engines.set(SESSION_ID, engine);
+        chatMediaArchive.archive.mockRejectedValueOnce(new Error('bucket unreachable'));
+
+        projector.handleInboundMessage(SESSION_ID, engine, makeIncoming());
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(webhookService.dispatch).toHaveBeenCalledWith(SESSION_ID, 'message.received', expect.anything());
+        expect(eventsGateway.emitMessage).toHaveBeenCalledWith(SESSION_ID, expect.anything());
+      });
+    });
+
+    describe('automation rules', () => {
+      it('hands the dispatched message to the rule evaluator', async () => {
+        const engine = makeEngine();
+        engines.set(SESSION_ID, engine);
+
+        projector.handleInboundMessage(SESSION_ID, engine, makeIncoming());
+        await new Promise(resolve => setImmediate(resolve));
+
+        // The hook-final message, same object the webhook dispatch gets — rule conditions must see
+        // exactly what a filtered message.received webhook would have seen.
+        expect(automationRules.evaluateInbound).toHaveBeenCalledWith(
+          SESSION_ID,
+          expect.objectContaining({ chatId: '15550001111@c.us' }),
+        );
+      });
+
+      it('keeps delivering when rule evaluation rejects — a broken rule must never break the receive path', async () => {
+        const engine = makeEngine();
+        engines.set(SESSION_ID, engine);
+        automationRules.evaluateInbound.mockRejectedValueOnce(new Error('rules table gone'));
+
+        projector.handleInboundMessage(SESSION_ID, engine, makeIncoming());
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(webhookService.dispatch).toHaveBeenCalledWith(SESSION_ID, 'message.received', expect.anything());
+        expect(eventsGateway.emitMessage).toHaveBeenCalledWith(SESSION_ID, expect.anything());
+      });
     });
   });
 });

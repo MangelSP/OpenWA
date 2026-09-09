@@ -11,7 +11,11 @@ import { chatKind } from '../identity/wa-id';
  * intentionally not produced on this engine — unlike the wwjs adapter, which sources call detail
  * from the gated `getChatHistory` path.
  */
-export function mapBaileysMessageType(contentType: string | undefined, isPtt = false): MessageType {
+export function mapBaileysMessageType(
+  contentType: string | undefined,
+  isPtt = false,
+  isCatalogShare = false,
+): MessageType {
   switch (contentType) {
     case 'conversation':
     case 'extendedTextMessage':
@@ -46,6 +50,14 @@ export function mapBaileysMessageType(contentType: string | undefined, isPtt = f
       // carry display text that {@link extractBaileysBody} flattens into `body`, so they surface as
       // `text` instead of being dropped as `unknown` with an empty body (#562).
       return 'text';
+    case 'orderMessage':
+      return 'order';
+    case 'productMessage':
+      // A shared product card — or, with the `catalog` arm set instead of `product`, a share of the
+      // whole catalog (there is no `catalogMessage` content type). A catalog share carries no
+      // product id, so it stays `unknown` rather than a `product` with nothing to act on; its title
+      // still reaches `body` via {@link extractBaileysBody}.
+      return isCatalogShare ? 'unknown' : 'product';
     case 'placeholderMessage':
       // Meta masks high-security business messages (enterprise OTPs, banking alerts) on linked/
       // companion devices — which Baileys is — delivering a bodyless `placeholderMessage` (its only
@@ -76,14 +88,40 @@ export interface BaileysBodyContent {
     hydratedFourRowTemplate?: { hydratedContentText?: string | null } | null;
   } | null;
   interactiveResponseMessage?: { body?: { text?: string | null } | null } | null;
+  /** A poll's question; the wire bumps the content key across versions, all carry `name`. */
+  pollCreationMessage?: { name?: string | null } | null;
+  pollCreationMessageV2?: { name?: string | null } | null;
+  pollCreationMessageV3?: { name?: string | null } | null;
+  /** A shared WhatsApp event; only its display name is surfaced as text. */
+  eventMessage?: { name?: string | null } | null;
+  /** The user tapping a business message button: which visible label they pressed. */
+  buttonsResponseMessage?: { selectedDisplayText?: string | null } | null;
+  templateButtonReplyMessage?: { selectedDisplayText?: string | null } | null;
+  /** A single shared contact card. */
+  contactMessage?: { vcard?: string | null } | null;
+  /** Several contact cards shared together; each carries its own vCard. */
+  contactsArrayMessage?: { contacts?: Array<{ vcard?: string | null }> | null } | null;
+  /** A placed order: the customer's note, else the order's own title. */
+  orderMessage?: { message?: string | null; orderTitle?: string | null } | null;
+  /** A shared product card: the accompanying text, else the product's — or the catalog's — title. */
+  productMessage?: {
+    body?: string | null;
+    product?: { title?: string | null } | null;
+    catalog?: { title?: string | null } | null;
+  } | null;
 }
 
 /**
  * Extract the display text of an inbound Baileys message: plain text first, then a media caption,
  * then the WhatsApp Business interactive shapes (interactive / buttons / template / interactive-
  * response) whose text was previously dropped — the OTP/verification text businesses send via these
- * shapes (#562). Returns `''` when the message carries no extractable text. Pass the NORMALIZED
- * content (ephemeral/viewOnce/documentWithCaption wrappers already unwrapped), as the adapter does.
+ * shapes (#562), then the text-shaped non-conversation content whose display text whatsapp-web.js
+ * already exposes as `body` and Baileys used to drop silently: a poll's question, a shared event's
+ * name, which button label the user tapped, and a shared contact card's vCard(s). Multiple vCards
+ * from a `contactsArrayMessage` are newline-joined; RFC 6350 allows concatenated vCards in one
+ * stream, so this is a single valid multi-card body, not string mangling. Returns `''` when the
+ * message carries no extractable text. Pass the NORMALIZED content (ephemeral/viewOnce/
+ * documentWithCaption wrappers already unwrapped), as the adapter does.
  */
 export function extractBaileysBody(content: BaileysBodyContent): string {
   return (
@@ -97,8 +135,104 @@ export function extractBaileysBody(content: BaileysBodyContent): string {
     content.templateMessage?.hydratedTemplate?.hydratedContentText ??
     content.templateMessage?.hydratedFourRowTemplate?.hydratedContentText ??
     content.interactiveResponseMessage?.body?.text ??
+    content.pollCreationMessage?.name ??
+    content.pollCreationMessageV2?.name ??
+    content.pollCreationMessageV3?.name ??
+    content.eventMessage?.name ??
+    content.buttonsResponseMessage?.selectedDisplayText ??
+    content.templateButtonReplyMessage?.selectedDisplayText ??
+    content.contactMessage?.vcard ??
+    extractContactsArrayVcards(content.contactsArrayMessage) ??
+    content.orderMessage?.message ??
+    content.orderMessage?.orderTitle ??
+    content.productMessage?.body ??
+    content.productMessage?.product?.title ??
+    content.productMessage?.catalog?.title ??
     ''
   );
+}
+
+/**
+ * Joins the vCards of a `contactsArrayMessage` into one string, in the order they were shared.
+ * Returns `undefined` (not `''`) when there are no vCards to join, so it composes with `??` in
+ * {@link extractBaileysBody} the same way every other optional-field lookup there does.
+ */
+function extractContactsArrayVcards(
+  contactsArrayMessage: BaileysBodyContent['contactsArrayMessage'],
+): string | undefined {
+  const vcards = (contactsArrayMessage?.contacts ?? [])
+    .map(contact => contact.vcard)
+    .filter((vcard): vcard is string => !!vcard);
+
+  return vcards.length > 0 ? vcards.join('\n') : undefined;
+}
+
+/**
+ * The inbound message-content subset the commerce extractor reads. Declared structurally, as
+ * {@link BaileysBodyContent} is.
+ */
+export interface BaileysCommerceContent {
+  orderMessage?: { orderId?: string | null; token?: string | null } | null;
+  productMessage?: {
+    businessOwnerJid?: string | null;
+    product?: { productId?: string | null; title?: string | null; description?: string | null } | null;
+    /** Set instead of `product` when the whole catalog was shared — see {@link isBaileysCatalogShare}. */
+    catalog?: { title?: string | null } | null;
+  } | null;
+}
+
+/** Both commerce shapes an inbound message can carry; each arm is set only for its content type. */
+export interface BaileysCommerce {
+  order?: IncomingMessage['order'];
+  product?: IncomingMessage['product'];
+}
+
+/**
+ * Extract the ids a commerce message carries: an order's `orderId`/`token` (the correlation handle
+ * for its line items) and a shared product's `productId` (what the catalog routes take). Both are
+ * dropped by the generic path, which sees only an empty body.
+ *
+ * An order or product without its id yields nothing: a client cannot act on either, and an entry
+ * with an empty id would look actionable while failing at the API. Pass the NORMALIZED content, as
+ * the adapter does — a commerce message in a disappearing chat nests under `ephemeralMessage`.
+ */
+export function extractBaileysCommerce(
+  content: BaileysCommerceContent,
+  contentType: string | undefined,
+): BaileysCommerce {
+  if (contentType === 'orderMessage') {
+    const orderId = content.orderMessage?.orderId;
+    if (!orderId) {
+      return {};
+    }
+    return { order: { orderId, token: content.orderMessage?.token ?? undefined } };
+  }
+
+  if (contentType === 'productMessage') {
+    const snapshot = content.productMessage?.product;
+    return snapshot?.productId
+      ? {
+          product: {
+            productId: snapshot.productId,
+            title: snapshot.title ?? undefined,
+            description: snapshot.description ?? undefined,
+            businessOwnerJid: content.productMessage?.businessOwnerJid ?? undefined,
+          },
+        }
+      : {};
+  }
+
+  return {};
+}
+
+/**
+ * A catalog share arrives as a `productMessage` too, carrying the `catalog` arm instead of
+ * `product` (there is no `catalogMessage` content type). It names a whole catalog and carries no
+ * product id, so it must not surface as a `product` with no product — see
+ * {@link mapBaileysMessageType}.
+ */
+export function isBaileysCatalogShare(content: BaileysCommerceContent): boolean {
+  return !content.productMessage?.product?.productId && content.productMessage?.catalog != null;
 }
 
 /**
@@ -216,21 +350,11 @@ export function extractBaileysContext(content: BaileysContextContent): BaileysMe
   };
 
   if (contextInfo?.quotedMessage && contextInfo.stanzaId) {
-    const qm = contextInfo.quotedMessage as {
-      conversation?: string | null;
-      extendedTextMessage?: { text?: string | null } | null;
-      imageMessage?: { caption?: string | null } | null;
-      videoMessage?: { caption?: string | null } | null;
-      documentMessage?: { caption?: string | null } | null;
-    };
-    const qBody =
-      qm.conversation ??
-      qm.extendedTextMessage?.text ??
-      qm.imageMessage?.caption ??
-      qm.videoMessage?.caption ??
-      qm.documentMessage?.caption ??
-      '';
-    context.quotedMessage = { id: contextInfo.stanzaId, body: qBody };
+    // The quote's body comes from the SAME extractor as the live message, so a quoted contact card,
+    // poll or interactive shape carries its text instead of an empty string — matching wwjs, whose
+    // quote is a full Message and therefore shows the same body it would show unquoted.
+    const qm = contextInfo.quotedMessage as BaileysBodyContent;
+    context.quotedMessage = { id: contextInfo.stanzaId, body: extractBaileysBody(qm) };
   }
 
   return context;
@@ -287,6 +411,11 @@ export interface BaileysIncomingFields {
   location?: IncomingMessage['location'];
   /** Pre-extracted quoted message context. Populated by the adapter when `contextInfo` is present. */
   quotedMessage?: IncomingMessage['quotedMessage'];
+  /** Pre-extracted commerce ids. Populated by the adapter for `orderMessage` / `productMessage`. */
+  order?: IncomingMessage['order'];
+  product?: IncomingMessage['product'];
+  /** A `productMessage` that shares the whole catalog rather than one product — see `isBaileysCatalogShare`. */
+  isCatalogShare?: boolean;
   /** Ephemeral/disappearing-messages timer from `contextInfo.expiration` on the Baileys message. */
   ephemeralDuration?: number;
   /** @mentioned engine JIDs from `contextInfo.mentionedJid`; normalized and surfaced as `mentionedIds`. */
@@ -322,7 +451,7 @@ export function buildIncomingMessageFromBaileys(
     to: fields.fromMe ? chatId : self,
     chatId,
     body: fields.body,
-    type: mapBaileysMessageType(fields.contentType, fields.isPtt),
+    type: mapBaileysMessageType(fields.contentType, fields.isPtt, fields.isCatalogShare),
     timestamp: fields.timestamp,
     fromMe: fields.fromMe,
     isGroup,
@@ -366,6 +495,19 @@ export function buildIncomingMessageFromBaileys(
 
   if (fields.quotedMessage) {
     incoming.quotedMessage = fields.quotedMessage;
+  }
+
+  if (fields.order) {
+    incoming.order = fields.order;
+  }
+
+  if (fields.product) {
+    // The catalog owner goes through the same normalizer as every other JID on the payload, so an
+    // order/product never emits `@s.whatsapp.net` or `@lid` next to `@c.us` fields in one object.
+    const { businessOwnerJid } = fields.product;
+    incoming.product = businessOwnerJid
+      ? { ...fields.product, businessOwnerJid: normalizeJid(businessOwnerJid) }
+      : fields.product;
   }
 
   // Ephemeral/disappearing-messages timer, when the chat has one set.

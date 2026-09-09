@@ -8,12 +8,15 @@ import type {
   TemplateRow,
   BaileysStoredMessageRow,
   LidMappingRow,
+  ChatStateRow,
   PluginInstanceRow,
   ConversationMappingRow,
   IngressEventRow,
   WebhookDeliveryFailureRow,
+  WebhookOutboxEventRow,
   IntegrationDeliveryFailureRow,
   StatusUpdateRow,
+  AutomationRuleRow,
 } from './migration-tables.types';
 
 // A per-table restore step for importData: which backup key to read, the exact INSERT text (kept in
@@ -33,17 +36,28 @@ export interface TableImporter<K extends keyof MigrationTables = keyof Migration
   skip?: (row: MigrationTables[K][number]) => string | null;
 }
 
-// Registers one concrete descriptor into the union-keyed TABLE_IMPORTERS array. The return type
-// widens the row-specific id/map/skip to the union of all row types; sound because the import loop
-// only ever feeds a descriptor rows read from data.tables[its own key].
-function defineTableImporter<K extends keyof MigrationTables>(importer: TableImporter<K>): TableImporter {
+/**
+ * A registered importer with its row type erased, which is what the union-keyed TABLE_IMPORTERS
+ * array holds. The row-consuming members take `never` rather than the union of every row type: a
+ * holder of the erased form cannot know which row type a given descriptor wants, and `never` is the
+ * only parameter type that every concrete `TableImporter<K>` can be assigned to. Soundness comes
+ * from the import loop, which only ever hands a descriptor rows read from `data.tables[its key]`.
+ */
+export type AnyTableImporter = Omit<TableImporter, 'id' | 'map' | 'skip'> & {
+  id: (row: never) => string;
+  map: (row: never) => unknown[];
+  skip?: (row: never) => string | null;
+};
+
+// Registers one concrete descriptor into the union-keyed TABLE_IMPORTERS array.
+function defineTableImporter<K extends keyof MigrationTables>(importer: TableImporter<K>): AnyTableImporter {
   return importer;
 }
 
 // Restore order is FK order: sessions first (webhooks/messages/templates/etc. reference it), the
 // standalone cache/DLQ tables after. The per-block comments from the former inline import blocks
 // live on their descriptor entries.
-export const TABLE_IMPORTERS: TableImporter[] = [
+export const TABLE_IMPORTERS: AnyTableImporter[] = [
   // Import sessions first
   defineTableImporter({
     key: 'sessions',
@@ -86,7 +100,9 @@ export const TABLE_IMPORTERS: TableImporter[] = [
       webhook.sessionId,
       webhook.url,
       typeof webhook.events === 'string' ? webhook.events : JSON.stringify(webhook.events || []),
-      webhook.secret,
+      // Rows exported after credential redaction (and hand-trimmed archives) carry no secret at
+      // all — restore those as unsigned rather than failing the row on a missing key.
+      webhook.secret ?? null,
       typeof webhook.headers === 'string' ? webhook.headers : JSON.stringify(webhook.headers || {}),
       webhook.filters == null
         ? null
@@ -105,8 +121,8 @@ export const TABLE_IMPORTERS: TableImporter[] = [
   defineTableImporter({
     key: 'messages',
     label: 'message',
-    sql: `INSERT INTO messages (id, "sessionId", "waMessageId", "chatId", "chatName", author, "from", "to", body, type, direction, "timestamp", metadata, status, "createdAt")
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+    sql: `INSERT INTO messages (id, "sessionId", "waMessageId", "chatId", "chatName", author, "from", "to", body, type, direction, "timestamp", metadata, status, "createdAt", "mediaPath", "mediaMimetype")
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
     id: (msg: MessageRow) => msg.id,
     map: (msg: MessageRow) => [
       msg.id,
@@ -126,6 +142,11 @@ export const TABLE_IMPORTERS: TableImporter[] = [
       msg.metadata == null ? null : typeof msg.metadata === 'string' ? msg.metadata : JSON.stringify(msg.metadata),
       msg.status,
       msg.createdAt,
+      // Archives predating the chat-media columns restore to NULL, same as author above. Carrying
+      // them matters because the media FILES ride along in the storage export: restoring the rows
+      // without their pointers would turn every archived file into an orphan the sweep then reaps.
+      msg.mediaPath ?? null,
+      msg.mediaMimetype ?? null,
     ],
   }),
 
@@ -199,6 +220,15 @@ export const TABLE_IMPORTERS: TableImporter[] = [
     sql: `INSERT INTO lid_mappings (lid, phone, "sessionId", "updatedAt") VALUES ($1, $2, $3, $4)`,
     id: (lm: LidMappingRow) => lm.lid,
     map: (lm: LidMappingRow) => [lm.lid, lm.phone ?? null, lm.sessionId ?? null, lm.updatedAt],
+  }),
+
+  // Import chat states (optional; not a FK, restored as a standalone per-session cache table)
+  defineTableImporter({
+    key: 'chatStates',
+    label: 'chat state',
+    sql: `INSERT INTO chat_states ("sessionId", "chatId", "muteEndTime", archived, pinned, "updatedAt") VALUES ($1, $2, $3, $4, $5, $6)`,
+    id: (cs: ChatStateRow) => `${cs.sessionId}/${cs.chatId}`,
+    map: (cs: ChatStateRow) => [cs.sessionId, cs.chatId, cs.muteEndTime ?? null, cs.archived, cs.pinned, cs.updatedAt],
   }),
 
   // Import plugin instances (Integration Fabric config + ingress HMAC secret)
@@ -293,6 +323,30 @@ export const TABLE_IMPORTERS: TableImporter[] = [
     ],
   }),
 
+  // Import the outbound delivery record. Restoring it restores the replay backlog: a 'pending'
+  // row still carries its payload, so the reconciler on the target instance picks up where the
+  // source left off.
+  defineTableImporter({
+    key: 'webhookOutboxEvents',
+    label: 'webhook outbox event',
+    sql: `INSERT INTO webhook_outbox_events (id, "webhookId", "sessionId", event, "idempotencyKey", "deliveryId", payload, state, attempts, "lastAttemptAt", "createdAt")
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+    id: (row: WebhookOutboxEventRow) => row.id,
+    map: (row: WebhookOutboxEventRow) => [
+      row.id,
+      row.webhookId,
+      row.sessionId,
+      row.event,
+      row.idempotencyKey,
+      row.deliveryId,
+      row.payload,
+      row.state,
+      row.attempts,
+      row.lastAttemptAt,
+      row.createdAt,
+    ],
+  }),
+
   // Import integration delivery failures (inbound + outbound DLQ)
   defineTableImporter({
     key: 'integrationDeliveryFailures',
@@ -341,6 +395,27 @@ export const TABLE_IMPORTERS: TableImporter[] = [
       su.expiresAt,
     ],
   }),
+  // Import automation rules (per-session autoreply rules; FK sessions ON DELETE CASCADE, so the
+  // import's `DELETE FROM sessions` wipes them and they must be re-inserted or a restore
+  // permanently loses every rule).
+  defineTableImporter({
+    key: 'automationRules',
+    label: 'automation rule',
+    sql: `INSERT INTO automation_rules (id, "sessionId", name, enabled, conditions, "replyText", "cooldownSeconds", "createdAt", "updatedAt")
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+    id: (rule: AutomationRuleRow) => rule.id,
+    map: (rule: AutomationRuleRow) => [
+      rule.id,
+      rule.sessionId,
+      rule.name,
+      rule.enabled ?? true,
+      rule.conditions ?? null,
+      rule.replyText,
+      rule.cooldownSeconds ?? 60,
+      rule.createdAt,
+      rule.updatedAt,
+    ],
+  }),
 ];
 
 // The `as TableCounts` cast in importData means a dropped or mis-keyed descriptor is invisible to
@@ -354,12 +429,15 @@ const EXPECTED_TABLE_KEYS: ReadonlyArray<keyof MigrationTables> = [
   'templates',
   'baileysStoredMessages',
   'lidMappings',
+  'chatStates',
   'pluginInstances',
   'conversationMappings',
   'ingressEvents',
   'webhookDeliveryFailures',
+  'webhookOutboxEvents',
   'integrationDeliveryFailures',
   'statusUpdates',
+  'automationRules',
 ];
 const importerKeys = TABLE_IMPORTERS.map(importer => importer.key);
 for (const key of EXPECTED_TABLE_KEYS) {

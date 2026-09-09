@@ -28,6 +28,22 @@ interface S3Config {
 /** How often an S3-configured service re-probes a bucket that was unreachable at boot. */
 export const DEFAULT_S3_REPROBE_INTERVAL_MS = 60_000;
 
+/**
+ * True when a storage read failed because the object is simply not there.
+ *
+ * Both backends must be covered, and they report it differently: the local backend raises a POSIX
+ * `ENOENT` (a `.code`), while S3 raises `NoSuchKey`/`NotFound`, which carries a `.name` and no
+ * `.code` at all — `getS3File` below rethrows that original error when the local read-through also
+ * misses. Checking only `.code` turns a missing S3 object into a 500 on the one backend where
+ * retention and bucket lifecycle rules make a miss most likely.
+ */
+export function isMissingObjectError(error: unknown): boolean {
+  const e = error as { code?: string; name?: string; $metadata?: { httpStatusCode?: number } };
+  return (
+    e?.code === 'ENOENT' || e?.name === 'NoSuchKey' || e?.name === 'NotFound' || e?.$metadata?.httpStatusCode === 404
+  );
+}
+
 function positiveIntFromEnv(name: string, fallback: number): number {
   const parsed = Number.parseInt(process.env[name] ?? '', 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
@@ -76,6 +92,24 @@ export class StorageService implements OnModuleDestroy {
         this.s3Bucket = process.env.S3_BUCKET || s3Config.bucket || 'openwa';
         void this.initializeS3Bucket();
         this.startS3Reprobe();
+      } else {
+        // Every other degradation in this service announces itself, but this one could not: the
+        // logging all lives past the client construction above, so an s3 deployment missing its
+        // credentials built no client, wrote every file to local disk, and said nothing at all.
+        // The operator's first symptom was an empty bucket with no failure to point at.
+        //
+        // Name the variables actually missing rather than declaring all of them absent: reaching
+        // here with one of the pair set is a plain typo in the other, and "no credentials found"
+        // would send that operator looking at the one they got right.
+        const missing = [
+          accessKeyId ? null : 'S3_ACCESS_KEY_ID',
+          secretAccessKey ? null : 'S3_SECRET_ACCESS_KEY',
+        ].filter((name): name is string => name !== null);
+        this.logger.warn(
+          `STORAGE_TYPE=s3 but ${missing.join(' and ')} is not set; media is being written to the ` +
+            `local dir '${this.localPath}' instead of the bucket. The built-in MinIO uses ` +
+            `minioadmin/minioadmin.`,
+        );
       }
     }
 
@@ -295,7 +329,8 @@ export class StorageService implements OnModuleDestroy {
         if (s3Keys.has(file)) continue;
         count += 1;
         try {
-          sizeBytes += fs.statSync(path.join(this.localPath, file)).size;
+          // Same reason as the local branch below: this walk is uncapped too, so the stat must yield.
+          sizeBytes += (await fs.promises.stat(path.join(this.localPath, file))).size;
         } catch (error) {
           this.logger.debug(`Failed to stat file: ${file}`, { error: String(error) });
         }
@@ -303,12 +338,18 @@ export class StorageService implements OnModuleDestroy {
       return { count, sizeBytes };
     }
 
-    const files = await this.listFiles();
+    // The uncapped walk, for the same reason createExportStream uses it: this is the pre-check an
+    // operator runs BEFORE the export/import migration, so a count truncated at STORAGE_LIST_MAX_FILES
+    // would hide exactly the gap they are checking for.
+    const files = await this.listAllFiles();
     let sizeBytes = 0;
     for (const file of files) {
       try {
         const fullPath = path.join(this.localPath, file);
-        const stats = fs.statSync(fullPath);
+        // Awaited, not statSync: uncapping the walk above also uncapped this loop, and a synchronous
+        // stat per file holds the event loop for the whole store — health checks, webhooks and every
+        // in-flight request wait behind a count. Measured at one event-loop tick for 2000 files.
+        const stats = await fs.promises.stat(fullPath);
         sizeBytes += stats.size;
       } catch (error) {
         this.logger.debug(`Failed to stat file: ${file}`, { error: String(error) });
@@ -352,11 +393,24 @@ export class StorageService implements OnModuleDestroy {
   // ============================================================================
 
   createExportStream(): Promise<PassThrough> {
+    // Enumerated with iterateFiles(), NOT listFiles(). listFiles() stops at STORAGE_LIST_MAX_FILES
+    // and returns without logging or throwing — a per-call DoS guard, as its own doc says, and not a
+    // completeness contract. Spending it here made the documented local→S3 migration (export,
+    // repoint STORAGE_TYPE, import) leave media behind on the old backend silently, and the
+    // operator's own files/count pre-check was truncated by the same path, so the consistency check
+    // could not reveal the gap. An export exists to be complete; that is what the uncapped walk is for.
     return createExportStream(
-      () => this.listFiles(),
+      () => this.listAllFiles(),
       filePath => this.getFile(filePath),
       this.logger,
     );
+  }
+
+  /** Every key in the store, uncapped — the completeness counterpart to the capped listFiles(). */
+  private async listAllFiles(): Promise<string[]> {
+    const files: string[] = [];
+    for await (const file of this.iterateFiles()) files.push(file);
+    return files;
   }
 
   // Best-effort, NOT atomic: see the implementation in storage-transfer.ts for the full contract.

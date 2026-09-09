@@ -1,5 +1,11 @@
 import { Controller, Get, Optional } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse } from '@nestjs/swagger';
+import {
+  AvailableEngineDto,
+  InfraCurrentEngineResponseDto,
+  InfraHealthResponseDto,
+  InfraStatusResponseDto,
+} from './dto/infra-response.dto';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { QUEUE_NAMES } from '../queue/queue-names';
@@ -15,6 +21,7 @@ import { CacheService } from '../../common/cache/cache.service';
 import { StorageService } from '../../common/storage/storage.service';
 import { createLogger } from '../../common/services/logger.service';
 import { readGeneratedEnv } from './generated-env';
+import { isEnvPinned } from '../../config/env-precedence';
 
 interface InfraStatus {
   // `builtIn` reflects whether OpenWA's own bundled container is actually running and backing this
@@ -37,7 +44,18 @@ interface InfraStatus {
     webVersion?: string | null;
     webVersionSource?: 'pinned' | 'auto' | 'native';
   };
+  // Which of the settings this page can edit are supplied by a layer ABOVE data/.env.generated (the
+  // container environment or a project .env) and therefore cannot be changed from the dashboard until
+  // that layer is. Reported rather than inferred: a running-vs-saved mismatch is also what a save that
+  // has not been restarted yet looks like, and the two need opposite advice (#1082).
+  envPinned: string[];
 }
+
+/**
+ * The keys behind the Infrastructure page's four editable selections, in card order. Only these are
+ * reported: the page has no control for anything else, so naming other variables would be noise.
+ */
+const DASHBOARD_SELECTION_ENV_KEYS = ['DATABASE_TYPE', 'REDIS_ENABLED', 'STORAGE_TYPE', 'ENGINE_TYPE'];
 
 @ApiTags('infrastructure')
 @Controller('infra')
@@ -94,7 +112,7 @@ export class InfraStatusController {
   @Get('status')
   @RequireRole(ApiKeyRole.ADMIN)
   @ApiOperation({ summary: 'Get infrastructure status' })
-  @ApiResponse({ status: 200, description: 'Infrastructure status' })
+  @ApiResponse({ status: 200, description: 'Infrastructure status', type: InfraStatusResponseDto })
   async getStatus(): Promise<InfraStatus> {
     // Active DB liveness probe (SELECT 1) on both connections in parallel — not just isInitialized,
     // which stays true after a Postgres backend dies until an explicit .destroy() (see probeDbConnected).
@@ -204,6 +222,7 @@ export class InfraStatusController {
         browserArgs,
         ...(engineType === 'whatsapp-web.js' ? { webVersion, webVersionSource } : {}),
       },
+      envPinned: DASHBOARD_SELECTION_ENV_KEYS.filter(isEnvPinned),
     };
   }
 
@@ -224,7 +243,7 @@ export class InfraStatusController {
   @Get('engines')
   @RequireRole(ApiKeyRole.ADMIN)
   @ApiOperation({ summary: 'Get available WhatsApp engines' })
-  @ApiResponse({ status: 200, description: 'List of available engines' })
+  @ApiResponse({ status: 200, description: 'List of available engines', type: [AvailableEngineDto] })
   getEngines(): Array<{ id: string; name: string; enabled: boolean; features: string[] }> {
     return this.engineFactory.getAvailableEngines();
   }
@@ -232,7 +251,7 @@ export class InfraStatusController {
   @Get('engines/current')
   @RequireRole(ApiKeyRole.ADMIN)
   @ApiOperation({ summary: 'Get current active engine' })
-  @ApiResponse({ status: 200, description: 'Current engine info' })
+  @ApiResponse({ status: 200, description: 'Current engine info', type: InfraCurrentEngineResponseDto })
   getCurrentEngine(): { engineType: string } {
     return { engineType: this.engineFactory.getCurrentEngine() };
   }
@@ -240,7 +259,11 @@ export class InfraStatusController {
   @Get('health')
   @Public()
   @ApiOperation({ summary: 'Health check endpoint' })
-  @ApiResponse({ status: 200, description: 'Server is healthy' })
+  @ApiResponse({
+    status: 200,
+    description: 'Process is up. This route does not probe dependencies — read /infra/status for those.',
+    type: InfraHealthResponseDto,
+  })
   healthCheck(): { status: string; timestamp: string } {
     return {
       status: 'ok',

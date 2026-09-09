@@ -63,10 +63,37 @@ describe('SessionLidResolver', () => {
     expect(remember).toHaveBeenCalledWith('111', '628111222333', 's1');
   });
 
-  it('does not persist a miss', async () => {
+  it('persists a definitive null resolution so a stale mapping converges (#1058)', async () => {
     resolveContactPhone.mockResolvedValue(null);
 
     await resolver.resolveSenderPhone('s1', '404@lid');
+
+    expect(remember).toHaveBeenCalledWith('404', null, 's1');
+  });
+
+  it('does not persist a transient failure (engine rejects) as a null mapping', async () => {
+    resolveContactPhone.mockRejectedValue(new Error('socket closed'));
+
+    await resolver.resolveSenderPhone('s1', '111@lid');
+
+    expect(remember).not.toHaveBeenCalled();
+  });
+
+  // The wwjs adapter used to swallow every lookup failure into null, so this guard was dead on
+  // that engine: a dead page or rate-limit read as "no mapping" and clobbered a valid stored
+  // row. The adapter now rejects on failure (the HTTP boundary nulls instead), which is what
+  // makes the guard above real; this case pins that the persisted-negative path still fires for
+  // a DEFINITIVE null (the engine answered: no mapping).
+  it('persists a definitive null (the engine answered no-mapping) even on wwjs', async () => {
+    resolveContactPhone.mockResolvedValue(null);
+
+    await resolver.resolveSenderPhone('s1', '222@lid');
+
+    expect(remember).toHaveBeenCalledWith('222', null, 's1');
+  });
+
+  it('does not persist when there is no live engine (transient, not definitive)', async () => {
+    await resolver.resolveSenderPhone('not-started', '111@lid');
 
     expect(remember).not.toHaveBeenCalled();
   });
