@@ -2,7 +2,7 @@ import { ConfigService } from '@nestjs/config';
 import { ModuleRef } from '@nestjs/core';
 import { PluginLoaderService } from './plugin-loader.service';
 import { PluginStorageService } from './plugin-storage.service';
-import { HookManager } from '../hooks';
+import { HookContext, HookEvent, HookHandler, HookManager } from '../hooks';
 import { IPlugin, PluginInstance, PluginManifest, PluginStatus, PluginType } from './plugin.interfaces';
 import { PluginWorkerHost } from './sandbox/plugin-worker-host';
 import { PluginLogLevel } from './sandbox/protocol';
@@ -21,6 +21,7 @@ class TestableLoader extends PluginLoaderService {
   capturedOnHookSubscribe?: (event: string, priority?: number) => void;
   capturedOnLog?: (level: PluginLogLevel, message: string, meta?: Record<string, unknown>) => void;
   capturedOnWorkerExit?: (code: number, intentional: boolean) => void;
+  capturedOnUnresponsive?: () => void;
   protected createSandboxHost(
     _capDispatcher?: (verb: string, args: unknown[]) => Promise<unknown>,
     onHookSubscribe?: (event: string, priority?: number) => void,
@@ -29,10 +30,12 @@ class TestableLoader extends PluginLoaderService {
     _runWithHookGuard?: (inFlightEvents: string[], run: () => Promise<unknown>) => Promise<unknown>,
     _onSearchProviderRegister?: () => void,
     onWorkerExit?: (code: number, intentional: boolean) => void,
+    onUnresponsive?: () => void,
   ): PluginWorkerHost {
     this.capturedOnHookSubscribe = onHookSubscribe;
     this.capturedOnLog = onLog;
     this.capturedOnWorkerExit = onWorkerExit;
+    this.capturedOnUnresponsive = onUnresponsive;
     const host: FakeHost = {
       load: jest.fn().mockResolvedValue(undefined),
       runLifecycle: jest.fn().mockResolvedValue(undefined),
@@ -123,6 +126,27 @@ describe('PluginLoaderService — sandbox tier routing', () => {
     expect((loader as unknown as { sandboxHosts: Map<string, unknown> }).sandboxHosts.has('p1')).toBe(false);
   });
 
+  it('runs the worker onDisable and terminate once when shutdown overlaps a disable in flight', async () => {
+    const loader = makeLoader();
+    seed(loader, { builtIn: false, instance: null });
+    await loader.enablePlugin('p1');
+    const host = loader.hosts[0];
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => (release = resolve));
+    host.runLifecycle.mockClear().mockReturnValueOnce(gate);
+
+    const disabling = loader.disablePlugin('p1');
+    const destroying = loader.onModuleDestroy();
+    release();
+    await disabling;
+    await destroying;
+
+    expect(host.runLifecycle).toHaveBeenCalledTimes(1);
+    expect(host.runLifecycle).toHaveBeenCalledWith('onDisable', expect.any(Number));
+    expect(host.terminate).toHaveBeenCalledTimes(1);
+    expect(pluginOf(loader).status).toBe(PluginStatus.DISABLED);
+  });
+
   it('dedups duplicate hook-subscribe from the worker so a flood cannot grow the host registry', async () => {
     const loader = makeLoader();
     seed(loader, { builtIn: false, instance: null });
@@ -163,6 +187,72 @@ describe('PluginLoaderService — sandbox tier routing', () => {
     expect(registerSpy.mock.calls.filter(c => c[1] === 'message:received')).toHaveLength(1);
   });
 
+  it('runs the shim at the lowest priority the worker asked for, and ignores a non-numeric one', async () => {
+    const loader = makeLoader();
+    seed(loader, { builtIn: false, instance: null });
+    const hookManager = (loader as unknown as { hookManager: HookManager }).hookManager;
+    const order: string[] = [];
+    hookManager.register('other', 'message:sending', () => {
+      order.push('other@100');
+      return Promise.resolve({ continue: true });
+    });
+    await loader.enablePlugin('p1');
+    loader.hosts[0].dispatchHook.mockImplementation(() => {
+      order.push('p1');
+      return Promise.resolve({ continue: true });
+    });
+
+    // The worker's first handler asks for 200; a later one for 1 (it re-subscribes); junk is ignored.
+    loader.capturedOnHookSubscribe!('message:sending', 200);
+    loader.capturedOnHookSubscribe!('message:sending', 1);
+    loader.capturedOnHookSubscribe!('message:sending', 'high' as unknown as number);
+    loader.capturedOnHookSubscribe!('message:sending', NaN);
+    await hookManager.execute('message:sending', {}, { source: 't' });
+
+    expect(order).toEqual(['p1', 'other@100']);
+    expect(hookManager.getRegisteredHooks()['message:sending']).toEqual([
+      { pluginId: 'p1', priority: 1 },
+      { pluginId: 'other', priority: 100 },
+    ]);
+  });
+
+  it('forwards the host in-flight chain to the worker with each dispatch', async () => {
+    const loader = makeLoader();
+    seed(loader, { builtIn: false, instance: null });
+    const hookManager = (loader as unknown as { hookManager: HookManager }).hookManager;
+    await loader.enablePlugin('p1');
+    loader.capturedOnHookSubscribe!('message:sent');
+
+    await hookManager.runInFlight(['message:sending'], () =>
+      hookManager.execute('message:sent', {}, { sessionId: 's1', source: 't' }),
+    );
+
+    expect(loader.hosts[0].dispatchHook).toHaveBeenCalledWith(
+      expect.objectContaining({ event: 'message:sent', inFlight: ['message:sending', 'message:sent'] }),
+    );
+  });
+
+  it('reports a sandboxed plugin with no live worker as unhealthy (crashed or disabled)', async () => {
+    const loader = makeLoader();
+    seed(loader, { builtIn: false, instance: null });
+    await loader.enablePlugin('p1');
+    jest
+      .spyOn((loader as unknown as { logger: { warn: jest.Mock } }).logger, 'warn')
+      .mockImplementation(() => undefined);
+
+    loader.capturedOnWorkerExit!(1, false);
+    const crashed = await loader.checkPluginHealth('p1');
+    expect(crashed.healthy).toBe(false);
+    expect(crashed.message).toContain('worker exited unexpectedly');
+
+    pluginOf(loader).status = PluginStatus.DISABLED;
+    pluginOf(loader).error = undefined;
+    expect(await loader.checkPluginHealth('p1')).toEqual({
+      healthy: false,
+      message: 'plugin is not running (status disabled)',
+    });
+  });
+
   it('enables a built-in plugin in-process (no sandbox worker spawned)', async () => {
     const loader = makeLoader();
     const onEnable = jest.fn().mockResolvedValue(undefined);
@@ -177,13 +267,20 @@ describe('PluginLoaderService — sandbox tier routing', () => {
 });
 
 describe('PluginLoaderService — sandbox hook error surfacing', () => {
-  type Handler = (hookCtx: { data: unknown; sessionId?: string; source: string }) => Promise<unknown>;
-
   const loggerOf = (loader: TestableLoader): { warn: jest.Mock; log: jest.Mock } =>
     (loader as unknown as { logger: { warn: jest.Mock; log: jest.Mock } }).logger;
 
+  /** A context in the shape the emitters actually build — the shim reads `event` to route. */
+  const ctx = (event: HookEvent): HookContext => ({
+    event,
+    data: {},
+    sessionId: 's1',
+    timestamp: new Date(0),
+    source: 'Engine',
+  });
+
   /** Enable p1, subscribe it to `event`, and return the shim the loader registered for it. */
-  const setupShim = async (loader: TestableLoader, event: string): Promise<Handler> => {
+  const setupShim = async (loader: TestableLoader, event: HookEvent): Promise<HookHandler> => {
     seed(loader, { builtIn: false, instance: null });
     const hookManager = (loader as unknown as { hookManager: HookManager }).hookManager;
     const registerSpy = jest.spyOn(hookManager, 'register');
@@ -201,18 +298,18 @@ describe('PluginLoaderService — sandbox hook error surfacing', () => {
     loader.hosts[0].dispatchHook.mockResolvedValue({ continue: true, error: 'boom' });
     const warnSpy = jest.spyOn(loggerOf(loader), 'warn').mockImplementation(() => undefined);
 
-    await handler({ data: {}, sessionId: 's1', source: 'Engine' });
+    await handler(ctx('message:sent'));
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining("Sandboxed plugin p1 hook 'message:sent' handler failed: boom"),
       expect.objectContaining({ action: 'sandbox_hook_error', pluginId: 'p1', event: 'message:sent' }),
     );
 
     // A second failure inside the rate-limit window is counted, not logged again.
-    await handler({ data: {}, sessionId: 's1', source: 'Engine' });
+    await handler(ctx('message:sent'));
     expect(warnSpy).toHaveBeenCalledTimes(1);
 
     // The chain still fails open: the shim resolves continue:true for the hook manager.
-    await expect(handler({ data: {}, sessionId: 's1', source: 'Engine' })).resolves.toEqual({ continue: true });
+    await expect(handler(ctx('message:sent'))).resolves.toEqual({ continue: true });
 
     // The health surface carries the last hook error without overriding the worker's own verdict.
     const health = await loader.checkPluginHealth('p1');
@@ -235,7 +332,7 @@ describe('PluginLoaderService — sandbox hook error surfacing', () => {
     loader.hosts[0].dispatchHook.mockResolvedValue({ continue: true, error: 'boom' });
     jest.spyOn(loggerOf(loader), 'warn').mockImplementation(() => undefined);
 
-    await handler({ data: {}, sessionId: 's1', source: 'Engine' });
+    await handler(ctx('message:sent'));
     expect((await loader.checkPluginHealth('p1')).message).toContain('last hook error');
 
     // Worker crashes (intentional=false): the host is dropped without any disable running.
@@ -252,13 +349,99 @@ describe('PluginLoaderService — sandbox hook error surfacing', () => {
     loader.hosts[0].dispatchHook.mockResolvedValue({ continue: false, data: { n: 1 } });
     const warnSpy = jest.spyOn(loggerOf(loader), 'warn').mockImplementation(() => undefined);
 
-    await expect(handler({ data: {}, sessionId: 's1', source: 'Engine' })).resolves.toEqual({
+    await expect(handler(ctx('message:sent'))).resolves.toEqual({
       continue: false,
       data: { n: 1 },
     });
     expect(warnSpy).not.toHaveBeenCalled();
     const health = await loader.checkPluginHealth('p1');
     expect(health.message ?? '').not.toContain('last hook error');
+  });
+});
+
+describe('PluginLoaderService - blocked sandbox worker', () => {
+  const loggerOf = (loader: TestableLoader): { warn: jest.Mock } =>
+    (loader as unknown as { logger: { warn: jest.Mock } }).logger;
+  const hostsOf = (loader: TestableLoader): Map<string, unknown> =>
+    (loader as unknown as { sandboxHosts: Map<string, unknown> }).sandboxHosts;
+  const storageOf = (loader: TestableLoader): { setPluginStatus: jest.Mock } =>
+    (loader as unknown as { pluginStorage: { setPluginStatus: jest.Mock } }).pluginStorage;
+
+  it('terminates an unresponsive worker and leaves the plugin in ERROR with its hooks removed', async () => {
+    const loader = makeLoader();
+    seed(loader, { builtIn: false, instance: null });
+    const hookManager = (loader as unknown as { hookManager: HookManager }).hookManager;
+    const unregisterSpy = jest.spyOn(hookManager, 'unregisterPlugin');
+    const warnSpy = jest.spyOn(loggerOf(loader), 'warn').mockImplementation(() => undefined);
+    await loader.enablePlugin('p1');
+    const host = loader.hosts[0];
+
+    loader.capturedOnUnresponsive!();
+
+    const plugin = pluginOf(loader);
+    expect(plugin.status).toBe(PluginStatus.ERROR);
+    expect(plugin.error).toMatch(/unresponsive/);
+    expect(storageOf(loader).setPluginStatus).toHaveBeenCalledWith('p1', PluginStatus.ERROR);
+    expect(unregisterSpy).toHaveBeenCalledWith('p1');
+    expect(hostsOf(loader).has('p1')).toBe(false);
+    expect(host.terminate).toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('p1'),
+      expect.objectContaining({ action: 'sandbox_worker_unresponsive', pluginId: 'p1' }),
+    );
+
+    // The deliberate terminate() then exits the worker; that must not undo or repeat the above.
+    loader.capturedOnWorkerExit!(1, true);
+    expect(pluginOf(loader).status).toBe(PluginStatus.ERROR);
+  });
+
+  it('ignores a late report from a worker generation that has already been replaced', async () => {
+    const loader = makeLoader();
+    seed(loader, { builtIn: false, instance: null });
+    await loader.enablePlugin('p1');
+    const staleReport = loader.capturedOnUnresponsive!;
+    await loader.disablePlugin('p1');
+    await loader.enablePlugin('p1');
+    const current = loader.hosts[1];
+
+    staleReport();
+
+    expect(pluginOf(loader).status).toBe(PluginStatus.ENABLED);
+    expect(hostsOf(loader).get('p1')).toBe(current);
+    expect(current.terminate).not.toHaveBeenCalled();
+  });
+
+  it('rate-limits the hook timeout warn per event and surfaces the timeout in plugin health', async () => {
+    const loader = makeLoader();
+    seed(loader, { builtIn: false, instance: null });
+    const hookManager = (loader as unknown as { hookManager: HookManager }).hookManager;
+    const registerSpy = jest.spyOn(hookManager, 'register');
+    await loader.enablePlugin('p1');
+    loader.capturedOnHookSubscribe!('message:received');
+    const handler = registerSpy.mock.calls.find(c => c[1] === 'message:received')![2];
+    loader.hosts[0].dispatchHook.mockImplementation((options: { onTimeout?: () => void }) => {
+      options.onTimeout?.();
+      return Promise.resolve({ continue: true });
+    });
+    const warnSpy = jest.spyOn(loggerOf(loader), 'warn').mockImplementation(() => undefined);
+    const hookCtx: HookContext = {
+      event: 'message:received',
+      data: {},
+      sessionId: 's1',
+      timestamp: new Date(0),
+      source: 'Engine',
+    };
+
+    await handler(hookCtx);
+    await handler(hookCtx);
+
+    const timeoutWarns = warnSpy.mock.calls.filter(
+      c => (c[1] as { action?: string } | undefined)?.action === 'sandbox_hook_timeout',
+    );
+    expect(timeoutWarns).toHaveLength(1);
+    const health = await loader.checkPluginHealth('p1');
+    expect(health.message).toContain("last hook error in 'message:received'");
+    expect(health.message).toContain('timed out');
   });
 });
 
@@ -316,6 +499,17 @@ describe('PluginLoaderService — sandbox log relay bounds', () => {
     expect(warnSpy).toHaveBeenCalledTimes(1);
   });
 
+  it('relays an unknown worker log level as log instead of throwing', async () => {
+    // Plugin code can post to parentPort directly, so the level is untrusted: `logger.info` does not exist.
+    const loader = makeLoader();
+    seed(loader, { builtIn: false, instance: null });
+    await loader.enablePlugin('p1');
+    const logSpy = jest.spyOn(loggerOf(loader), 'log').mockImplementation(() => undefined);
+
+    expect(() => loader.capturedOnLog!('info' as PluginLogLevel, 'hello')).not.toThrow();
+    expect(logSpy).toHaveBeenCalledWith('[p1] hello', { pluginId: 'p1' });
+  });
+
   it('truncates an oversized worker log line before relaying it', async () => {
     const loader = makeLoader();
     seed(loader, { builtIn: false, instance: null });
@@ -328,5 +522,62 @@ describe('PluginLoaderService — sandbox log relay bounds', () => {
     const relayed = logSpy.mock.calls[0][0] as string;
     expect(relayed).toContain('…[truncated]');
     expect(relayed.length).toBe('[p1] '.length + 8192 + '…[truncated]'.length);
+  });
+
+  it('bounds a non-string worker log message like a string one', async () => {
+    // Plugin code can post to parentPort directly, so the message is untrusted and may not be a string.
+    const loader = makeLoader();
+    seed(loader, { builtIn: false, instance: null });
+    await loader.enablePlugin('p1');
+    const logSpy = jest.spyOn(loggerOf(loader), 'log').mockImplementation(() => undefined);
+
+    loader.capturedOnLog!('log', ['x'.repeat(6000), 'y'.repeat(6000)] as unknown as string);
+
+    const relayed = logSpy.mock.calls[0][0] as string;
+    expect(relayed.length).toBe('[p1] '.length + 8192 + '…[truncated]'.length);
+  });
+
+  it('replaces an oversized worker log meta with a size marker instead of relaying it', async () => {
+    const loader = makeLoader();
+    seed(loader, { builtIn: false, instance: null });
+    await loader.enablePlugin('p1');
+    const logSpy = jest.spyOn(loggerOf(loader), 'log').mockImplementation(() => undefined);
+
+    loader.capturedOnLog!('log', 'big', { data: 'x'.repeat(20000) });
+    loader.capturedOnLog!('log', 'small', { n: 1 });
+
+    expect(logSpy).toHaveBeenNthCalledWith(1, '[p1] big', {
+      metaTruncated: true,
+      metaLength: 20011,
+      pluginId: 'p1',
+    });
+    expect(logSpy).toHaveBeenNthCalledWith(2, '[p1] small', { n: 1, pluginId: 'p1' });
+  });
+
+  it('keeps the error text of a worker error log whose meta is oversized or not serializable', async () => {
+    // logger.error's reason travels as meta.error, and the host error call gets no trace argument.
+    const loader = makeLoader();
+    seed(loader, { builtIn: false, instance: null });
+    await loader.enablePlugin('p1');
+    const errorSpy = jest
+      .spyOn((loader as unknown as { logger: { error: jest.Mock } }).logger, 'error')
+      .mockImplementation(() => undefined);
+
+    loader.capturedOnLog!('error', 'big', { data: 'x'.repeat(20000), error: 'boom' });
+    loader.capturedOnLog!('error', 'bigint', { n: 1n, error: 'boom' });
+    loader.capturedOnLog!('error', 'long', { error: 'e'.repeat(10000) });
+    loader.capturedOnLog!('error', 'nullmeta', null as unknown as Record<string, unknown>);
+
+    expect(errorSpy).toHaveBeenNthCalledWith(1, '[p1] big', 'undefined', {
+      error: 'boom',
+      metaTruncated: true,
+      metaLength: 20026,
+      pluginId: 'p1',
+    });
+    expect(errorSpy).toHaveBeenNthCalledWith(2, '[p1] bigint', 'undefined', { error: 'boom', pluginId: 'p1' });
+    const longMeta = errorSpy.mock.calls[2][2] as { error: string; metaTruncated: boolean };
+    expect(longMeta.metaTruncated).toBe(true);
+    expect(longMeta.error).toBe(`${'e'.repeat(8192)}…[truncated]`);
+    expect(errorSpy).toHaveBeenNthCalledWith(4, '[p1] nullmeta', 'undefined', { pluginId: 'p1' });
   });
 });

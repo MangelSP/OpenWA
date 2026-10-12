@@ -1,19 +1,16 @@
-@import url('https://fonts.googleapis.com/css2?family=Heebo:wght@400;500;600;700&display=swap');
-@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Arabic:wght@400;500;600;700&display=swap');
-
 :root {
-  font-family: 'Plus Jakarta Sans', system-ui, Avenir, Helvetica, Arial, sans-serif;
+  font-family: 'Plus Jakarta Sans Variable', 'Plus Jakarta Sans', system-ui, Avenir, Helvetica, Arial, sans-serif;
   line-height: 1.6;
   font-weight: 400;
 }
 
 html[lang='he'],
 html[dir='rtl'] {
-  font-family: 'Heebo', 'Rubik', 'Noto Sans Hebrew', 'Segoe UI', Arial, sans-serif;
+  font-family: 'Heebo Variable', 'Heebo', 'Rubik', 'Noto Sans Hebrew', 'Segoe UI', Arial, sans-serif;
 }
 
 html[lang='ar'] {
-  font-family: 'Noto Sans Arabic', 'Cairo', 'Tajawal', 'Segoe UI', Arial, sans-serif;
+  font-family: 'Noto Sans Arabic Variable', 'Noto Sans Arabic', 'Cairo', 'Tajawal', 'Segoe UI', Arial, sans-serif;
 }
 
 :root {
@@ -305,7 +302,7 @@ select:disabled {
 .btn-icon:hover {
   background: rgba(239, 68, 68, 0.12);
   border-color: rgba(239, 68, 68, 0.3);
-  color: var(--error);
+  color: var(--error-text);
 }
 
 .btn-icon:hover svg {
@@ -347,7 +344,9 @@ select:disabled {
   gap: 0.5rem;
   padding: 0.75rem 1.25rem;
   background: var(--primary, #25d366);
-  color: #fff;
+  /* Dark text on the WhatsApp green: 9.0:1 (AAA). White was 1.98:1, failing even the AA
+     large-text floor - the single worst contrast pair in the dashboard. */
+  color: #0f172a;
   border: none;
   border-radius: 8px;
   font-size: 0.9375rem;

@@ -73,8 +73,8 @@ export class SessionEngineLeafEvents {
       const mediaMaxBytes =
         this.configService?.get<number>('status.mediaMaxBytes', DEFAULT_MEDIA_MAX_BYTES) ?? DEFAULT_MEDIA_MAX_BYTES;
       const messages = await engine.getChatHistory('status@broadcast', STATUS_SEED_LIMIT, true, mediaMaxBytes);
-      // getChatHistory maps a message's contact from the sync cache only, so status posters (usually
-      // @lid ids) come back nameless. Resolve each unique poster once via getContactById — the same
+      // getChatHistory resolves each poster's contact, but a lookup that failed or found no name leaves
+      // the status nameless (usually an @lid poster). Resolve each once via getContactById — the same
       // lookup the contacts API uses, which maps the @lid to the real contact — so a seeded status
       // carries the poster's name like a live one does. Cached per JID: one lookup per contact, not
       // one per status.
@@ -127,10 +127,11 @@ export class SessionEngineLeafEvents {
 
   /**
    * Fan a neutral engine GroupEvent out to consumers: the WebSocket room and the webhook stream.
-   * The `kind` selects the event name (`group.join` / `group.leave` / `group.update`); the payload
-   * is the same plain camelCase shape on both channels, with `kind` itself carried by the name.
-   * There is no persistence here — group membership/metadata lives in the engine, not the message
-   * store — so unlike message edits there is nothing to apply before notifying.
+   * The `kind` selects the event name (`group.join` / `group.leave` / `group.update` /
+   * `group.join_request`); the payload is the same plain camelCase shape on both channels, with
+   * `kind` itself carried by the name. There is no persistence here — group membership/metadata
+   * lives in the engine, not the message store — so unlike message edits there is nothing to
+   * apply before notifying.
    */
   dispatchGroupEvent(id: string, event: GroupEvent): void {
     const payload: Record<string, unknown> = {
@@ -158,6 +159,10 @@ export class SessionEngineLeafEvents {
       case 'update':
         this.eventsGateway.emitGroupUpdate(id, payload);
         void this.webhookService.dispatch(id, 'group.update', payload);
+        break;
+      case 'join_request':
+        this.eventsGateway.emitGroupJoinRequest(id, payload);
+        void this.webhookService.dispatch(id, 'group.join_request', payload);
         break;
     }
   }
@@ -197,6 +202,7 @@ export class SessionEngineLeafEvents {
         sessionId: id,
         callId,
         error: err instanceof Error ? err.message : String(err),
+        action: 'call_auto_reject_failed',
       });
     }
   }

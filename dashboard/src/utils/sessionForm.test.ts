@@ -44,6 +44,13 @@ test('the length cap is 50', () => {
   assert.deepEqual(sessionNameIssues('a'.repeat(51), []), ['too-long']);
 });
 
+test('the gateway rejects a name under 3 characters, so the form does too', () => {
+  assert.deepEqual(sessionNameIssues('ab', []), ['too-short']);
+  assert.deepEqual(sessionNameIssues('a', ['a']), ['too-short'], 'duplicate stays suppressed');
+  assert.deepEqual(sessionNameIssues('abc', []), []);
+  assert.equal(canCreateSession('ab', []), false);
+});
+
 test('pairing accepts a bare international number and nothing else', () => {
   assert.equal(isValidPairingPhone('628123456789'), true);
   assert.equal(isValidPairingPhone('  628123456789  '), true, 'trimmed');
@@ -78,8 +85,21 @@ test('filterSessions combines the search box and the status group', () => {
     { id: 'u3', name: 'sales-backup', status: 'disconnected' },
   ];
 
-  assert.deepEqual(filterSessions(sessions, 'sales', 'all').map(s => s.id), ['u1', 'u3']);
-  assert.deepEqual(filterSessions(sessions, 'sales', 'inactive').map(s => s.id), ['u3']);
-  assert.deepEqual(filterSessions(sessions, '', 'active').map(s => s.id), ['u1']);
-  assert.deepEqual(filterSessions(sessions, 'u2', 'all').map(s => s.id), ['u2'], 'id matches too');
+  assert.deepEqual(
+    filterSessions(sessions, 'sales', 'all').map(s => s.id),
+    ['u1', 'u3'],
+  );
+  assert.deepEqual(
+    filterSessions(sessions, 'sales', 'inactive').map(s => s.id),
+    ['u3'],
+  );
+  assert.deepEqual(
+    filterSessions(sessions, '', 'active').map(s => s.id),
+    ['u1'],
+  );
+  assert.deepEqual(
+    filterSessions(sessions, 'u2', 'all').map(s => s.id),
+    ['u2'],
+    'id matches too',
+  );
 });

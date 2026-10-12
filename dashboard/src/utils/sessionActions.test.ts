@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  awaitsPairing,
   canForceKillSession,
   canUnlinkSession,
   classifyUnlinkError,
@@ -119,7 +120,10 @@ test('replaceSession: unrelated rows keep their identity and order', () => {
   const updated = makeSession({ id: 'b', status: 'disconnected' });
   const result = replaceSession([a, b, c], updated);
 
-  assert.deepEqual(result.map(s => s.id), ['a', 'b', 'c']);
+  assert.deepEqual(
+    result.map(s => s.id),
+    ['a', 'b', 'c'],
+  );
   assert.equal(result[0], a, 'unrelated row keeps identity');
   assert.equal(result[2], c, 'unrelated row keeps identity');
   assert.equal(result[1], updated, 'matching row is the exact response object');
@@ -138,7 +142,10 @@ test('replaceSession: a response whose id is absent does not drop other rows (no
   const b = makeSession({ id: 'b' });
   const orphan = makeSession({ id: 'zzz', status: 'disconnected' });
   const result = replaceSession([a, b], orphan);
-  assert.deepEqual(result.map(s => s.id), ['a', 'b']);
+  assert.deepEqual(
+    result.map(s => s.id),
+    ['a', 'b'],
+  );
   assert.equal(result[0], a);
   assert.equal(result[1], b);
 });
@@ -184,4 +191,29 @@ test('classifyUnlinkError: everything else is generic', () => {
   }
   assert.equal(classifyUnlinkError(new Error('network down')), 'generic'); // no status at all
   assert.equal(classifyUnlinkError(undefined), 'generic');
+});
+
+// The card body: a session that has never been paired gets the QR placeholder, a linked one that is
+// merely reconnecting keeps its identity rows. `initializing` is the status that means both.
+test('awaitsPairing: qr_ready always awaits pairing, phone or not', () => {
+  assert.equal(awaitsPairing(makeSession({ status: 'qr_ready', phone: null })), true);
+  assert.equal(awaitsPairing(makeSession({ status: 'qr_ready', phone: '+155512345' })), true);
+});
+
+test('awaitsPairing: initializing without a phone is a first pairing', () => {
+  assert.equal(awaitsPairing(makeSession({ status: 'initializing', phone: null })), true);
+  assert.equal(awaitsPairing(makeSession({ status: 'initializing', phone: '' })), true);
+});
+
+test('awaitsPairing: initializing WITH a phone is a linked session reconnecting', () => {
+  // The regression this guards: a Baileys transient close parks a still-linked session at
+  // INITIALIZING for the whole backoff, and the card used to paint it as an unpaired account.
+  assert.equal(awaitsPairing(makeSession({ status: 'initializing', phone: '+155512345' })), false);
+});
+
+test('awaitsPairing: no other status ever takes the placeholder', () => {
+  for (const status of ['created', 'authenticating', 'ready', 'disconnected', 'action_required', 'failed'] as const) {
+    assert.equal(awaitsPairing(makeSession({ status, phone: null })), false, status);
+    assert.equal(awaitsPairing(makeSession({ status, phone: '+155512345' })), false, status);
+  }
 });

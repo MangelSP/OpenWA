@@ -9,6 +9,8 @@ import { RedisThrottlerStorage } from './common/throttler/redis-throttler.storag
 import { createThrottlerRedisClient } from './common/throttler/throttler-redis.client';
 import configuration from './config/configuration';
 import { validateEnv } from './config/env.validation';
+import { createBootDataSource } from './database/pg-boot-migrations';
+import { createMainDataSource, mainConnectionOptions, SQLITE_BUSY_TIMEOUT_MS } from './database/main-connection';
 import { SessionModule } from './modules/session/session.module';
 import { MessageModule } from './modules/message/message.module';
 import { TemplateModule } from './modules/template/template.module';
@@ -32,7 +34,11 @@ import { StorageModule } from './common/storage/storage.module';
 import { StatsModule } from './modules/stats/stats.module';
 import { MetricsModule } from './modules/metrics/metrics.module';
 import { StatusModule } from './modules/status/status.module';
+import { MediaModule } from './modules/media/media.module';
 import { StatusStoreModule } from './modules/status-store/status-store.module';
+import { ChatMediaModule } from './modules/chat-media/chat-media.module';
+import { AutomationModule } from './modules/automation/automation.module';
+import { TakeoverModule } from './modules/takeover/takeover.module';
 import { CatalogModule } from './modules/catalog/catalog.module';
 import { HooksModule } from './core/hooks';
 import { PluginsModule } from './core/plugins';
@@ -40,6 +46,7 @@ import { PluginsApiModule } from './modules/plugins/plugins.module';
 import { AgentToolsModule } from './core/agent-tools/agent-tools.module';
 import { IntegrationModule } from './modules/integration/integration.module';
 import { SearchModule } from './modules/search/search.module';
+import { SqlitePermissionsBoot } from './database/sqlite-file-permissions';
 
 // Only import QueueModule if explicitly enabled to avoid Redis connection errors
 const queueModules: Array<Type | DynamicModule> = [];
@@ -92,7 +99,7 @@ if (dashboardServingEnabled && dashboardBuildPresent) {
       // Let Nest own these so unknown API/socket routes return real 404s/JSON rather
       // than the SPA index.html fallback (Express 5 / path-to-regexp v8 wildcard syntax).
       exclude: ['/api/{*splat}', '/socket.io/{*splat}', '/mcp', '/mcp/{*splat}'],
-      // Disable this module's OWN catch-all SPA fallback. main.ts already serves dashboard
+      // Disable this module's OWN catch-all SPA fallback. configure-app.ts already serves dashboard
       // documents (it injects the per-response CSP nonce, which is why it must own them), and
       // that handler is correctly narrow: it skips /assets and only answers extensionless paths
       // or explicit text/html navigations. The built-in fallback here is not narrow — it answers
@@ -123,27 +130,10 @@ if (dashboardServingEnabled && dashboardBuildPresent) {
       name: 'main',
       imports: [ConfigModule],
       inject: [ConfigService],
-      useFactory: (configService: ConfigService) => {
-        // Default ON for zero-config first boot. When disabled
-        // (MAIN_DATABASE_SYNCHRONIZE=false), the main-owned migrations create the
-        // api_keys/audit_logs schema instead — never both at once.
-        const synchronize = configService.get<boolean>('database.synchronize', true);
-        return {
-          name: 'main',
-          type: 'better-sqlite3' as const,
-          database: configService.get<string>('database.database', './data/main.sqlite'),
-          entities: [
-            __dirname + '/modules/auth/**/*.entity{.ts,.js}',
-            __dirname + '/modules/audit/**/*.entity{.ts,.js}',
-          ],
-          // Dedicated migrations dir for the main connection only (must NOT run the
-          // data-connection migrations, which target session/webhook/message tables).
-          migrations: [__dirname + '/database/migrations-main/*{.ts,.js}'],
-          synchronize,
-          migrationsRun: !synchronize,
-          logging: configService.get<boolean>('database.logging', false),
-        };
-      },
+      // Migrations always, then synchronize on MAIN_DATABASE_SYNCHRONIZE=true; the factory refuses a
+      // file whose schema does not match this release (see main-connection.ts).
+      useFactory: (configService: ConfigService) => mainConnectionOptions(configService),
+      dataSourceFactory: createMainDataSource,
     }),
 
     // Data Storage Database (pluggable - user data)
@@ -151,6 +141,10 @@ if (dashboardServingEnabled && dashboardBuildPresent) {
       name: 'data',
       imports: [ConfigModule],
       inject: [ConfigService],
+      // The postgres branch runs its boot migrations under a cross-replica advisory lock inside
+      // this factory (see pg-boot-migrations.ts) instead of TypeORM's unsynchronized built-in
+      // migrationsRun; the sqlite branches keep the library's default construction + initialize.
+      dataSourceFactory: createBootDataSource,
       useFactory: (configService: ConfigService) => {
         const dbType = configService.get<'sqlite' | 'postgres'>('dataDatabase.type', 'sqlite');
         const baseConfig = {
@@ -162,6 +156,7 @@ if (dashboardServingEnabled && dashboardBuildPresent) {
             __dirname + '/engine/**/*.entity{.ts,.js}',
             __dirname + '/modules/integration/**/*.entity{.ts,.js}',
             __dirname + '/modules/status-store/**/*.entity{.ts,.js}',
+            __dirname + '/modules/automation/**/*.entity{.ts,.js}',
           ],
           migrations: [__dirname + '/database/migrations/*{.ts,.js}'],
           logging: configService.get<boolean>('dataDatabase.logging', false),
@@ -193,7 +188,11 @@ if (dashboardServingEnabled && dashboardBuildPresent) {
                 }
               : false,
 
-            // Never auto-sync Postgres in production; rely on migrations.
+            // Never auto-sync Postgres in production; rely on migrations. Boot migrations execute
+            // inside createBootDataSource (dataSourceFactory above) under the advisory lock — this
+            // flag states the intent and remains the built-in fallback if that factory is ever
+            // bypassed (the factory constructs the DataSource with migrationsRun:false and calls
+            // runMigrations() itself while holding the lock).
             synchronize: configService.get<boolean>('dataDatabase.synchronize', false),
             migrationsRun: true,
             retryAttempts: 10,
@@ -201,9 +200,9 @@ if (dashboardServingEnabled && dashboardBuildPresent) {
             extra: {
               max: configService.get<number>('dataDatabase.poolSize', 10),
               // Runtime query/pool timeouts so a stuck query or saturated pool fails fast instead of
-              // hanging requests. statement_timeout bounds live runtime queries; the boot migrations
-              // (migrationsRun above) reset it to 0 per-transaction via SET LOCAL, so a long
-              // CREATE INDEX / backfill at boot is never aborted by it.
+              // hanging requests. statement_timeout applies to the runtime pool only: the boot
+              // migration chain runs on a separate pool built without it (pg-boot-migrations.ts),
+              // so a long CREATE INDEX / backfill at boot is never aborted by it.
               statement_timeout: configService.get<number>('dataDatabase.statementTimeoutMs', 30000),
               idleTimeoutMillis: configService.get<number>('dataDatabase.idleTimeoutMs', 30000),
               connectionTimeoutMillis: configService.get<number>('dataDatabase.connectionTimeoutMs', 10000),
@@ -224,6 +223,7 @@ if (dashboardServingEnabled && dashboardBuildPresent) {
           name: 'data',
           type: 'better-sqlite3' as const,
           database: configService.get<string>('dataDatabase.database', './data/openwa.sqlite'),
+          timeout: SQLITE_BUSY_TIMEOUT_MS,
           synchronize,
           migrationsRun: !synchronize,
         };
@@ -258,9 +258,7 @@ if (dashboardServingEnabled && dashboardBuildPresent) {
         // API. The client is built fail-fast (see throttler-redis.client.ts) so that fail-open
         // engages immediately instead of after a queue/timeout stall per request.
         const redisStorage =
-          process.env.REDIS_ENABLED === 'true'
-            ? new RedisThrottlerStorage(createThrottlerRedisClient(configService))
-            : undefined;
+          process.env.REDIS_ENABLED === 'true' ? new RedisThrottlerStorage(createThrottlerRedisClient()) : undefined;
         return { throttlers, ...(redisStorage ? { storage: redisStorage } : {}) };
       },
     }),
@@ -292,7 +290,11 @@ if (dashboardServingEnabled && dashboardBuildPresent) {
     StatsModule, // Phase 3: Statistics Dashboard
     MetricsModule, // Prometheus /api/metrics
     StatusModule, // Phase 3: Status/Stories API
+    MediaModule, // Server-side media conversion (opt-in)
     StatusStoreModule, // Phase 3: inbound status/story TTL store (24h purge + media persistence)
+    ChatMediaModule, // opt-in chat-media archive (retention purge + orphan sweep)
+    AutomationModule, // single-message autoreply rules, evaluated on the inbound dispatch
+    TakeoverModule, // adopts sessions whose holder's lease lapsed (crashed peer / recreated node)
     CatalogModule, // Phase 3: Catalog API (WhatsApp Business)
     PluginsApiModule, // Phase 5: Plugins API
     AgentToolsModule, // Agent-invocable tool registry (protocol-neutral)
@@ -301,5 +303,9 @@ if (dashboardServingEnabled && dashboardBuildPresent) {
     ...mcpModules, // MCP Streamable-HTTP server (opt-in via MCP_ENABLED=true)
     ...serveStaticModules, // Bundled dashboard SPA (production single-port setup)
   ],
+  // Runs after every DataSource has initialized (they initialize eagerly in their provider
+  // factories, and onApplicationBootstrap fires after every onModuleInit), tightening the SQLite
+  // files that better-sqlite3 created with umask permissions back to owner-only.
+  providers: [SqlitePermissionsBoot],
 })
 export class AppModule {}

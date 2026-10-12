@@ -2,6 +2,7 @@ import { SessionLidResolver } from './session-lid-resolver.service';
 import { EngineRegistry } from '../../engine/engine-registry.service';
 import type { IWhatsAppEngine } from '../../engine/interfaces/whatsapp-engine.interface';
 import type { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
+import { LidNotMappedError } from '../../common/errors/lid-not-mapped.error';
 
 describe('SessionLidResolver', () => {
   let engines: EngineRegistry;
@@ -53,6 +54,42 @@ describe('SessionLidResolver', () => {
     await expect(resolver.resolveSenderPhone('s1', '111@lid')).resolves.toBeNull();
   });
 
+  describe('a rejected lookup', () => {
+    let now: jest.SpyInstance<number, []>;
+    beforeEach(() => {
+      now = jest.spyOn(Date, 'now').mockReturnValue(1_000_000);
+    });
+    afterEach(() => now.mockRestore());
+
+    it('does not cache a transient failure, so the sender resolves once the engine answers', async () => {
+      resolveContactPhone.mockRejectedValueOnce(new Error('Evaluation failed')).mockResolvedValueOnce('628111');
+
+      await expect(resolver.resolveSenderPhone('s1', '111@lid')).resolves.toBeNull();
+      await expect(resolver.resolveSenderPhone('s1', '111@lid')).resolves.toBe('628111');
+      expect(resolveContactPhone).toHaveBeenCalledTimes(2);
+    });
+
+    it('retries an unmapped lid once the hold expires', async () => {
+      resolveContactPhone.mockRejectedValueOnce(new LidNotMappedError('111@lid')).mockResolvedValueOnce('628111');
+
+      await expect(resolver.resolveSenderPhone('s1', '111@lid')).resolves.toBeNull();
+      now.mockReturnValue(1_000_000 + 60_001);
+      await expect(resolver.resolveSenderPhone('s1', '111@lid')).resolves.toBe('628111');
+      expect(resolveContactPhone).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not retry an unmapped lid on every message from the same sender, and writes nothing', async () => {
+      resolveContactPhone.mockRejectedValue(new LidNotMappedError('404@lid'));
+
+      await expect(resolver.resolveSenderPhone('s1', '404@lid')).resolves.toBeNull();
+      now.mockReturnValue(1_000_000 + 59_000);
+      await expect(resolver.resolveSenderPhone('s1', '404@lid')).resolves.toBeNull();
+
+      expect(resolveContactPhone).toHaveBeenCalledTimes(1);
+      expect(remember).not.toHaveBeenCalled();
+    });
+  });
+
   it('returns null when the session has no live engine', async () => {
     await expect(resolver.resolveSenderPhone('not-started', '111@lid')).resolves.toBeNull();
   });
@@ -63,10 +100,37 @@ describe('SessionLidResolver', () => {
     expect(remember).toHaveBeenCalledWith('111', '628111222333', 's1');
   });
 
-  it('does not persist a miss', async () => {
+  it('persists a definitive null resolution so a stale mapping converges (#1058)', async () => {
     resolveContactPhone.mockResolvedValue(null);
 
     await resolver.resolveSenderPhone('s1', '404@lid');
+
+    expect(remember).toHaveBeenCalledWith('404', null, 's1');
+  });
+
+  it('does not persist a transient failure (engine rejects) as a null mapping', async () => {
+    resolveContactPhone.mockRejectedValue(new Error('socket closed'));
+
+    await resolver.resolveSenderPhone('s1', '111@lid');
+
+    expect(remember).not.toHaveBeenCalled();
+  });
+
+  // The wwjs adapter used to swallow every lookup failure into null, so this guard was dead on
+  // that engine: a dead page or rate-limit read as "no mapping" and clobbered a valid stored
+  // row. The adapter now rejects on failure (the HTTP boundary nulls instead), which is what
+  // makes the guard above real; this case pins that the persisted-negative path still fires for
+  // a DEFINITIVE null (the engine answered: no mapping).
+  it('persists a definitive null (the engine answered no-mapping) even on wwjs', async () => {
+    resolveContactPhone.mockResolvedValue(null);
+
+    await resolver.resolveSenderPhone('s1', '222@lid');
+
+    expect(remember).toHaveBeenCalledWith('222', null, 's1');
+  });
+
+  it('does not persist when there is no live engine (transient, not definitive)', async () => {
+    await resolver.resolveSenderPhone('not-started', '111@lid');
 
     expect(remember).not.toHaveBeenCalled();
   });

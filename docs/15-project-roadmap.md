@@ -40,8 +40,8 @@ timeline
                  : Bundled Traefik removed
                  : Bring-your-own reverse proxy
 
-    section v0.5.0-v0.12.x - Incremental Releases (Released)
-        Jun-Jul 2026 : Integration Fabric provisioning
+    section v0.5.0-v0.24.x - Incremental Releases (Released)
+        Jun-Sep 2026 : Integration Fabric provisioning
                      : Java & Go SDKs
                      : Live message edits
                      : Chat kind discriminator & status store
@@ -54,35 +54,36 @@ timeline
 
 ### Release Summary
 
-| Version | Focus                                                      | Status      |
-| ------- | ---------------------------------------------------------- | ----------- |
-| v0.0.1  | MVP - Basic API                                            | ✅ Released |
-| v0.0.2  | Production Ready                                           | ✅ Released |
-| v0.1.0  | Initial Stable Release                                     | ✅ Released |
-| v0.1.7  | Maintenance & fixes                                        | ✅ Released |
-| v0.1.8  | Maintenance & fixes                                        | ✅ Released |
-| v0.2.0  | i18n, Real-time Chats & Hardening                          | ✅ Released |
-| v0.2.1  | Dashboard split-origin fix                                 | ✅ Released |
-| v0.2.2  | Security hardening (SSRF, secrets, Prometheus metrics)     | ✅ Released |
-| v0.2.3  | Plain-HTTP / LAN dashboard fixes                           | ✅ Released |
-| v0.2.4  | CORS LAN fix, pinnable WA-Web version                      | ✅ Released |
-| v0.2.5  | Pairing-code linking                                       | ✅ Released |
-| v0.2.6  | Chromium hardened-container (read-only) fix                | ✅ Released |
-| v0.2.7  | Typing simulation, delete-chat, engine-agnostic groundwork | ✅ Released |
-| v0.2.8  | Engine decoupling (ack/type/JID), templates, @lid→phone    | ✅ Released |
-| v0.2.9  | Reliability/security/a11y hardening (RBAC, deps, shutdown, retention) | ✅ Released |
-| v0.2.10 | Dashboard/CI follow-ups (MessageTester JID, neutral MessageType, qemu v4) | ✅ Released |
-| v0.3.0  | Engine pluggability (Baileys engine, plugin layer)                              | ✅ Released |
-| v0.4.0  | Single-port deployment (dashboard on API port, Traefik removed)                 | ✅ Released |
-| v0.5.x  | Plugin/dashboard hardening and SDK/docs increments                              | ✅ Released |
-| v0.6.x  | Operational hardening, API surface refinements, dashboard follow-ups            | ✅ Released |
-| v0.7.x  | Dashboard chat UX, infra backup/restore, media-download toggle, infra follow-ups | ✅ Released |
-| v0.8.x  | Integration Fabric provisioning (instance API + dashboard tab), Java & Go SDKs   | ✅ Released |
-| v0.9.0  | Live message-edit events; `general.sessionTimeout` dropped from settings         | ✅ Released |
-| v0.10.x | Chat `kind` discriminator, 24-hour status store, Docker Hub dual-publish         | ✅ Released |
-| v0.11.0 | SDK poll / profile-picture / status-media coverage, security & reliability hardening | ✅ Released |
+| Version | Focus                                                                                                | Status      |
+| ------- | ---------------------------------------------------------------------------------------------------- | ----------- |
+| v0.0.1  | MVP - Basic API                                                                                      | ✅ Released |
+| v0.0.2  | Production Ready                                                                                     | ✅ Released |
+| v0.1.0  | Initial Stable Release                                                                               | ✅ Released |
+| v0.1.7  | Maintenance & fixes                                                                                  | ✅ Released |
+| v0.1.8  | Maintenance & fixes                                                                                  | ✅ Released |
+| v0.2.0  | i18n, Real-time Chats & Hardening                                                                    | ✅ Released |
+| v0.2.1  | Dashboard split-origin fix                                                                           | ✅ Released |
+| v0.2.2  | Security hardening (SSRF, secrets, Prometheus metrics)                                               | ✅ Released |
+| v0.2.3  | Plain-HTTP / LAN dashboard fixes                                                                     | ✅ Released |
+| v0.2.4  | CORS LAN fix, pinnable WA-Web version                                                                | ✅ Released |
+| v0.2.5  | Pairing-code linking                                                                                 | ✅ Released |
+| v0.2.6  | Chromium hardened-container (read-only) fix                                                          | ✅ Released |
+| v0.2.7  | Typing simulation, delete-chat, engine-agnostic groundwork                                           | ✅ Released |
+| v0.2.8  | Engine decoupling (ack/type/JID), templates, @lid→phone                                              | ✅ Released |
+| v0.2.9  | Reliability/security/a11y hardening (RBAC, deps, shutdown, retention)                                | ✅ Released |
+| v0.2.10 | Dashboard/CI follow-ups (MessageTester JID, neutral MessageType, qemu v4)                            | ✅ Released |
+| v0.3.0  | Engine pluggability (Baileys engine, plugin layer)                                                   | ✅ Released |
+| v0.4.0  | Single-port deployment (dashboard on API port, Traefik removed)                                      | ✅ Released |
+| v0.5.x  | Plugin/dashboard hardening and SDK/docs increments                                                   | ✅ Released |
+| v0.6.x  | Operational hardening, API surface refinements, dashboard follow-ups                                 | ✅ Released |
+| v0.7.x  | Dashboard chat UX, infra backup/restore, media-download toggle, infra follow-ups                     | ✅ Released |
+| v0.8.x  | Integration Fabric provisioning (instance API + dashboard tab), Java & Go SDKs                       | ✅ Released |
+| v0.9.0  | Live message-edit events; `general.sessionTimeout` dropped from settings                             | ✅ Released |
+| v0.10.x | Chat `kind` discriminator, 24-hour status store, Docker Hub dual-publish                             | ✅ Released |
+| v0.11.0 | SDK poll / profile-picture / status-media coverage, security & reliability hardening                 | ✅ Released |
 | v0.12.x | Session/engine decomposition (`EngineRegistry`), plugin lifecycle and configuration-precedence fixes | ✅ Released |
-| v1.0.0  | Enterprise Ready (K8s Operator, multi-tenant)                                   | 📋 Planned  |
+| v0.13+  | Incremental releases through v0.24.x; see `CHANGELOG.md`                                             | ✅ Released |
+| v1.0.0  | Enterprise Ready (K8s Operator, multi-tenant)                                                        | 📋 Planned  |
 
 > SDK / docs-site / observability features are delivered **incrementally** as they're additive — they no
 > longer gate a single version. The five client SDKs landed this way across `0.7.3`–`0.8.19`; the docs
@@ -136,12 +137,16 @@ follow the SemVer "major version zero" convention:
 - **PATCH (`0.2.x`)** — bug fixes **and** backward-compatible additions (new endpoints, optional fields,
   new opt-in features). The default for ongoing work.
 - **MINOR (`0.3.0`, `0.4.0`, …)** — **breaking changes** (removed/renamed fields, changed payload
-  semantics, deployment-topology changes). A breaking change does **not** stay in `0.2.x`.
+  semantics, deployment-topology changes). A breaking change does **not** ship in a patch release,
+  and neither does anything the CHANGELOG files under **Upgrade notes (behavior changes)**.
 - Every breaking change ships with a prominent **⚠️ callout + migration note** in the CHANGELOG and the
   GitHub release, because the version number alone won't fully signal it pre-1.0.
 
-> Note: `0.2.8` shipped one breaking change (webhook `type` neutralization, #270) as a patch — that
-> predates this policy and is documented with a migration note; the policy applies from `0.2.9` onward.
+> Note: `0.1.7` and `0.2.2` carried Upgrade notes, and `0.2.8` shipped one breaking change (webhook
+> `type` neutralization, #270) as a patch, all before this policy existed. Later patch releases did not hold to it either: `0.8.19`, `0.14.5` and `0.14.6`
+> carried breaking entries, and `0.23.3`, `0.23.5`, `0.23.6` and `0.23.7` carried Upgrade notes. Each
+> has its migration note in the CHANGELOG. The rule is enforced from `0.24.0`:
+> `src/common/docs-governance.spec.ts` fails a patch release whose CHANGELOG section has either.
 
 ## 15.3 Phase 1: MVP (Month 1-3)
 
@@ -473,11 +478,11 @@ gantt
 
 #### Scaling & Infrastructure
 
-| Feature            | Priority | Status |
-| ------------------ | -------- | ------ |
-| Horizontal scaling | P2       | 📄 Design reference only; single active owner per session remains required |
+| Feature            | Priority | Status                                                                      |
+| ------------------ | -------- | --------------------------------------------------------------------------- |
+| Horizontal scaling | P2       | 📄 Design reference only; single active owner per session remains required  |
 | Session affinity   | P2       | 📄 Documented for future topology, not implemented as multi-replica runtime |
-| Security audit     | P0       | ✅     |
+| Security audit     | P0       | ✅                                                                          |
 
 #### Community & Tooling
 
@@ -507,8 +512,7 @@ v0.1.0 Release Package:
 ## 15.6 Future Roadmap (v0.3.0+)
 
 > **Note:** Version 0.1.0 is the initial stable release including all features from Phases 1-3.
-> Versions 0.1.7 through 0.11.0 have since shipped (see the CHANGELOG); v1.0.0
-> onward is forward-looking.
+> Later versions have shipped since (see the CHANGELOG); v1.0.0 onward is forward-looking.
 
 ```mermaid
 flowchart LR
@@ -525,10 +529,10 @@ flowchart LR
         V020[v0.2.0 - i18n, Real-time Chats,<br/>Webhook Delivery-state & Hardening]
     end
 
-    subgraph v0.x["✅ Released (v0.3–v0.11)"]
+    subgraph v0.x["✅ Released (v0.3-v0.24.x)"]
         V030[v0.3.0 - Engine Pluggability<br/>Baileys engine + plugin layer]
         V040[v0.4.0 - Single-Port Deployment<br/>Dashboard on API port, no bundled Traefik]
-        V011[v0.5.0-v0.12.x - Incremental releases<br/>see the CHANGELOG]
+        V011[v0.5.0-v0.24.x - Incremental releases<br/>see the CHANGELOG]
     end
 
     subgraph v1.x["v1.x Series - Enterprise"]
@@ -570,27 +574,27 @@ vars are removed. Ships with a migration guide.
 Delivered additively whenever ready, per SemVer (not gated to one version). Prometheus metrics shipped
 in `0.2.2` and the five client SDKs across `0.7.3`–`0.8.19`; the rest remain open.
 
-| Feature                | Priority | Status | Description                     |
-| ---------------------- | -------- | ------ | ------------------------------- |
-| JavaScript/Node.js SDK | P1       | ✅ Shipped (`@rmyndharis/openwa`) | Official client library |
-| Python SDK             | P2       | ✅ Shipped (`rmyndharis-openwa`) | Python client library |
-| PHP SDK                | P2       | ✅ Shipped (`rmyndharis/openwa`) | PHP client library |
-| Java SDK               | P2       | ✅ Shipped (`com.rmyndharis:openwa`) | Java client library |
-| Go SDK                 | P2       | ✅ Shipped (`github.com/rmyndharis/OpenWA/sdk/go`) | Go client library |
-| Postman Collection     | P1       | ◐ cURL collection (doc 07); Postman export TBD | Ready-to-use API collection |
-| Docs Site              | P1       | ☐ Open | Documentation website |
-| Video Tutorials        | P2       | ☐ Open | Getting started video series    |
-| Example Projects       | P1       | ◐ A few under `docs/examples/` | Real-world integration examples |
+| Feature                | Priority | Status                                             | Description                     |
+| ---------------------- | -------- | -------------------------------------------------- | ------------------------------- |
+| JavaScript/Node.js SDK | P1       | ✅ Shipped (`@rmyndharis/openwa`)                  | Official client library         |
+| Python SDK             | P2       | ✅ Shipped (`rmyndharis-openwa`)                   | Python client library           |
+| PHP SDK                | P2       | ✅ Shipped (`rmyndharis/openwa`)                   | PHP client library              |
+| Java SDK               | P2       | ✅ Shipped (`com.rmyndharis:openwa`)               | Java client library             |
+| Go SDK                 | P2       | ✅ Shipped (`github.com/rmyndharis/OpenWA/sdk/go`) | Go client library               |
+| Postman Collection     | P1       | ◐ cURL collection (doc 07); Postman export TBD     | Ready-to-use API collection     |
+| Docs Site              | P1       | ☐ Open                                             | Documentation website           |
+| Video Tutorials        | P2       | ☐ Open                                             | Getting started video series    |
+| Example Projects       | P1       | ◐ A few under `docs/examples/`                     | Real-world integration examples |
 
 **Performance & Observability**
 
-| Feature                | Priority | Status | Description                      |
-| ---------------------- | -------- | ------ | -------------------------------- |
+| Feature                | Priority | Status                                      | Description                      |
+| ---------------------- | -------- | ------------------------------------------- | -------------------------------- |
 | Prometheus Metrics     | P1       | ✅ Shipped (`GET /api/metrics`, `openwa_*`) | /metrics endpoint for monitoring |
-| Grafana Dashboard      | P2       | ☐ Open | Pre-built monitoring dashboard   |
-| OpenTelemetry Tracing  | P2       | ☐ Open | Distributed tracing support      |
-| Performance Benchmarks | P1       | ☐ Open | Documented performance metrics   |
-| Memory Optimization    | P1       | ☐ Open | Reduced memory per session       |
+| Grafana Dashboard      | P2       | ☐ Open                                      | Pre-built monitoring dashboard   |
+| OpenTelemetry Tracing  | P2       | ☐ Open                                      | Distributed tracing support      |
+| Performance Benchmarks | P1       | ☐ Open                                      | Documented performance metrics   |
+| Memory Optimization    | P1       | ☐ Open                                      | Reduced memory per session       |
 
 ### Integration Fabric — inbound integrations for plugins (in progress)
 
@@ -605,13 +609,13 @@ through a stable, versioned **Integration SDK (v1)**. Motivated by #553.
 Delivered in phases (additive; see [25 - Integration Fabric](./25-integration-fabric.md) for the
 architecture and design rationale):
 
-| Phase | Scope                                                                                                                                                                          | Status                         |
-| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------ |
-| P0    | Core substrate: inbound webhook RPC, `@Public` ingress endpoint with HMAC-over-raw-body verification, plugin-instance primitive, normalized send capability, identity/dedup/DLQ tables, ingress queue. SDK v1 frozen. | ✅ Merged (internal substrate) |
-| P1    | Scale-correctness: per-conversation FIFO ordering, per-instance fairness, DLQ redrive, bot/human handover.                                                                    | ✅ Merged (internal substrate) |
-| P2    | Operator provisioning (mint plugin instances and secrets, dashboard) + the first adapter (helpdesk inbox) shipped as a marketplace plugin — closes #553 end-to-end.           | ✅ Shipped (provisioning `0.8.0`; adapter needs `0.8.7`+) |
-| P3    | A second ingress adapter — validates the substrate generalizes beyond the first consumer.                                                                                     | ✅ Shipped (`supabase-otp-hook`) |
-| P4    | Developer experience: SDK reference docs, compatibility test suite, multi-node routing.                                                                                       | 📋 Planned                     |
+| Phase | Scope                                                                                                                                                                                                                 | Status                                                    |
+| ----- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
+| P0    | Core substrate: inbound webhook RPC, `@Public` ingress endpoint with HMAC-over-raw-body verification, plugin-instance primitive, normalized send capability, identity/dedup/DLQ tables, ingress queue. SDK v1 frozen. | ✅ Merged (internal substrate)                            |
+| P1    | Scale-correctness: per-conversation FIFO ordering, per-instance fairness, DLQ redrive, bot/human handover.                                                                                                            | ✅ Merged (internal substrate)                            |
+| P2    | Operator provisioning (mint plugin instances and secrets, dashboard) + the first adapter (helpdesk inbox) shipped as a marketplace plugin — closes #553 end-to-end.                                                   | ✅ Shipped (provisioning `0.8.0`; adapter needs `0.8.7`+) |
+| P3    | A second ingress adapter — validates the substrate generalizes beyond the first consumer.                                                                                                                             | ✅ Shipped (`supabase-otp-hook`)                          |
+| P4    | Developer experience: SDK reference docs, compatibility test suite, multi-node routing.                                                                                                                               | 📋 Planned                                                |
 
 > **Provisioning is operator-facing since `0.8.0`.** An ADMIN key mints a per-plugin instance and its
 > ingress secret through `POST /api/integration/plugins/:pluginId/instances`, and rotates that secret
@@ -628,19 +632,19 @@ architecture and design rationale):
 
 ### v1.0.0 - Enterprise Ready
 
-| Feature             | Priority | Description                    |
-| ------------------- | -------- | ------------------------------ |
-| Kubernetes Operator | P3       | Native K8s deployment          |
-| Multi-tenant        | P3       | Enterprise SaaS features       |
-| Encryption at rest  | P2       | Full data encryption           |
-| Audit compliance    | P2       | SOC2, GDPR compliance          |
-| WhatsApp Pay        | P3       | Payment links integration      |
+| Feature             | Priority | Description               |
+| ------------------- | -------- | ------------------------- |
+| Kubernetes Operator | P3       | Native K8s deployment     |
+| Multi-tenant        | P3       | Enterprise SaaS features  |
+| Encryption at rest  | P2       | Full data encryption      |
+| Audit compliance    | P2       | SOC2, GDPR compliance     |
+| WhatsApp Pay        | P3       | Payment links integration |
 
 ## 15.7 Cutting a Release
 
-Releases are cut by a maintainer from `main`. There is no release branch and no release PR: the
-version bump lands as a single commit on `main`, and pushing the tag hands everything else to
-`.github/workflows/release.yml`.
+Releases are cut by a maintainer from `main`. There is no long-lived release branch: the version
+bump is a single commit on a short-lived `chore/release-<version>` branch, merged to `main` through a
+PR, and pushing the tag from `main` hands everything else to `.github/workflows/release.yml`.
 
 ### Before you start
 
@@ -650,17 +654,29 @@ version bump lands as a single commit on `main`, and pushing the tag hands every
 - The release job needs `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` (promotion logs into both
   registries before applying any tag) and optionally `RELEASE_PAT` (authors the GitHub Release as a
   user rather than the bot). Check with `gh secret list`.
-- Pick the version per [15.2](#152-version-numbering). Pre-1.0, a release containing **any**
-  breaking change is a MINOR — patch releases carry none.
+- Pick the version per [15.2](#152-version-numbering). Pre-1.0, a release whose `[Unreleased]`
+  section has **any** breaking entry or an **Upgrade notes** heading is a MINOR; patch releases
+  carry neither.
 
 ### The release commit
 
-Exactly four files change. Nothing else belongs in this commit.
+Five files change on a patch. A MINOR changes six: `SECURITY.md` names the supported minor in its
+prose, its table row and its `< X.Y` lower bound, and `npm run check:versions` fails without it — a
+gate that runs on the pushed tag, so omitting it means deleting the tag and cutting again. Nothing
+else belongs in this commit.
 
 ```bash
 npm version --no-git-tag-version <version>   # package.json + package-lock.json
 npm run openapi:export                        # openapi.json info.version follows package.json
 ```
+
+Then bump `appVersion` in `charts/openwa/Chart.yaml` to the same version — the chart defaults its
+image tag to `appVersion`, so a stale one deploys a tag that does not exist yet. Bump the chart's own
+`version:` by a patch in the same commit: Helm identifies a chart by that field alone, so leaving it
+while the templates change makes two different charts answer to one name in `helm list` and
+`helm history`. Releases from v0.13.0 onward bumped it, except v0.23.4 to v0.23.6, which kept v0.23.3's
+chart version 0.1.20, and nothing gates it —
+`npm run check:versions` reads only `appVersion`, and the `chart` job lints behaviour, not versions.
 
 Then in `CHANGELOG.md`, insert the new heading directly under the retained, now-empty
 `## [Unreleased]` — the accumulated entries fall under it by position:
@@ -677,21 +693,36 @@ degrades the release notes to a bare `Release v<version>`.
 
 ### Verify, commit, tag
 
-Run the same gates the tag will run, so a failure costs a local minute rather than a released tag:
+Run the same gates the tag will run, so a failure costs a local minute rather than a released tag. The
+queue-on and throttler-redis e2e suites skip when no Redis is reachable, while the tag runs them against a
+Redis service, so start one first (`docker run --rm -d -p 6379:6379 redis:7-alpine`, or set `REDIS_HOST`
+and `REDIS_PORT`, which both suites read) and check that jest reports no skipped suites:
 
 ```bash
 npm run check:versions && npm run openapi:check && npm run lint && npm run format:check
 npx tsc --noEmit -p tsconfig.json && npm run check:dockerignore
-npm audit --audit-level=high
-npm test && npm run test:e2e && npm run build
-cd dashboard && npm run lint && npm run typecheck && npm run i18n:check && npm run build && npm run test:unit
+npm run check:sdk-routes && npm run check:sdk-coverage && npm run check:sdk-events && npm run check:sdk-docs
+npm run check:contract-shapes
+CHECK_AUDIT_REQUIRED=1 npm run check:audit && (cd dashboard && npm audit --audit-level=high)
+npm run test:cov && npm run test:scripts && npm run test:docs && npm run test:e2e && npm run build && npm run test:engine-real
+cd dashboard && npm run lint && npm run format:check && npm run typecheck && npm run i18n:check && npm run build && npm run test:unit
 ```
 
+`build` also waits on the `scripts-smoke` job (`shellcheck docker-entrypoint.sh scripts/*.sh` and
+`./scripts/smoke-test-backup-restore.sh`, which need `shellcheck` and `sqlite3`) and the `chart` job
+(`helm lint`, `helm template` + `kubeconform`, `npm run check:chart` and `actionlint`, all run through
+Docker), and `docker` waits on `test-postgres`. Run those locally when the release touches their files.
+
 ```bash
-git add package.json package-lock.json openapi.json CHANGELOG.md
+# SECURITY.md only on a MINOR; the chart's own `version:` bumps a patch alongside `appVersion`.
+git switch -c chore/release-<version>
+git add package.json package-lock.json openapi.json CHANGELOG.md charts/openwa/Chart.yaml SECURITY.md
 git commit -m "chore(release): v<version>"
+git push origin chore/release-<version>   # open the PR to main and merge it once CI is green
+
+git switch main && git pull --ff-only
 git tag -a v<version> -m "v<version>"
-git push origin main --follow-tags
+git push origin v<version>
 ```
 
 The tag must be annotated and `v`-prefixed; `release.yml` triggers on `v*` and refuses to proceed if
@@ -701,9 +732,11 @@ the tag string and `package.json` disagree.
 
 ```mermaid
 flowchart TB
-    A[push tag v*] --> B[lint / test / test-postgres / dashboard]
+    A[push tag v*] --> B[lint / test / dashboard / scripts-smoke / chart]
+    A --> T[test-postgres]
     B --> C[build]
     C --> D[docker: multi-arch build, staging tag only]
+    T --> D
     D --> E[boot-smoke: run the image on amd64 + arm64]
     D --> F[image-scan: Trivy, CRITICAL/HIGH, fixable only]
     E --> G[promote: apply X.Y.Z, X.Y, latest to GHCR + Docker Hub]
@@ -718,8 +751,8 @@ never points at an image that was not tested. `verify-published` then re-resolve
 with no registry login, asserting public pullability and digest identity on both platforms. The
 GitHub Release is gated on all of it.
 
-Prereleases (`-rc`, `-beta`, `-alpha` in the tag) skip the mutable `X.Y` and `latest` channels and
-are flagged prerelease on GitHub.
+A tag with any `-` suffix (for example `-rc.1`, `-beta.1`, `-alpha.1`) is a prerelease: it skips the
+mutable `X.Y` and `latest` channels and is flagged prerelease on GitHub.
 
 ### When a gate fails
 
@@ -741,8 +774,9 @@ supersede it with a new release instead (e.g. `v0.10.3` → `v0.10.4`).
 Two failure classes are worth anticipating because they depend on the outside world rather than on
 the change being released:
 
-- **`npm audit --audit-level=high`** in the release gate is time-dependent: a tree that was clean
-  last week can fail on a newly published advisory.
+- **The dependency audit** in the release gate (`npm run check:audit` for the root,
+  `npm audit --audit-level=high` for the dashboard) is time-dependent: a tree that was clean last week
+  can fail on a newly published advisory.
 - **The image scan reads the base image**, including the dependency tree bundled inside its npm CLI,
   which `npm audit` never sees. Accepted findings live in `.trivyignore`, each with a written
   justification and the condition for removing it.
@@ -760,9 +794,12 @@ Do the registry checks logged **out**. A promotion can look green while the tags
 everyone else — that is the failure mode that took `latest`, `0.10` and `0.10.5` offline after
 v0.10.5 published its GitHub Release.
 
-Upgrading a Compose deployment is `git pull && docker compose up -d --build`: the bundled
-`docker-compose.yml` **builds** the API service rather than pulling it, so `docker compose pull` is
-a no-op for OpenWA itself.
+Upgrading a Compose deployment that builds from source is `git pull && docker compose up -d --build`:
+the bundled `docker-compose.yml` **builds** the API service rather than pulling it, so
+`docker compose pull` is a no-op for OpenWA itself. A deployment whose `docker-compose.override.yml`
+sets a published image (see the README) upgrades with `git pull` followed by
+`docker compose pull openwa-api && docker compose up -d --no-build` instead; `--build` there would
+build from source and tag the result with the published image name.
 
 ## 15.8 Success Metrics
 
@@ -779,26 +816,26 @@ a no-op for OpenWA itself.
 
 ### Phase 2 Success Criteria
 
-| Metric                | Target       | Actual            | Type     |
-| --------------------- | ------------ | ----------------- | -------- |
-| Multi-session support | 10+ sessions | ✅ Achieved       | Internal |
-| Dashboard functional  | All features | ✅ Achieved       | Internal |
-| PostgreSQL stable     | ✅           | ✅ Achieved       | Internal |
-| Webhook delivery rate | > 99%        | ✅ Achieved       | Internal |
-| Test coverage         | > 70%        | ⚠️ 66.87% line coverage; 80% improvement plan active | Internal |
-| GitHub stars          | 100+         | 📋 Pending        | External |
+| Metric                | Target       | Actual                                                                                          | Type     |
+| --------------------- | ------------ | ----------------------------------------------------------------------------------------------- | -------- |
+| Multi-session support | 10+ sessions | ✅ Achieved                                                                                     | Internal |
+| Dashboard functional  | All features | ✅ Achieved                                                                                     | Internal |
+| PostgreSQL stable     | ✅           | ✅ Achieved                                                                                     | Internal |
+| Webhook delivery rate | > 99%        | ✅ Achieved                                                                                     | Internal |
+| Test coverage         | > 70%        | ⚠️ line coverage sits well above the ratchet floors — `npm run test:cov` is the source of truth | Internal |
+| GitHub stars          | 100+         | ✅ Achieved                                                                                     | External |
 
 ### Phase 3 Success Criteria
 
-| Metric                        | Target  | Actual            | Type     |
-| ----------------------------- | ------- | ----------------- | -------- |
-| Feature parity with WAHA Plus | 90%+    | ✅ Achieved       | Internal |
-| API response time (p95)       | < 200ms | ✅ Achieved       | Internal |
-| Test coverage                 | > 80%   | ⚠️ 66.87% line coverage; in progress | Internal |
-| Documentation coverage        | 100%    | ✅ 95%+           | Internal |
-| Production users              | 50+     | 📋 Pending        | External |
-| GitHub stars                  | 500+    | 📋 Pending        | External |
-| Community contributors        | 5+      | 📋 Pending        | External |
+| Metric                        | Target  | Actual                                                      | Type     |
+| ----------------------------- | ------- | ----------------------------------------------------------- | -------- |
+| Feature parity with WAHA Plus | 90%+    | ✅ Achieved                                                 | Internal |
+| API response time (p95)       | < 200ms | ✅ Achieved                                                 | Internal |
+| Test coverage                 | > 80%   | ⚠️ above the per-directory ratchet floors; see docs/09 §9.5 | Internal |
+| Documentation coverage        | 100%    | ✅ 95%+                                                     | Internal |
+| Production users              | 50+     | Not measured (no usage telemetry)                           | External |
+| GitHub stars                  | 500+    | ✅ Achieved                                                 | External |
+| Community contributors        | 5+      | ✅ Achieved                                                 | External |
 
 ---
 

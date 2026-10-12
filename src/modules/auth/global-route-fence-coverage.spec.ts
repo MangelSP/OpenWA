@@ -9,7 +9,7 @@
 // a @SessionScoped controller) and carries neither @RequireUnscopedKey, @Public, nor an entry in
 // ALLOWLIST below — so a future endpoint cannot silently re-introduce the gap.
 import { readdirSync, readFileSync } from 'fs';
-import { join } from 'path';
+import { basename, join, sep } from 'path';
 
 /**
  * Handlers that are deliberately global AND deliberately reachable by a session-restricted key,
@@ -20,6 +20,7 @@ const ALLOWLIST = new Map<string, string>([
   ['audit.controller.ts :: findAll', 'scope-filters rows via resolveSessionScope'],
   ['webhooks-list.controller.ts :: findAll', 'scope-filters rows via the calling key'],
   ['webhooks-list.controller.ts :: deliveryFailures', 'scope-filters rows via the calling key'],
+  ['webhooks-list.controller.ts :: redriveDeliveryFailures', 'replays only rows inside the calling key scope'],
   ['search.controller.ts :: search', 'scope-filters results via the calling key'],
   ['session.controller.ts :: findAll', 'scope-filters sessions to the key allowlist'],
   ['session.controller.ts :: getStats', 'scope-filters the aggregate to apiKey.allowedSessions in the service'],
@@ -184,11 +185,15 @@ export class ThingController {
     const modulesDir = join(__dirname, '..');
     const offenders: string[] = [];
     for (const file of listControllerFiles(modulesDir)) {
-      const basename = file.split('/').pop() as string;
+      // Derive the file name through `path`, and normalize separators before matching: `join()`
+      // yields backslashes on Windows, so splitting on '/' left the whole path as the "basename",
+      // no ALLOWLIST key ever matched, and every allowlisted controller was reported as an offender.
+      const fileName = basename(file);
+      const posixPath = file.split(sep).join('/');
       for (const handler of handlersMissingGlobalFence(readFileSync(file, 'utf8'))) {
-        const key = `${basename} :: ${handler}`;
+        const key = `${fileName} :: ${handler}`;
         if (ALLOWLIST.has(key)) continue;
-        offenders.push(`${file.replace(/.*\/src\//, 'src/')} :: ${handler}`);
+        offenders.push(`${posixPath.replace(/.*\/src\//, 'src/')} :: ${handler}`);
       }
     }
     expect(offenders).toEqual([]);

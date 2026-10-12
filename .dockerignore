@@ -21,6 +21,9 @@ data/
 *.db
 *.sqlite
 *.sqlite3
+# scripts/backup.sh archives and restore.sh safety snapshots: copies of the same state
+backups/
+**/*.pre-restore-*
 
 # VCS metadata — not a build input; keeps history/hooks out of the context
 .git/
@@ -66,3 +69,6 @@ temp/
 
 # Debug
 .pnpm-debug.log*
+
+# Helm chart — deployment artifact, not a build input
+charts/

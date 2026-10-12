@@ -37,6 +37,17 @@ it('carries media and collapses the type to the status union', () => {
   expect(s.media).toEqual({ mimetype: 'image/jpeg', data: 'AAAA' });
 });
 
+// The store picks the omitted-media reason from these two: without them an engine-omitted status
+// is recorded as over the cap, and that reason goes out on the status.received webhook.
+it('carries the engine-omitted marker and the size of media it did not download', () => {
+  const s = buildIncomingStatus({
+    ...base,
+    type: 'image',
+    media: { mimetype: 'image/jpeg', omitted: true, sizeBytes: 99 },
+  })!;
+  expect(s.media).toStrictEqual({ mimetype: 'image/jpeg', data: undefined, omitted: true, sizeBytes: 99 });
+});
+
 it('carries text-status styling through to the store row', () => {
   const s = buildIncomingStatus({ ...base, backgroundColor: '#25d366', font: 2 })!;
   expect(s.backgroundColor).toBe('#25d366');
@@ -58,4 +69,26 @@ it('returns null when there is no resolvable poster (author/from both the broadc
 
 it('returns null when the message has no id', () => {
   expect(buildIncomingStatus({ ...base, id: '' })).toBeNull();
+});
+
+/**
+ * Both engines map a PTT message to `voice`, and everything that was not an image or a video used to
+ * collapse into `text`. That silently turned an incoming voice status into a text one — a status with
+ * audio attached but a type saying otherwise.
+ */
+it('keeps a voice status as voice rather than collapsing it to text', () => {
+  const s = buildIncomingStatus({
+    ...base,
+    type: 'voice',
+    body: '',
+    media: { mimetype: 'audio/ogg; codecs=opus', data: 'AAAA' },
+  })!;
+
+  expect(s.type).toBe('voice');
+  expect(s.media?.mimetype).toBe('audio/ogg; codecs=opus');
+});
+
+it('still collapses a type the status union does not model', () => {
+  expect(buildIncomingStatus({ ...base, type: 'document' })!.type).toBe('text');
+  expect(buildIncomingStatus({ ...base, type: 'audio' })!.type).toBe('text');
 });

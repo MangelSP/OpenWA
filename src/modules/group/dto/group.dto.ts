@@ -7,11 +7,17 @@ import {
   IsNotEmpty,
   MaxLength,
   IsBoolean,
+  IsIn,
   IsInt,
   Min,
+  IsOptional,
+  Matches,
   ValidateIf,
 } from 'class-validator';
 import { ToStrictBoolean, ToStrictNumber } from '../../../common/utils/strict-boolean';
+import type { GroupMemberAddMode } from '../../../engine/interfaces/whatsapp-engine.interface';
+import { IsMediaUrl } from '../../../common/media/media-url';
+import { stripBase64DataUri } from '../../message/media-cap.util';
 
 // Field caps shared with the agent-tool input schemas (src/core/agent-tools/tools/group.tools.ts)
 // so MCP and REST enforce the same limits on the equivalent operations.
@@ -32,7 +38,7 @@ export class CreateGroupDto {
   @IsString()
   @IsNotEmpty()
   @MaxLength(GROUP_NAME_MAX_LENGTH)
-  name: string;
+  name!: string;
 
   @ApiProperty({
     description: 'Participant WhatsApp IDs (e.g. 628123456789@c.us)',
@@ -43,7 +49,7 @@ export class CreateGroupDto {
   @ArrayNotEmpty()
   @ArrayMaxSize(GROUP_PARTICIPANTS_MAX)
   @IsString({ each: true })
-  participants: string[];
+  participants!: string[];
 }
 
 export class ParticipantsDto {
@@ -56,7 +62,27 @@ export class ParticipantsDto {
   @ArrayNotEmpty()
   @ArrayMaxSize(GROUP_PARTICIPANTS_MAX)
   @IsString({ each: true })
-  participants: string[];
+  participants!: string[];
+}
+
+/**
+ * Approve/reject body for the membership-request routes. `participants` names specific requesters;
+ * omitted (or an empty body) means EVERY pending request — mirroring both engines' act-on-all form.
+ * ValidateIf (not @IsOptional) so an explicit `null` fails validation (400) instead of being read
+ * as approve-all: misreading a malformed client shape here mass-approves join requests.
+ */
+export class MembershipRequestActionDto {
+  @ApiPropertyOptional({
+    description: 'Requester WhatsApp IDs (e.g. 628123456789@c.us). Omit to act on every pending request.',
+    type: [String],
+    maxItems: GROUP_PARTICIPANTS_MAX,
+  })
+  @ValidateIf(o => (o as MembershipRequestActionDto).participants !== undefined)
+  @IsArray()
+  @ArrayNotEmpty()
+  @ArrayMaxSize(GROUP_PARTICIPANTS_MAX)
+  @IsString({ each: true })
+  participants?: string[];
 }
 
 export class GroupSubjectDto {
@@ -64,7 +90,7 @@ export class GroupSubjectDto {
   @IsString()
   @IsNotEmpty()
   @MaxLength(GROUP_NAME_MAX_LENGTH)
-  subject: string;
+  subject!: string;
 }
 
 export class GroupDescriptionDto {
@@ -74,7 +100,7 @@ export class GroupDescriptionDto {
   })
   @IsString()
   @MaxLength(GROUP_DESCRIPTION_MAX_LENGTH)
-  description: string;
+  description!: string;
 }
 
 export class JoinGroupDto {
@@ -85,7 +111,33 @@ export class JoinGroupDto {
   @IsString()
   @IsNotEmpty()
   @MaxLength(128)
-  inviteCode: string;
+  inviteCode!: string;
+}
+
+/**
+ * Group picture payload. Mirrors SetProfilePictureDto: provide exactly one of `url` or `base64`
+ * (base64 wins when both are present), and a `mimetype` when using base64.
+ */
+export class SetGroupPictureDto {
+  @ApiPropertyOptional({ description: 'Image URL (http/https)', example: 'https://example.com/group.jpg' })
+  @IsOptional()
+  // base64 wins when it holds data; a base64 that is only a data-URI prefix strips to nothing, and then
+  // the url is what gets sent, so it is checked.
+  @IsMediaUrl<SetGroupPictureDto>({ ignoreWhen: o => !!stripBase64DataUri(o.base64) })
+  url?: string;
+
+  @ApiPropertyOptional({ description: 'Base64 encoded image data' })
+  @IsOptional()
+  @IsString()
+  base64?: string;
+
+  @ApiPropertyOptional({ description: 'Image MIME type (required when using base64)', example: 'image/jpeg' })
+  @IsOptional()
+  @IsString()
+  // A group picture is an image by definition — reject non-image mimetypes fast (400) rather than
+  // letting the engine accept an arbitrary payload.
+  @Matches(/^image\//)
+  mimetype?: string;
 }
 
 /**
@@ -117,4 +169,12 @@ export class GroupSettingsDto {
   @IsInt()
   @Min(0)
   ephemeralSeconds?: number;
+
+  @ApiPropertyOptional({
+    description: "Who may add participants: 'all' (any member) or 'admins' (admins only)",
+    enum: ['all', 'admins'],
+  })
+  @ValidateIf((o: GroupSettingsDto) => o.memberAddMode !== undefined)
+  @IsIn(['all', 'admins'])
+  memberAddMode?: GroupMemberAddMode;
 }

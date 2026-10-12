@@ -6,13 +6,13 @@ OpenWA signs webhook deliveries when a webhook is configured with a secret. Rece
 
 OpenWA sends these system headers with webhook deliveries:
 
-| Header | Description |
-| ------ | ----------- |
-| `X-OpenWA-Signature` | HMAC-SHA256 signature, present only when the webhook has a secret |
-| `X-OpenWA-Event` | Event name, for example `message.received` |
-| `X-OpenWA-Idempotency-Key` | Stable key for duplicate detection |
-| `X-OpenWA-Delivery-Id` | Unique identifier for this delivery (stable across retry attempts) |
-| `X-OpenWA-Retry-Count` | Retry count for the current delivery |
+| Header                     | Description                                                        |
+| -------------------------- | ------------------------------------------------------------------ |
+| `X-OpenWA-Signature`       | HMAC-SHA256 signature, present only when the webhook has a secret  |
+| `X-OpenWA-Event`           | Event name, for example `message.received`                         |
+| `X-OpenWA-Idempotency-Key` | Stable key for duplicate detection                                 |
+| `X-OpenWA-Delivery-Id`     | Unique identifier for this delivery (stable across retry attempts) |
+| `X-OpenWA-Retry-Count`     | Retry count for the current delivery                               |
 
 The signature format is:
 
@@ -21,6 +21,20 @@ sha256=<hex digest>
 ```
 
 The digest is computed over the exact raw request body bytes using the webhook secret.
+
+## With an OpenWA SDK
+
+From the next SDK release (after 0.5.0), each SDK ships this check. Pass the raw body, the `X-OpenWA-Signature` header value and the secret; the helper returns false for a missing, malformed or wrong signature and compares in constant time.
+
+| SDK        | Call                                                    |
+| ---------- | ------------------------------------------------------- |
+| JavaScript | `await verifyWebhookSignature(rawBody, header, secret)` |
+| Python     | `verify_webhook_signature(raw_body, header, secret)`    |
+| Go         | `openwa.VerifyWebhookSignature(body, header, secret)`   |
+| Java       | `WebhookSignature.verify(body, header, secret)`         |
+| PHP        | `WebhookSignature::verify($rawBody, $header, $secret)`  |
+
+The raw-body rule below still applies: parse the JSON only after the check passes. The receivers below show the same check without an SDK.
 
 ## Node.js / Express
 
@@ -36,8 +50,7 @@ const WEBHOOK_SECRET = process.env.OPENWA_WEBHOOK_SECRET;
 function verifyOpenWASignature(rawBody, signature, secret) {
   if (!signature || !secret) return false;
 
-  const expected =
-    'sha256=' + crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
+  const expected = 'sha256=' + crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
 
   const signatureBuffer = Buffer.from(signature);
   const expectedBuffer = Buffer.from(expected);

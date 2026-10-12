@@ -107,6 +107,11 @@ const mustReject = [
   'data/.api-key',
   'openwa.sqlite',
   'backup.db',
+  // Backup archives and pre-restore snapshots (scripts/backup.sh, scripts/restore.sh)
+  'backups/openwa-backup-20260101-000000.tar.gz',
+  'data.pre-restore-20260101-000000/.api-key',
+  'data.pre-restore-20260101-000000/baileys/s1/creds.json',
+  'state/sessions.pre-restore-20260101-000000/session-s1/Default/Cookies',
   // VCS metadata
   '.git/HEAD',
   '.git/hooks/pre-commit',
@@ -144,7 +149,13 @@ const mustKeep = [
   'scripts/postinstall.js',
   'scripts/patch-wwebjs-201832.js',
   'scripts/patch-wwebjs-newsletter-preview.js',
+  'scripts/patch-wwebjs-status.js',
+  'scripts/patch-wwebjs-ready-sync.js',
   'scripts/wwebjs-201832.patch',
+  'scripts/pgdg-ACCC4CF8.asc',
+  'scripts/backup.sh',
+  'scripts/restore.sh',
+  'scripts/lib-env.sh',
   'docker-entrypoint.sh',
   'docs/01-project-overview.md',
 ];

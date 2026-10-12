@@ -11,24 +11,25 @@ import { Session } from '../../modules/session/entities/session.entity';
  */
 @Entity('baileys_stored_messages')
 @Index(['sessionId', 'waMessageId'], { unique: true }) // lookup + dedup (send-return vs upsert echo)
-@Index(['sessionId', 'createdAt']) // eviction ordering
+// Eviction ordering: the cap trim's cutoff lookup and range delete both walk (createdAt, id).
+@Index('IDX_baileys_stored_messages_session_created_id', ['sessionId', 'createdAt', 'id'])
 export class BaileysStoredMessage {
   @PrimaryGeneratedColumn('uuid')
-  id: string;
+  id!: string;
 
   @Column()
-  sessionId: string;
+  sessionId!: string;
 
   @ManyToOne(() => Session, { onDelete: 'CASCADE' })
   @JoinColumn({ name: 'sessionId' })
   session?: Session;
 
   @Column()
-  waMessageId: string;
+  waMessageId!: string;
 
   @Column({ type: 'text' })
-  serializedMessage: string;
+  serializedMessage!: string;
 
   @CreateDateColumn()
-  createdAt: Date;
+  createdAt!: Date;
 }

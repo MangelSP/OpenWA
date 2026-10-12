@@ -1,6 +1,7 @@
 import { useEffect, useRef, useCallback, useState } from 'react';
 import { io, Socket } from 'socket.io-client';
-import { warnIfInsecureHttpUrl } from '../utils/urlSecurity';
+import { API_ORIGIN } from '../services/api';
+import { resolveSocketUrl, warnIfInsecureHttpUrl } from '../utils/urlSecurity';
 
 interface SessionStatusEvent {
   sessionId: string;
@@ -37,7 +38,13 @@ interface MessageReactionEvent {
   chatId: string;
   reaction: string;
   senderId: string;
-  reactions: Record<string, string>;
+  /**
+   * The post-apply snapshot of every reaction on the message. ABSENT when the gateway holds no
+   * stored copy of the message to compute it from, which it says by omitting the key rather than
+   * sending an empty object — absent means "unknown", `{}` means "there are none left". Keep it
+   * optional: normalising the absence away here is what makes a consumer's own fallback dead code.
+   */
+  reactions?: Record<string, string>;
   timestamp: string;
 }
 
@@ -71,6 +78,12 @@ interface StatusReceivedEvent {
   timestamp: string;
 }
 
+/** A restriction imposed or lifted — the dashboard uses it purely as a refetch signal for the badge. */
+interface SessionRestrictionEvent {
+  sessionId: string;
+  timestamp: string;
+}
+
 /** Ack frame answering a client `subscribe` request (`{type: 'subscribed'}`). */
 interface SubscribedEvent {
   sessionId: string;
@@ -92,6 +105,7 @@ interface WebSocketEvents {
   onMessageRevoked?: (event: MessageRevokedEvent) => void;
   onMessageEdited?: (event: MessageEditedEvent) => void;
   onStatusReceived?: (event: StatusReceivedEvent) => void;
+  onSessionRestriction?: (event: SessionRestrictionEvent) => void;
   onSubscribed?: (event: SubscribedEvent) => void;
   onServerError?: (event: ServerErrorEvent) => void;
 }
@@ -124,11 +138,12 @@ interface ServerErrorFrame {
   message?: string;
 }
 
-// Use current origin for WebSocket (goes through nginx proxy in Docker)
-// Falls back to env var or localhost for development
-const SOCKET_URL = import.meta.env.VITE_WS_URL || window.location.origin;
-// Warn when the WebSocket origin is an insecure http:// URL on a non-localhost host.
-warnIfInsecureHttpUrl(SOCKET_URL, 'VITE_WS_URL');
+// The origin of VITE_WS_URL when set, else of VITE_API_URL (a split-origin build names the API there), else the
+// page's own origin (the single-container setup, or nginx proxying /socket.io in Docker).
+const SOCKET_URL = resolveSocketUrl(import.meta.env.VITE_WS_URL, API_ORIGIN, window.location.origin);
+// Warn when VITE_WS_URL is an insecure http:// or ws:// URL on a non-localhost host; api.ts already warns
+// about VITE_API_URL under its own name.
+if (import.meta.env.VITE_WS_URL) warnIfInsecureHttpUrl(SOCKET_URL, 'VITE_WS_URL');
 
 export function useWebSocket(events: WebSocketEvents = {}) {
   const socketRef = useRef<Socket | null>(null);
@@ -139,6 +154,11 @@ export function useWebSocket(events: WebSocketEvents = {}) {
   // `reconnect_failed` never fires). Lets the UI show a "connection lost" indicator + a manual
   // retry instead of silently going stale.
   const [connectionFailed, setConnectionFailed] = useState(false);
+  // Bumped every time connect() creates a NEW socket instance. The envelope-handler effect below
+  // captures socketRef.current when it runs; without this epoch in its deps, a manual reconnect()
+  // (which swaps in a fresh socket) leaves the new socket with NO 'message' listener while
+  // isConnected still reports true - realtime events stop arriving with no signal anywhere.
+  const [socketEpoch, setSocketEpoch] = useState(0);
 
   const connect = useCallback(() => {
     if (socketRef.current?.connected) return;
@@ -151,6 +171,7 @@ export function useWebSocket(events: WebSocketEvents = {}) {
       return;
     }
 
+    setSocketEpoch(epoch => epoch + 1);
     socketRef.current = io(`${SOCKET_URL}/events`, {
       autoConnect: true,
       reconnection: true,
@@ -272,6 +293,9 @@ export function useWebSocket(events: WebSocketEvents = {}) {
         case 'status.received':
           events.onStatusReceived?.({ sessionId, timestamp: msg.timestamp });
           break;
+        case 'session.restriction':
+          events.onSessionRestriction?.({ sessionId, timestamp: msg.timestamp });
+          break;
         case 'message.ack':
           events.onMessageAck?.({
             sessionId,
@@ -289,7 +313,9 @@ export function useWebSocket(events: WebSocketEvents = {}) {
             chatId: String(data.chatId),
             reaction: String(data.reaction),
             senderId: String(data.senderId),
-            reactions: (data.reactions as Record<string, string>) || {},
+            // Carried through as-is, including absent: `|| {}` here would tell every consumer that
+            // the message has no reactions left, which is a different claim from "we do not know".
+            reactions: data.reactions as Record<string, string> | undefined,
             timestamp: msg.timestamp,
           });
           break;
@@ -337,7 +363,9 @@ export function useWebSocket(events: WebSocketEvents = {}) {
     return () => {
       socket.off('message', handleIncomingMessage);
     };
-  }, [events]);
+    // socketEpoch re-runs this effect for the socket a manual reconnect() swapped in; the cleanup
+    // above detaches the handler from the dead instance first.
+  }, [events, socketEpoch]);
 
   return { isConnected, connectionFailed, reconnect, subscribe, unsubscribe };
 }

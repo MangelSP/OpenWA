@@ -9,8 +9,9 @@ import {
   pluginsApi,
   pluginInstancesApi,
   statsApi,
-  type Webhook,
-  type WebhookFilters,
+  type CreateWebhookRequest,
+  type UpdateWebhookRequest,
+  type MessageTemplate,
   type TemplatePayload,
   type StatsPeriod,
   type CreateInstanceInput,
@@ -27,8 +28,7 @@ export const queryKeys = {
   webhooks: ['webhooks'] as const,
   templates: (sessionId: string) => ['sessions', sessionId, 'templates'] as const,
   apiKeys: ['apiKeys'] as const,
-  logs: (params: { severity?: string; page: number; limit: number }) =>
-    ['logs', params] as const,
+  logs: (params: { severity?: string; page: number; limit: number }) => ['logs', params] as const,
   infraStatus: ['infra', 'status'] as const,
   plugins: ['plugins'] as const,
   pluginInstances: (pluginId: string) => ['plugins', pluginId, 'instances'] as const,
@@ -78,7 +78,8 @@ export function useStopSessionMutation() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => sessionApi.stop(id),
-    onSuccess: () => {
+    // A failed stop can still have changed the session, so the list is re-read either way.
+    onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.sessions });
     },
   });
@@ -86,11 +87,12 @@ export function useStopSessionMutation() {
 
 // ── Webhook Queries ───────────────────────────────────────────────────
 
-export function useWebhooksQuery() {
+export function useWebhooksQuery(enabled = true) {
   return useQuery({
     queryKey: queryKeys.webhooks,
     queryFn: webhookApi.listAll,
     staleTime: 30_000,
+    enabled,
     // Normalize `events` to an array at the data boundary so every consumer (list render + edit
     // modal) can trust the declared string[] shape. A malformed payload then renders as no tags
     // instead of taking down the whole SPA via events.map() in the ErrorBoundary.
@@ -101,8 +103,8 @@ export function useWebhooksQuery() {
 export function useCreateWebhookMutation() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (params: { sessionId: string; url: string; events: string[]; filters?: WebhookFilters | null }) =>
-      webhookApi.create(params.sessionId, { url: params.url, events: params.events, filters: params.filters }),
+    mutationFn: ({ sessionId, ...body }: CreateWebhookRequest & { sessionId: string }) =>
+      webhookApi.create(sessionId, body),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.webhooks });
     },
@@ -112,7 +114,7 @@ export function useCreateWebhookMutation() {
 export function useUpdateWebhookMutation() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (params: { sessionId: string; id: string; data: Partial<Webhook> }) =>
+    mutationFn: (params: { sessionId: string; id: string; data: UpdateWebhookRequest }) =>
       webhookApi.update(params.sessionId, params.id, params.data),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.webhooks });
@@ -123,8 +125,7 @@ export function useUpdateWebhookMutation() {
 export function useDeleteWebhookMutation() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (params: { sessionId: string; id: string }) =>
-      webhookApi.delete(params.sessionId, params.id),
+    mutationFn: (params: { sessionId: string; id: string }) => webhookApi.delete(params.sessionId, params.id),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.webhooks });
     },
@@ -158,7 +159,12 @@ export function useUpdateTemplateMutation() {
   return useMutation({
     mutationFn: (params: { sessionId: string; id: string; data: Partial<TemplatePayload> }) =>
       templateApi.update(params.sessionId, params.id, params.data),
-    onSuccess: (_template, params) => {
+    onSuccess: (saved, params) => {
+      // Swap the saved row into the list before the refetch lands (or fails), so reopening it in the meantime
+      // loads the stored values rather than the pre-save ones that a second save would write back.
+      queryClient.setQueryData<MessageTemplate[]>(queryKeys.templates(params.sessionId), rows =>
+        rows?.map(row => (row.id === params.id ? saved : row)),
+      );
       void queryClient.invalidateQueries({ queryKey: queryKeys.templates(params.sessionId) });
     },
   });
@@ -167,8 +173,7 @@ export function useUpdateTemplateMutation() {
 export function useDeleteTemplateMutation() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (params: { sessionId: string; id: string }) =>
-      templateApi.delete(params.sessionId, params.id),
+    mutationFn: (params: { sessionId: string; id: string }) => templateApi.delete(params.sessionId, params.id),
     onSuccess: (_template, params) => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.templates(params.sessionId) });
     },
@@ -188,8 +193,37 @@ export function useApiKeysQuery() {
 export function useCreateApiKeyMutation() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (data: { name: string; role: string; allowedIps?: string[]; allowedSessions?: string[]; expiresAt?: string }) =>
-      apiKeyApi.create(data),
+    mutationFn: (data: {
+      name: string;
+      role: string;
+      allowedIps?: string[];
+      allowedSessions?: string[];
+      allowedChats?: string[];
+      expiresAt?: string;
+    }) => apiKeyApi.create(data),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.apiKeys });
+    },
+  });
+}
+
+export function useUpdateApiKeyMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      id,
+      data,
+    }: {
+      id: string;
+      data: {
+        name?: string;
+        role?: string;
+        allowedIps?: string[];
+        allowedSessions?: string[];
+        allowedChats?: string[];
+        expiresAt?: string | null;
+      };
+    }) => apiKeyApi.update(id, data),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.apiKeys });
     },
@@ -328,12 +362,13 @@ export function useCurrentEngineQuery() {
 // ── Stats Queries ─────────────────────────────────────────────────────
 // /stats/* is ADMIN-only; a non-admin key gets 403 → don't retry, let the UI fall back gracefully.
 
-export function useStatsOverviewQuery() {
+export function useStatsOverviewQuery(enabled = true) {
   return useQuery({
     queryKey: queryKeys.statsOverview,
     queryFn: statsApi.getOverview,
     staleTime: 30_000,
     retry: false,
+    enabled,
   });
 }
 

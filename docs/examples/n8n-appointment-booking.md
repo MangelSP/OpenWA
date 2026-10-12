@@ -34,9 +34,9 @@ The workflow is intentionally generic. The availability source can be Google Cal
 
 Use the **OpenWA Trigger** node.
 
-| Field | Value |
-| ----- | ----- |
-| Event | `message.received` |
+| Field   | Value                         |
+| ------- | ----------------------------- |
+| Event   | `message.received`            |
 | Session | Your connected OpenWA session |
 
 The incoming message body is available at:
@@ -59,17 +59,17 @@ For a production workflow, replace this with a classifier, a structured form flo
 
 ## Normalize the Request
 
-Add a **Set** node to extract the values your booking system expects.
+Add a **Set** node named `Normalize request` to extract the values your booking system expects.
 
 Suggested fields:
 
-| Field | Example value |
-| ----- | ------------- |
-| `chatId` | `{{$json.data.chatId}}` |
-| `phone` | `{{$json.data.from}}` |
-| `message` | `{{$json.data.body}}` |
+| Field           | Example value                                      |
+| --------------- | -------------------------------------------------- |
+| `chatId`        | `{{$json.data.chatId}}`                            |
+| `phone`         | `{{$json.data.from}}`                              |
+| `message`       | `{{$json.data.body}}`                              |
 | `requestedDate` | Parsed date from the message or a default fallback |
-| `service` | Parsed service name or workflow default |
+| `service`       | Parsed service name or workflow default            |
 
 If the message does not contain enough information, send a clarification question instead of creating a booking.
 
@@ -83,13 +83,13 @@ Thanks. What day and time would you prefer for the appointment?
 
 Use whichever node matches your scheduling source:
 
-| Source | n8n node |
-| ------ | -------- |
-| Google Calendar | Google Calendar or HTTP Request |
-| Cal.com | HTTP Request |
-| Internal API | HTTP Request |
-| Database | PostgreSQL / MySQL / SQLite node |
-| Spreadsheet | Google Sheets |
+| Source          | n8n node                         |
+| --------------- | -------------------------------- |
+| Google Calendar | Google Calendar or HTTP Request  |
+| Cal.com         | HTTP Request                     |
+| Internal API    | HTTP Request                     |
+| Database        | PostgreSQL / MySQL / SQLite node |
+| Spreadsheet     | Google Sheets                    |
 
 The availability step should return whether the requested slot is available and, if not, a small list of alternatives.
 
@@ -97,12 +97,14 @@ The availability step should return whether the requested slot is available and,
 
 When the requested slot is available, create the booking in your scheduling source and send a confirmation with the **OpenWA: Send Text** node.
 
-| Field | Value |
-| ----- | ----- |
-| Resource | Message |
-| Operation | Send Text |
-| Chat ID | `{{$json.chatId}}` |
-| Text | Confirmation message |
+| Field     | Value                                           |
+| --------- | ----------------------------------------------- |
+| Resource  | Message                                         |
+| Operation | Send Text                                       |
+| Chat ID   | `{{ $('Normalize request').item.json.chatId }}` |
+| Text      | Confirmation message                            |
+
+Each node replaces `$json` with its own output, so after **Create Booking** `$json` holds the booking system's response, not `chatId`. Read fields from the trigger or the Set node by name through `$('<node name>').item.json`.
 
 Example confirmation text:
 
@@ -114,7 +116,7 @@ Reply CANCEL if you need to cancel or change it.
 
 ## Alternative Slots Message
 
-When the requested slot is not available, send available alternatives instead of failing silently.
+When the requested slot is not available, send available alternatives instead of failing silently. Use the same Chat ID expression, `{{ $('Normalize request').item.json.chatId }}`, on this **OpenWA: Send Text** node.
 
 Example text:
 

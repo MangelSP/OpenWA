@@ -4,6 +4,7 @@ import { SearchController } from './search.controller';
 import { SearchService } from './search.service';
 import { SearchProviderRegistry } from './search-provider.registry';
 import { BuiltInFtsProvider } from './providers/builtin-fts.provider';
+import { PLUGIN_SEARCH_REGISTRY_PORT } from '../../core/plugins/plugin-host-ports';
 
 /**
  * Wires the global search feature: the route (SearchController), the service layer (SearchService),
@@ -15,7 +16,8 @@ import { BuiltInFtsProvider } from './providers/builtin-fts.provider';
  * from `SEARCH_ENABLED=false`, which omits the module entirely (route 404).
  *
  * The module is imported by AppModule only when `SEARCH_ENABLED !== 'false'`. Plugin providers
- * (Spec 2) will register themselves the same way and `auto` will select a healthy plugin over builtin.
+ * register themselves through the same registry; in `auto` mode the most recently registered plugin
+ * supersedes builtin (no health gating).
  */
 export function bootstrapSearchProviders(
   registry: SearchProviderRegistry,
@@ -47,6 +49,11 @@ export function bootstrapSearchProviders(
       inject: [SearchProviderRegistry, BuiltInFtsProvider, ConfigService],
       useFactory: bootstrapSearchProviders,
     },
+    // Binds the core-owned plugin capability port to this module's registry; resolved lazily by the
+    // plugin runtime (PluginHostServices), which no-ops when this whole module is omitted
+    // (SEARCH_ENABLED=false).
+    // An alias, not a factory, so lifecycle hooks are not dispatched twice on the same instance.
+    { provide: PLUGIN_SEARCH_REGISTRY_PORT, useExisting: SearchProviderRegistry },
   ],
 })
 export class SearchModule {}

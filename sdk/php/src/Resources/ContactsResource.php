@@ -35,7 +35,11 @@ class ContactsResource
         return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/contacts/{$this->http->encodeSegment($contactId)}");
     }
 
-    /** @return array<string,mixed> */
+    /**
+     * Check whether a number is on WhatsApp. Requires an OPERATOR key.
+     *
+     * @return array<string,mixed>
+     */
     public function check(string $sessionId, string $number): array
     {
         return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/contacts/check/{$this->http->encodeSegment($number)}");
@@ -68,15 +72,57 @@ class ContactsResource
         return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/contacts/{$this->http->encodeSegment($contactId)}/phone");
     }
 
-    /** @return array<string,mixed> */
+    /**
+     * Block a contact. Requires an OPERATOR key.
+     *
+     * @return array<string,mixed>
+     */
     public function block(string $sessionId, string $contactId): array
     {
         return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/contacts/{$this->http->encodeSegment($contactId)}/block");
     }
 
-    /** @return array<string,mixed> */
+    /**
+     * Save a contact to the addressbook, or edit an existing entry. Requires an OPERATOR key.
+     *
+     * @param array<string,mixed> $body firstName and an optional lastName.
+     * @return array<string,mixed>
+     */
+    public function upsert(string $sessionId, string $contactId, array $body): array
+    {
+        return $this->http->request('PUT', "/api/sessions/{$this->http->encodeSegment($sessionId)}/contacts/{$this->http->encodeSegment($contactId)}", [], $body) ?? [];
+    }
+
+    /**
+     * Remove a contact from the addressbook. Requires an OPERATOR key.
+     *
+     * @return array<string,mixed>
+     */
+    public function delete(string $sessionId, string $contactId): array
+    {
+        return $this->http->request('DELETE', "/api/sessions/{$this->http->encodeSegment($sessionId)}/contacts/{$this->http->encodeSegment($contactId)}") ?? [];
+    }
+
+    /**
+     * Unblock a contact. Requires an OPERATOR key.
+     *
+     * @return array<string,mixed>
+     */
     public function unblock(string $sessionId, string $contactId): array
     {
         return $this->http->request('DELETE', "/api/sessions/{$this->http->encodeSegment($sessionId)}/contacts/{$this->http->encodeSegment($contactId)}/block");
+    }
+
+    /**
+     * List the JIDs this account has blocked.
+     *
+     * Session-wide, so it takes no contact id — unlike block() and unblock(), which act on one
+     * contact. Returns a bare list of ids, not contact records.
+     *
+     * @return array<int,string>
+     */
+    public function listBlocked(string $sessionId): array
+    {
+        return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/contacts/blocked");
     }
 }

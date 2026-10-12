@@ -7,7 +7,7 @@ import {
 
 export interface ConversationSendDeps {
   manifest: PluginManifest;
-  assertPermission: (manifest: PluginManifest, permission: string) => void;
+  assertPermission: (manifest: PluginManifest, permission: PluginCapabilityPermission) => void;
   // Full session gate for THIS plugin (manifest scope AND operator activation), bound to the plugin by
   // the loader — so conversation.send is confined to activated sessions like every other capability.
   assertSessionActive: (sessionId: string) => void;
@@ -18,7 +18,7 @@ export interface ConversationSendDeps {
   // synchronously inside sendText/reply. 'message:sent' is emitted later by SessionEngineLifecycle's
   // engine callback (onMessageCreate), outside this call's async scope, so seeding it here would be a no-op.
   runGuarded: <T>(events: string[], run: () => Promise<T>) => Promise<T>;
-  sendText: (sessionId: string, opts: { chatId: string; text: string }) => Promise<unknown>;
+  sendText: (sessionId: string, opts: { chatId: string; text: string; linkPreview?: boolean }) => Promise<unknown>;
   reply: (sessionId: string, opts: { chatId: string; quotedMessageId: string; text: string }) => Promise<unknown>;
   // Media send by URL. The loader binds this to the per-type MessageService media methods
   // (sendImage/sendVideo/sendAudio/sendDocument) — the facade stays DTO-agnostic.
@@ -62,8 +62,8 @@ export function buildConversationSendFacade(deps: ConversationSendDeps) {
         // A location envelope is delivered as a native location pin. Without valid coordinates there
         // is NOTHING to send — reject loudly instead of degrading to an empty text message.
         if (env.type === 'location') {
-          // The engine location path cannot quote a message, so a location reply is not expressible.
-          // Reject rather than silently drop the quote (same rule as media).
+          // The plugin location port (ConversationSendDeps, PluginMessagePort) carries no quotedMessageId,
+          // so a location reply would lose its quote. Reject rather than silently drop it (same rule as media).
           if (env.replyTo) {
             throw new PluginCapabilityError('conversation.send: replyTo is not supported for location messages');
           }
@@ -83,8 +83,8 @@ export function buildConversationSendFacade(deps: ConversationSendDeps) {
         // nothing to send as media, so it falls through to the text/reply path — a plugin that puts the
         // URL in `text` as a fallback still delivers a (text) message rather than erroring.
         if (isMediaType(env.type) && env.mediaUrl) {
-          // The engine media path takes only (chatId, media) — it cannot quote a message, so a media
-          // reply is not expressible. Reject rather than silently drop the quote.
+          // The plugin media port (ConversationSendDeps, PluginMessagePort) carries no quotedMessageId, so
+          // a media reply would lose its quote. Reject rather than silently drop it.
           if (env.replyTo) {
             throw new PluginCapabilityError('conversation.send: replyTo is not supported for media messages');
           }
@@ -93,7 +93,14 @@ export function buildConversationSendFacade(deps: ConversationSendDeps) {
         if (env.replyTo) {
           return deps.reply(sessionId, { chatId, quotedMessageId: env.replyTo, text: env.text ?? '' });
         }
-        return deps.sendText(sessionId, { chatId, text: env.text ?? '' });
+        // Forwarded only when the plugin actually expressed a choice: MessageService widens the engine
+        // call whenever the key is present, so a blanket `linkPreview: undefined` would rewrite the call
+        // shape of every plugin send that never asked for a preview.
+        return deps.sendText(sessionId, {
+          chatId,
+          text: env.text ?? '',
+          ...(env.linkPreview === undefined ? {} : { linkPreview: env.linkPreview }),
+        });
       });
     },
   };

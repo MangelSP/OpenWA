@@ -1,8 +1,16 @@
 import { Controller, Get, Optional } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse } from '@nestjs/swagger';
+import {
+  AvailableEngineDto,
+  InfraCurrentEngineResponseDto,
+  InfraHealthResponseDto,
+  InfraStatusResponseDto,
+  InfraUpdateCheckResponseDto,
+} from './dto/infra-response.dto';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { QUEUE_NAMES } from '../queue/queue-names';
+import { producerReady } from '../queue/redis-connection';
 import { ConfigService } from '@nestjs/config';
 import { DataSource } from 'typeorm';
 import { InjectDataSource } from '@nestjs/typeorm';
@@ -15,6 +23,9 @@ import { CacheService } from '../../common/cache/cache.service';
 import { StorageService } from '../../common/storage/storage.service';
 import { createLogger } from '../../common/services/logger.service';
 import { readGeneratedEnv } from './generated-env';
+import { isEnvPinned } from '../../config/env-precedence';
+import { DEFAULT_PUPPETEER_ARGS } from '../../config/configuration';
+import { checkForUpdate, type UpdateCheck } from './update-check';
 
 interface InfraStatus {
   // `builtIn` reflects whether OpenWA's own bundled container is actually running and backing this
@@ -37,7 +48,29 @@ interface InfraStatus {
     webVersion?: string | null;
     webVersionSource?: 'pinned' | 'auto' | 'native';
   };
+  // Which of the settings this page can edit are supplied by a layer ABOVE data/.env.generated (the
+  // container environment or a project .env) and therefore cannot be changed from the dashboard until
+  // that layer is. Reported rather than inferred: a running-vs-saved mismatch is also what a save that
+  // has not been restarted yet looks like, and the two need opposite advice (#1082).
+  envPinned: string[];
 }
+
+/**
+ * The keys behind the Infrastructure page's editable controls that a shipped compose file or an
+ * operator variable is known to pin. docker-compose.dev.yml pins the local storage path and the three
+ * whatsapp-web.js launch options with non-empty defaults. Only page controls are reported: naming
+ * variables the page cannot edit would be noise.
+ */
+const DASHBOARD_PINNABLE_ENV_KEYS = [
+  'DATABASE_TYPE',
+  'REDIS_ENABLED',
+  'STORAGE_TYPE',
+  'STORAGE_LOCAL_PATH',
+  'ENGINE_TYPE',
+  'PUPPETEER_HEADLESS',
+  'SESSION_DATA_PATH',
+  'PUPPETEER_ARGS',
+];
 
 @ApiTags('infrastructure')
 @Controller('infra')
@@ -94,7 +127,7 @@ export class InfraStatusController {
   @Get('status')
   @RequireRole(ApiKeyRole.ADMIN)
   @ApiOperation({ summary: 'Get infrastructure status' })
-  @ApiResponse({ status: 200, description: 'Infrastructure status' })
+  @ApiResponse({ status: 200, description: 'Infrastructure status', type: InfraStatusResponseDto })
   async getStatus(): Promise<InfraStatus> {
     // Active DB liveness probe (SELECT 1) on both connections in parallel — not just isInitialized,
     // which stays true after a Postgres backend dies until an explicit .destroy() (see probeDbConnected).
@@ -131,7 +164,7 @@ export class InfraStatusController {
     if (engineType === 'whatsapp-web.js') {
       // Kick the auto-resolve but DON'T await it — /infra/status is polled frequently and the registry
       // fetch can take up to 5s on a firewalled host. Read whatever's cached now (null until the first
-      // success); a later poll reflects the resolved build. (#488 review)
+      // success); a later poll reflects the resolved build. (#488)
       if (getEffectiveWebVersionInfo().source === 'auto') {
         void resolveCurrentWebVersion().catch(() => undefined);
       }
@@ -144,7 +177,7 @@ export class InfraStatusController {
     const engineHeadless = this.configService.get<boolean>('engine.puppeteer.headless', true) ?? true;
     const sessionDataPath = this.configService.get<string>('engine.sessionDataPath', './data/sessions');
     const browserArgs =
-      this.configService.get<string[]>('engine.puppeteer.args')?.join(' ') || '--no-sandbox --disable-gpu';
+      this.configService.get<string[]>('engine.puppeteer.args')?.join(' ') || DEFAULT_PUPPETEER_ARGS.join(' ');
 
     // Built-in detection: prefer the actually-running bundled container as truth (so a stopped/missing
     // container, or a host-pinned external host, reads as NOT built-in), and require the app to be
@@ -166,6 +199,7 @@ export class InfraStatusController {
     let webhooks = { pending: 0, completed: 0, failed: 0 };
     if (queueEnabled && this.webhookQueue) {
       try {
+        await producerReady(this.webhookQueue);
         const counts = await this.webhookQueue.getJobCounts('wait', 'active', 'delayed', 'completed', 'failed');
         webhooks = {
           pending: (counts.wait ?? 0) + (counts.active ?? 0) + (counts.delayed ?? 0),
@@ -204,6 +238,7 @@ export class InfraStatusController {
         browserArgs,
         ...(engineType === 'whatsapp-web.js' ? { webVersion, webVersionSource } : {}),
       },
+      envPinned: DASHBOARD_PINNABLE_ENV_KEYS.filter(isEnvPinned),
     };
   }
 
@@ -224,7 +259,7 @@ export class InfraStatusController {
   @Get('engines')
   @RequireRole(ApiKeyRole.ADMIN)
   @ApiOperation({ summary: 'Get available WhatsApp engines' })
-  @ApiResponse({ status: 200, description: 'List of available engines' })
+  @ApiResponse({ status: 200, description: 'List of available engines', type: [AvailableEngineDto] })
   getEngines(): Array<{ id: string; name: string; enabled: boolean; features: string[] }> {
     return this.engineFactory.getAvailableEngines();
   }
@@ -232,15 +267,32 @@ export class InfraStatusController {
   @Get('engines/current')
   @RequireRole(ApiKeyRole.ADMIN)
   @ApiOperation({ summary: 'Get current active engine' })
-  @ApiResponse({ status: 200, description: 'Current engine info' })
+  @ApiResponse({ status: 200, description: 'Current engine info', type: InfraCurrentEngineResponseDto })
   getCurrentEngine(): { engineType: string } {
     return { engineType: this.engineFactory.getCurrentEngine() };
+  }
+
+  @Get('update-check')
+  @RequireRole(ApiKeyRole.ADMIN)
+  @ApiOperation({
+    summary: 'Compare the running version with the latest OpenWA release',
+    description:
+      'Reads the latest published GitHub release through the SSRF-guarded fetch and caches it. ' +
+      'Set UPDATE_CHECK_ENABLED=false to turn the outbound request off.',
+  })
+  @ApiResponse({ status: 200, description: 'Update check result', type: InfraUpdateCheckResponseDto })
+  getUpdateCheck(): Promise<UpdateCheck> {
+    return checkForUpdate();
   }
 
   @Get('health')
   @Public()
   @ApiOperation({ summary: 'Health check endpoint' })
-  @ApiResponse({ status: 200, description: 'Server is healthy' })
+  @ApiResponse({
+    status: 200,
+    description: 'Process is up. This route does not probe dependencies — read /infra/status for those.',
+    type: InfraHealthResponseDto,
+  })
   healthCheck(): { status: string; timestamp: string } {
     return {
       status: 'ok',

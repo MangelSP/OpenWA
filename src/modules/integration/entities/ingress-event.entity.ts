@@ -8,8 +8,10 @@ import { DateTransformer } from '../../../common/transformers/date.transformer';
 //  - 'dispatched' — the event reached the dispatch tier (handed to BullMQ or delivered inline). A
 //                   failure INSIDE the tier (BullMQ attempts exhausted) dead-letters separately, so a
 //                   'dispatched' row is never the reconciler's concern.
-//  - 'failed'     — terminal: the reconciler exhausted its replay budget; recovery continues via the
-//                   integration_delivery_failures row + RedriveService.
+//  - 'failed'     — terminal: the reconciler exhausted its replay budget or found the queue job failed,
+//                   or the row aged past INGRESS_DEDUP_RETENTION_DAYS undispatched; recovery continues
+//                   via the integration_delivery_failures row + RedriveService (none is written when the
+//                   instance or session was deleted).
 // NULL marks rows that predate these columns on synchronize-bootstrapped DBs (no backfill ran there);
 // NULL reads as "not watched" — the reconciler never sweeps it, so an upgrade can never mass-replay
 // the historical dedup log.
@@ -32,50 +34,59 @@ export class IngressEvent {
   // Host-minted uuid (crypto.randomUUID()), NOT DB-generated — the id and the jobId (= deliveryId)
   // are decoupled on purpose. @PrimaryColumn, not @PrimaryGeneratedColumn.
   @PrimaryColumn()
-  id: string;
+  id!: string;
 
   @Column()
-  instanceId: string;
+  instanceId!: string;
 
   @Column()
-  pluginId: string;
+  pluginId!: string;
 
   @Column()
-  providerDeliveryId: string;
+  providerDeliveryId!: string;
 
   @Column()
-  route: string;
+  route!: string;
 
   // NULL once the dispatch outcome is recorded (see the storage-shape comment above). The reconciler
   // only replays 'pending' rows, which always still carry the payload. NULL on a 'pending' row is
-  // unreadable history (e.g. imported without one) — the reconciler skips it loudly.
+  // unreadable history (e.g. imported without one); the reconciler's sweep query excludes it silently,
+  // and it stays pending until INGRESS_DEDUP_RETENTION_DAYS prunes it.
+  // `method` is the request's HTTP method, so a replay reaches the handler as the live attempt did. Rows
+  // written before it was persisted lack it, and dispatch falls back to 'POST' for them.
   @Column({ type: jsonColumnType(), nullable: true })
-  payload: { headers: Record<string, string>; query: Record<string, string>; body: string; rawBody: string } | null;
+  payload!: {
+    headers: Record<string, string>;
+    query: Record<string, string>;
+    body: string;
+    rawBody: string;
+    method?: string;
+  } | null;
 
   // sha256 hex of the rawBody, written at recordOrSkip. Survives payload retirement so operators can
   // still correlate a dedup row with a provider delivery without storing the payload. NULL on rows
   // that predate the column (no backfill — their payloads are retired anyway).
   @Column({ type: 'varchar', nullable: true })
-  payloadHash: string | null;
+  payloadHash!: string | null;
 
   @Column({ type: 'varchar', nullable: true })
-  sessionId: string | null;
+  sessionId!: string | null;
 
   // Nullable by design (see the IngressDispatchState comment above): NO DB default, because the
   // default 'pending' would also stamp pre-upgrade rows on the synchronize path and the reconciler
   // would replay the whole dedup log on deploy. New rows are 'pending' via recordOrSkip explicitly;
   // migration-managed DBs backfill existing rows to 'dispatched' instead.
   @Column({ type: 'varchar', nullable: true })
-  dispatchState: IngressDispatchState | null;
+  dispatchState!: IngressDispatchState | null;
 
   // Dispatch-attempt counter the reconciler caps its replay budget against; the live path bumps it
   // on a swallowed inline-dispatch failure so those retries count too.
   @Column({ type: 'int', default: 0 })
-  dispatchAttempts: number;
+  dispatchAttempts!: number;
 
   @Column({ type: dateColumnType(), nullable: true, transformer: DateTransformer })
-  lastDispatchAt: Date | null;
+  lastDispatchAt!: Date | null;
 
   @CreateDateColumn()
-  createdAt: Date;
+  createdAt!: Date;
 }

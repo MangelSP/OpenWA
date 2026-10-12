@@ -1,8 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseMessageBody, type MessageNode } from './messageFormatter.ts';
+import { MENTION_CLOSE, MENTION_OPEN, parseMessageBody, type MessageNode } from './messageFormatter.ts';
 
 const text = (value: string): MessageNode => ({ type: 'text', value });
+const wrap = (s: string) => `${MENTION_OPEN}${s}${MENTION_CLOSE}`;
 
 test('plain text returns a single text node', () => {
   assert.deepEqual(parseMessageBody('hello world'), [text('hello world')]);
@@ -21,45 +22,31 @@ test('*bold* wraps with bold', () => {
 });
 
 test('_italic_ wraps with italic', () => {
-  assert.deepEqual(parseMessageBody('_em_'), [
-    { type: 'italic', children: [text('em')] },
-  ]);
+  assert.deepEqual(parseMessageBody('_em_'), [{ type: 'italic', children: [text('em')] }]);
 });
 
 test('~strike~ wraps with strike', () => {
-  assert.deepEqual(parseMessageBody('~gone~'), [
-    { type: 'strike', children: [text('gone')] },
-  ]);
+  assert.deepEqual(parseMessageBody('~gone~'), [{ type: 'strike', children: [text('gone')] }]);
 });
 
 test('`inline` produces a code node with literal value', () => {
-  assert.deepEqual(parseMessageBody('use `npm i` now'), [
-    text('use '),
-    { type: 'code', value: 'npm i' },
-    text(' now'),
-  ]);
+  assert.deepEqual(parseMessageBody('use `npm i` now'), [text('use '), { type: 'code', value: 'npm i' }, text(' now')]);
 });
 
 test('```block``` produces a codeblock node with literal value', () => {
-  assert.deepEqual(parseMessageBody('```line1\nline2```'), [
-    { type: 'codeblock', value: 'line1\nline2' },
-  ]);
+  assert.deepEqual(parseMessageBody('```line1\nline2```'), [{ type: 'codeblock', value: 'line1\nline2' }]);
 });
 
 test('code segments do not get formatted inside', () => {
   // The `*not*` inside the code segment stays literal.
-  assert.deepEqual(parseMessageBody('`*not*`'), [
-    { type: 'code', value: '*not*' },
-  ]);
+  assert.deepEqual(parseMessageBody('`*not*`'), [{ type: 'code', value: '*not*' }]);
 });
 
 test('nesting: *_a_* -> bold(italic(a))', () => {
   assert.deepEqual(parseMessageBody('*_a_*'), [
     {
       type: 'bold',
-      children: [
-        { type: 'italic', children: [text('a')] },
-      ],
+      children: [{ type: 'italic', children: [text('a')] }],
     },
   ]);
 });
@@ -88,9 +75,7 @@ test('multiple consecutive formats: *a* _b_', () => {
 test('marker without outside boundary stays literal (no over-formatting)', () => {
   // 'word*bold*end' has no boundary char before the opening '*' nor after the closer.
   // Per WhatsApp rules this is literal text — the boundary guard prevents over-formatting.
-  assert.deepEqual(parseMessageBody('word*bold*end'), [
-    { type: 'text', value: 'word*bold*end' },
-  ]);
+  assert.deepEqual(parseMessageBody('word*bold*end'), [{ type: 'text', value: 'word*bold*end' }]);
 });
 
 // Deepest bold/italic/strike nesting in a parsed tree; text/code leaves count as 0.
@@ -104,8 +89,7 @@ test('hostile input: deep marker nesting is capped instead of overflowing the st
   const nodes = parseMessageBody(evil);
   assert.ok(treeDepth(nodes) <= 20, `nesting depth ${treeDepth(nodes)} exceeds the cap`);
   // Beyond the cap the leftover markers degrade to literal text — nothing is dropped.
-  const flat = (ns: MessageNode[]): string =>
-    ns.map(n => ('children' in n ? flat(n.children) : n.value)).join('');
+  const flat = (ns: MessageNode[]): string => ns.map(n => ('children' in n ? flat(n.children) : n.value)).join('');
   const rendered = flat(nodes);
   assert.ok(rendered.includes('a'));
   assert.ok(rendered.includes('*_'), 'unparsed markers must survive as literal text');
@@ -117,4 +101,63 @@ test('hostile input: a flood of formatted segments parses iteratively', () => {
   assert.equal(nodes.length, 200_000); // bold + ' ' text per repetition
   assert.deepEqual(nodes[0], { type: 'bold', children: [text('a')] });
   assert.deepEqual(nodes[1], text(' '));
+});
+
+test('hostile input: openers with no closer do not rescan the rest of the message each time', () => {
+  // Every `*` below follows a space, so none can close, and each opener used to scan to the end of
+  // the body: about 3 s of main thread for one 64k message. The second body adds a valid span per
+  // repetition, which used to rescan the dead `_` openers after every split.
+  for (const evil of ['*a '.repeat(21_000), '_a *b* '.repeat(9_000)]) {
+    const started = performance.now();
+    const nodes = parseMessageBody(evil);
+    const elapsed = performance.now() - started;
+    assert.ok(elapsed < 500, `parsing ${evil.length} chars took ${Math.round(elapsed)} ms`);
+    assert.ok(nodes.length > 0);
+  }
+  assert.deepEqual(parseMessageBody('*a '.repeat(3)), [text('*a *a *a ')]);
+  assert.deepEqual(parseMessageBody('_a *b* _a'), [text('_a '), { type: 'bold', children: [text('b')] }, text(' _a')]);
+});
+
+test('a MENTION_OPEN/MENTION_CLOSE span becomes its own mention node, not text', () => {
+  assert.deepEqual(parseMessageBody(`hi ${wrap('@Ravi')} there`), [
+    text('hi '),
+    { type: 'mention', value: '@Ravi' },
+    text(' there'),
+  ]);
+});
+
+test('a mention value is opaque to code/format parsing: *, ~ and ` inside it stay literal', () => {
+  assert.deepEqual(parseMessageBody(wrap('@*Ravi*')), [{ type: 'mention', value: '@*Ravi*' }]);
+});
+
+test('an unterminated mention marker falls back to one plain text node instead of dropping content', () => {
+  // Should not occur from resolveMentions in practice (it always closes what it opens); this only
+  // guards against silently losing the rest of the message if it ever does.
+  assert.deepEqual(parseMessageBody(`hi ${MENTION_OPEN}@Ravi`), [text(`hi ${MENTION_OPEN}@Ravi`)]);
+});
+
+test('two mentions in one message each become their own node', () => {
+  assert.deepEqual(parseMessageBody(`${wrap('@Ravi')} and ${wrap('@Sam')}`), [
+    { type: 'mention', value: '@Ravi' },
+    text(' and '),
+    { type: 'mention', value: '@Sam' },
+  ]);
+});
+
+test('a mention inside *bold* keeps the bold: the split happens at the text leaf, after format parsing', () => {
+  assert.deepEqual(parseMessageBody(`*Reminder ${wrap('@Ravi')} at 10*`), [
+    { type: 'bold', children: [text('Reminder '), { type: 'mention', value: '@Ravi' }, text(' at 10')] },
+  ]);
+});
+
+test('a format marker inside a mention name neither opens nor closes a span around it', () => {
+  assert.deepEqual(parseMessageBody(`*a ${wrap('@*x*')} b*`), [
+    { type: 'bold', children: [text('a '), { type: 'mention', value: '@*x*' }, text(' b')] },
+  ]);
+});
+
+test('a mention that fills a *bold* span on its own resolves and keeps the bold', () => {
+  assert.deepEqual(parseMessageBody(`*${wrap('@Ravi')}*`), [
+    { type: 'bold', children: [{ type: 'mention', value: '@Ravi' }] },
+  ]);
 });
