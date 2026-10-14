@@ -72,6 +72,10 @@ export enum AuditAction {
   INFRA_DATA_IMPORTED = 'infra_data_imported',
   INFRA_STORAGE_EXPORTED = 'infra_storage_exported',
   INFRA_STORAGE_IMPORTED = 'infra_storage_imported',
+  // Runtime override of the send-pacing policy (PUT / DELETE /infra/send-pacing). No secrets involved,
+  // so the new values are recorded in full.
+  INFRA_SEND_PACING_UPDATED = 'infra_send_pacing_updated',
+  INFRA_SEND_PACING_RESET = 'infra_send_pacing_reset',
 }
 
 export enum AuditSeverity {

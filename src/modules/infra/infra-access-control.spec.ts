@@ -23,6 +23,7 @@ jest.mock('fs', () => {
 import { Reflector } from '@nestjs/core';
 import { InfraStatusController } from './infra-status.controller';
 import { InfraConfigController } from './infra-config.controller';
+import { InfraSendPacingController } from './infra-send-pacing.controller';
 import { InfraDataController } from './infra-data.controller';
 import { InfraStorageController } from './infra-storage.controller';
 import { REQUIRED_ROLE_KEY } from '../auth/decorators/auth.decorators';
@@ -39,6 +40,9 @@ describe('Infra controllers access control', () => {
     [InfraConfigController, 'getConfig'], // GET  /infra/config (returns saved config; secrets omitted but still ADMIN-only)
     [InfraConfigController, 'saveConfig'], // PUT  /infra/config
     [InfraConfigController, 'requestRestart'], // POST /infra/restart
+    [InfraSendPacingController, 'getSendPacing'], // GET    /infra/send-pacing
+    [InfraSendPacingController, 'updateSendPacing'], // PUT    /infra/send-pacing (changes who may send, live)
+    [InfraSendPacingController, 'resetSendPacing'], // DELETE /infra/send-pacing
     [InfraDataController, 'exportData'], // GET  /infra/export-data  (dumps every data-DB table)
     [InfraDataController, 'importData'], // POST /infra/import-data  (DELETEs all rows)
     [InfraStorageController, 'exportStorage'], // GET  /infra/storage/export

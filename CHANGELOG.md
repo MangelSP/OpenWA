@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Expose caller-supplied send idempotency keys in all five SDKs.
 - Add optional 24-hour idempotency keys to twelve single-recipient send routes.
 - Add opt-in archive-only chat media with dashboard previews.
+- Change the send-pacing policy at runtime with `PUT /api/infra/send-pacing` (ADMIN key), without editing env vars or restarting; the override is kept in `data/send-pacing.json` and `DELETE` returns to the `SEND_PACING_*` values.
 
 ### Changed
 

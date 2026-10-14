@@ -654,7 +654,7 @@ plugin instances (`integration_instance_created`, `integration_instance_updated`
 `integration_instance_secret_regenerated`, `integration_instance_deleted`,
 `integration_instance_redriven`), and ADMIN-only infrastructure operations (`infra_config_saved`,
 `infra_restart_requested`, `infra_data_exported`, `infra_data_imported`, `infra_storage_exported`,
-`infra_storage_imported`).
+`infra_storage_imported`, `infra_send_pacing_updated`, `infra_send_pacing_reset`).
 
 Eight of these are reserved and never emitted, so no row ever carries them: `api_key_used`,
 `session_connected`, `message_sent`, `message_failed`, `webhook_created`, `webhook_deleted`,

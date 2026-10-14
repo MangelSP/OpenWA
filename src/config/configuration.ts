@@ -1,6 +1,6 @@
 import * as path from 'path';
 import { computeFeatureFlags } from './feature-flags';
-import { computeSendPacingConfig } from '../modules/message/send-pacing.config';
+import { loadSendPacingConfig } from '../modules/infra/send-pacing-override';
 import { resolveInflightBodyBudgetBytes } from './inflight-body-budget';
 import { resolveRequestTimeoutMs } from './http-timeouts';
 import { readWsRateLimitConfig } from '../modules/events/ws-rate-limit';
@@ -21,9 +21,9 @@ import { DEFAULT_WEBHOOK_SHUTDOWN_DRAIN_MS, MAX_TIMER_MS } from '../common/servi
  * would follow it, so a knob by that name would move part of the state while looking like it moved
  * all of it.
  *
- * PLUGIN_STATE_DIR is that objection answered rather than repeated: this value reaches exactly one
- * consumer, PluginStorageService, so the knob is named for the registry and per-plugin storage it
- * actually moves and claims nothing about the rest of the tree. Without it the plugin registry is
+ * PLUGIN_STATE_DIR is that objection answered rather than repeated: this value reaches exactly two
+ * consumers, PluginStorageService and the send-pacing override file (`send-pacing.json`), so the knob
+ * is named for the state it actually moves and claims nothing about the rest of the tree. Without it the plugin registry is
  * the one piece of state a test lane cannot redirect, which is why every e2e suite in a run shares
  * one registry file and rewrites the developer's copy of it.
  */
@@ -147,7 +147,9 @@ export default () => ({
 
   // Outbound send pacing. Its own object rather than a feature flag: every field needs clamping,
   // because a bad value here decides whether messages are refused. See message/send-pacing.config.ts.
-  sendPacing: computeSendPacingConfig(),
+  // The env policy with the admin's runtime override (<dataDir>/send-pacing.json) laid over it, read
+  // here so the very first send already sees it; PUT /infra/send-pacing swaps it live via ConfigService.set.
+  sendPacing: loadSendPacingConfig(process.env.PLUGIN_STATE_DIR || DEFAULT_DATA_DIR),
 
   // Redis configuration
   redis: {

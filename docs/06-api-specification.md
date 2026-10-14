@@ -1724,6 +1724,14 @@ the whole day's allowance cannot fit that day however long it waits, so it is re
 no `retryAfterSeconds`; split it into batches no larger than the allowance. No message is sent, so
 neither call consumes the overall daily send allowance.
 
+**Changing the policy without a restart.** The `SEND_PACING_*` variables are read at boot, but an
+ADMIN key can override the policy at runtime with `PUT /api/infra/send-pacing` (see
+[`/api/infra/send-pacing`](#get-apiinfrasend-pacing)): the next send is judged by the new values, in every
+session, with no env edit and no restart. The override is stored in `data/send-pacing.json`, so it survives a
+restart, and `DELETE /api/infra/send-pacing` returns to what the environment says. Fields the override does not
+set keep following their env var. A value the override sets is validated strictly (a bad one is a `400`, never a
+silent fallback to a default, which is what an invalid env var does).
+
 Two consequences worth knowing: a paced-out send fires **no** `message:sending` plugin hook (see
 `docs/19-plugin-architecture.md`), and refusals are counted in the `openwa_send_pacing_refusals_total`
 Prometheus counter, labelled by rule.
@@ -5455,7 +5463,7 @@ Unlike the other list routes this one is **not** a bare array: `data` is the pag
 
 Admin-facing operations: infrastructure status & config, the data/storage migration tooling, plugin lifecycle, and the optional MCP transport. Almost every route is **API key (ADMIN)**; the two exceptions are the public `GET /api/infra/health` and the `POST /mcp` JSON-RPC endpoint (see end of section). Every `/api/infra/*` and `/api/plugins/*` route except `GET /api/infra/health` and `PUT /api/plugins/:id/config/:sessionId` also refuses a key restricted to specific sessions (`@RequireUnscopedKey`): a key with a non-empty `allowedSessions` gets `403` `Session-scoped API keys are not permitted on this route` whatever its role, so use an unrestricted ADMIN key.
 
-> Note on the MCP request body: the entire `POST /mcp` envelope (mounted as a raw Express handler, outside the Nest pipe chain) is a **plain TS interface, not a class-validator DTO** — the global `whitelist`/`forbidNonWhitelisted` ValidationPipe does **not** run on it. Unknown fields pass through silently and no type/constraint checks happen, except the few field-level guards noted per endpoint. The infra bodies — `ImportDataDto` (`POST /api/infra/import-data`), `SaveConfigDto` (`PUT /api/infra/config`), `RestartDto` (`POST /api/infra/restart`), `ImportStorageDto` (`POST /api/infra/storage/import`) — and the plugin DTOs (`InstallFromUrlDto`, `PluginConfigDto`, `PluginSessionsDto`) _are_ class-validated and reject unknown fields with `400`. `ImportDataDto` additionally accepts, and ignores, the five metadata fields the export wraps `tables` in, so the backup file posts back unmodified.
+> Note on the MCP request body: the entire `POST /mcp` envelope (mounted as a raw Express handler, outside the Nest pipe chain) is a **plain TS interface, not a class-validator DTO** — the global `whitelist`/`forbidNonWhitelisted` ValidationPipe does **not** run on it. Unknown fields pass through silently and no type/constraint checks happen, except the few field-level guards noted per endpoint. The infra bodies — `ImportDataDto` (`POST /api/infra/import-data`), `SaveConfigDto` (`PUT /api/infra/config`), `RestartDto` (`POST /api/infra/restart`), `ImportStorageDto` (`POST /api/infra/storage/import`), `UpdateSendPacingDto` (`PUT /api/infra/send-pacing`) — and the plugin DTOs (`InstallFromUrlDto`, `PluginConfigDto`, `PluginSessionsDto`) _are_ class-validated and reject unknown fields with `400`. `ImportDataDto` additionally accepts, and ignores, the five metadata fields the export wraps `tables` in, so the backup file posts back unmodified.
 
 ---
 
@@ -5754,6 +5762,84 @@ Request a graceful server restart, optionally orchestrating Docker profiles (add
 ```
 
 `estimatedTime` (seconds, a typical healthy value rather than a bound; teardown is force-exited 67 s after the grace at the default `WEBHOOK_SHUTDOWN_DRAIN_MS`) = base 15 + 20/postgres + 13/redis + 15/minio + 5/removal. The echoed `profilesToRemove`, and the removal count, already omit any bundled service the environment pins the app to (for example `DATABASE_HOST=postgres` set in the host environment or the project `.env`); such a service is never stopped. `orchestration` is present only when Docker is available and at least one managed profile (`postgres`, `redis`, `minio`) remains in `profiles`; `removal` only when Docker is available and at least one managed profile remains in `profilesToRemove` after dropping pinned services and profiles that are also being started. Without Docker, a `data/.orchestration-request.json` signal file is written instead. After responding, `shutdownService.shutdown()` runs (default ~3s grace); readiness returns `503` during drain.
+
+**Errors:** `401` · `403`
+
+---
+
+#### GET /api/infra/send-pacing
+
+Read the [send-pacing](#send-pacing-opt-in-429-send_pacing_limited) policy in force, where it comes from, and the two layers beneath it.
+
+**Auth:** API key (ADMIN, not session-scoped)
+
+**Response** `200`
+
+```json
+{
+  "effective": {
+    "enabled": true,
+    "warmupSchedule": [30, 60, 120],
+    "coldSchedule": [5, 10, 20, 40, 60, 80, 100],
+    "breakerThreshold": 5,
+    "breakerCooldownMs": 900000
+  },
+  "source": "override",
+  "envDefaults": {
+    "enabled": false,
+    "warmupSchedule": [20, 40, 80, 160, 320, 640, 1000],
+    "coldSchedule": [5, 10, 20, 40, 60, 80, 100],
+    "breakerThreshold": 5,
+    "breakerCooldownMs": 900000
+  },
+  "defaults": {
+    "warmupSchedule": [20, 40, 80, 160, 320, 640, 1000],
+    "coldSchedule": [5, 10, 20, 40, 60, 80, 100],
+    "breakerThreshold": 5,
+    "breakerCooldownMs": 900000
+  }
+}
+```
+
+`effective` is the policy the next send is judged by. `source` is `override` while a runtime override is stored and `env` otherwise. `envDefaults` is what the `SEND_PACING_*` variables alone resolve to, and `defaults` the built-in values an unset variable falls back to. An empty `coldSchedule` means the cold-reachout rule is off.
+
+**Errors:** `401` · `403`
+
+---
+
+#### PUT /api/infra/send-pacing
+
+Change the send-pacing policy at runtime. The given fields are merged into the stored override, written to `data/send-pacing.json` (tmp file + rename) and applied to the next send; fields left out keep their value, so an update can be as small as `{ "enabled": false }`. The override is read back at boot, before the first send, and a missing or unusable file is logged and ignored, never fatal: the environment policy applies. The write happens first, so a failure to persist answers `500` and changes nothing. Recorded in the audit log as `infra_send_pacing_updated`, with the changed fields and the resulting policy.
+
+**Auth:** API key (ADMIN, not session-scoped)
+
+**Request body** — `UpdateSendPacingDto` (class-validated, and strict: any invalid or unknown field is a `400` and nothing is applied)
+
+| Field               | Type     | Required | Constraints                            | Description                                                                        |
+| ------------------- | -------- | -------- | -------------------------------------- | ---------------------------------------------------------------------------------- |
+| `enabled`           | boolean  | No       | `true` or `false` (`null` is rejected) | Turn the policy on or off                                                          |
+| `warmupSchedule`    | number[] | No       | 1 to 60 integers, each 1 to 100000     | Daily send allowance by session age in days; the last entry covers every later day |
+| `coldSchedule`      | number[] | No       | 0 to 60 integers, each 1 to 100000     | Daily allowance of new conversations by age; `[]` turns the rule off               |
+| `breakerThreshold`  | integer  | No       | `>= 1`                                 | Consecutive send failures that trip the breaker                                    |
+| `breakerCooldownMs` | integer  | No       | `>= 1000`                              | How long the open breaker blocks sends                                             |
+
+```json
+{ "enabled": true, "warmupSchedule": [30, 60, 120], "coldSchedule": [] }
+```
+
+**Response** `200` — the same body as `GET /api/infra/send-pacing`, with `source: "override"`.
+
+**Errors:** `400` an invalid or unknown field, or a body with no field at all · `401` · `403` · `500` the override could not be written to the data dir
+
+---
+
+#### DELETE /api/infra/send-pacing
+
+Drop the runtime override: `data/send-pacing.json` is removed and the next send is judged by the `SEND_PACING_*` environment policy again. Harmless when there is no override. Recorded in the audit log as `infra_send_pacing_reset`.
+
+**Auth:** API key (ADMIN, not session-scoped)
+
+**Response** `200` — the same body as `GET /api/infra/send-pacing`, with `source: "env"`.
 
 **Errors:** `401` · `403`
 

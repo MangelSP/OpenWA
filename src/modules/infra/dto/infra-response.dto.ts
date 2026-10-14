@@ -584,3 +584,68 @@ export class StorageImportResponseDto {
   @ApiProperty({ enum: ['local', 's3'], example: 'local' })
   storageType!: string;
 }
+
+// ---------- /infra/send-pacing ----------
+
+export class InfraSendPacingConfigDto {
+  @ApiProperty({ description: 'Whether the pacing policy refuses sends at all.', example: true })
+  enabled!: boolean;
+
+  @ApiProperty({
+    type: [Number],
+    description: 'Daily send allowance by session age in days; the last entry covers every later day.',
+    example: [20, 40, 80],
+  })
+  warmupSchedule!: number[];
+
+  @ApiProperty({
+    type: [Number],
+    description: 'Daily allowance of new conversations by session age in days; empty means the rule is off.',
+    example: [5, 10, 20],
+  })
+  coldSchedule!: number[];
+
+  @ApiProperty({ description: 'Consecutive send failures that trip the breaker.', example: 5 })
+  breakerThreshold!: number;
+
+  @ApiProperty({ description: 'How long the open breaker blocks sends, in milliseconds.', example: 900000 })
+  breakerCooldownMs!: number;
+}
+
+export class InfraSendPacingDefaultsDto {
+  @ApiProperty({ type: [Number], example: [20, 40, 80, 160, 320, 640, 1000] })
+  warmupSchedule!: number[];
+
+  @ApiProperty({ type: [Number], example: [5, 10, 20, 40, 60, 80, 100] })
+  coldSchedule!: number[];
+
+  @ApiProperty({ example: 5 })
+  breakerThreshold!: number;
+
+  @ApiProperty({ example: 900000 })
+  breakerCooldownMs!: number;
+}
+
+export class InfraSendPacingResponseDto {
+  @ApiProperty({ type: InfraSendPacingConfigDto, description: 'The policy the next send is judged by.' })
+  effective!: InfraSendPacingConfigDto;
+
+  @ApiProperty({
+    enum: ['env', 'override'],
+    description: '`override` while a runtime override is stored in the data dir, otherwise `env`.',
+    example: 'override',
+  })
+  source!: 'env' | 'override';
+
+  @ApiProperty({
+    type: InfraSendPacingConfigDto,
+    description: 'The policy the `SEND_PACING_*` environment variables alone resolve to.',
+  })
+  envDefaults!: InfraSendPacingConfigDto;
+
+  @ApiProperty({
+    type: InfraSendPacingDefaultsDto,
+    description: 'The built-in values an unset environment variable falls back to.',
+  })
+  defaults!: InfraSendPacingDefaultsDto;
+}

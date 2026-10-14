@@ -39,13 +39,22 @@ const DEFAULT_COLD_SCHEDULE = [5, 10, 20, 40, 60, 80, 100];
 const DEFAULT_BREAKER_THRESHOLD = 5;
 const DEFAULT_BREAKER_COOLDOWN_MS = 15 * 60_000;
 
+/** What an unset env var falls back to — shown next to the effective policy by `GET /infra/send-pacing`. */
+export const SEND_PACING_DEFAULTS = {
+  warmupSchedule: DEFAULT_WARMUP_SCHEDULE,
+  coldSchedule: DEFAULT_COLD_SCHEDULE,
+  breakerThreshold: DEFAULT_BREAKER_THRESHOLD,
+  breakerCooldownMs: DEFAULT_BREAKER_COOLDOWN_MS,
+};
+
 // A cap of 0 would refuse every send, which is never what a misconfigured value should mean, so the
 // floor is 1. The ceiling is a sanity bound, not a WhatsApp limit — nobody's real allowance is 100k,
 // and a fat-fingered value that large would silently disable the whole mechanism.
-const MIN_DAILY_CAP = 1;
-const MAX_DAILY_CAP = 100_000;
-const MIN_BREAKER_THRESHOLD = 1;
-const MIN_BREAKER_COOLDOWN_MS = 1000;
+// Exported so the strict runtime-override DTO enforces the same bounds the env parser clamps to.
+export const MIN_DAILY_CAP = 1;
+export const MAX_DAILY_CAP = 100_000;
+export const MIN_BREAKER_THRESHOLD = 1;
+export const MIN_BREAKER_COOLDOWN_MS = 1000;
 
 /**
  * Parse a comma-separated warm-up schedule (`"20,40,80"`). Any malformed entry falls the WHOLE
