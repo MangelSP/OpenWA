@@ -285,6 +285,36 @@ describe('MessageProjector', () => {
       expect(eventsGateway.emitMessage).not.toHaveBeenCalled();
     });
 
+    // Send pacing counts today's outgoing rows toward the gateway's daily allowance. A backfilled row
+    // carries the phone's real send time, so only this flag keeps it from being counted as a gateway send.
+    it('marks every backfilled row as history, whichever way it went', async () => {
+      messageRepository.find.mockResolvedValue([]);
+      const builder = {
+        insert: jest.fn().mockReturnThis(),
+        values: jest.fn().mockReturnThis(),
+        orIgnore: jest.fn().mockReturnThis(),
+        execute: jest.fn().mockResolvedValue({}),
+      };
+      Object.assign(messageRepository, { createQueryBuilder: jest.fn().mockReturnValue(builder) });
+
+      await projector.persistHistoryMessages('s1', engine, [
+        historyMessage({ id: 'SENT-FROM-PHONE', fromMe: true }),
+        historyMessage({ id: 'RECEIVED', fromMe: false }),
+      ]);
+
+      expect(messageRepository.create).toHaveBeenCalledTimes(2);
+      expect(messageRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          waMessageId: 'SENT-FROM-PHONE',
+          direction: MessageDirection.OUTGOING,
+          historySynced: true,
+        }),
+      );
+      expect(messageRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({ waMessageId: 'RECEIVED', direction: MessageDirection.INCOMING, historySynced: true }),
+      );
+    });
+
     it('skips rows that cannot become a valid message row, and queries nothing when none survive', async () => {
       await projector.persistHistoryMessages('s1', engine, [
         historyMessage({ id: '' }), // no id -> cannot de-dup
@@ -1360,6 +1390,20 @@ describe('MessageProjector (inbound projection)', () => {
       );
       expect(webhookService.dispatch).toHaveBeenCalledWith(SESSION_ID, 'message.sent', sent);
       expect(eventsGateway.emitMessageSent).toHaveBeenCalledWith(SESSION_ID, sent);
+    });
+
+    // The counterpart of the history flag: a live echo is a send the gateway's own count must keep seeing.
+    it('does not mark an own-send echo as history', async () => {
+      const engine = makeEngine();
+      engines.set(SESSION_ID, engine);
+      const sent = makeIncoming({ fromMe: true });
+
+      projector.handleOwnSendEcho(SESSION_ID, engine, sent);
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(messageRepository.create).toHaveBeenCalledWith(expect.objectContaining({ waMessageId: sent.id }));
+      const [row] = messageRepository.create.mock.calls[0] as [object];
+      expect(row).not.toHaveProperty('historySynced');
     });
   });
 

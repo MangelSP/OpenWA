@@ -37,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Send pacing no longer counts messages the phone sent before the number was linked, which the history backfill stores with their real time, against the daily or cold-reachout allowance; rows already stored before this release keep counting for the rest of their UTC day.
 - Bound the inbound media a PostgreSQL session holds before storing it to `INBOUND_MEDIA_CONCURRENCY` payloads, keeping each chat's arrival order.
 - Drop a Baileys edit, revoke or reaction from another chat, or an edit or revoke from the wrong author, aimed at a message still being downloaded, on SQLite too.
 - Warn at storage export when a file is larger than the per-entry import cap `STORAGE_IMPORT_MAX_BYTES`.

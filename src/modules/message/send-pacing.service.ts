@@ -1,7 +1,7 @@
 import { BadRequestException, HttpException, HttpStatus, Injectable, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
-import { MoreThanOrEqual, Repository } from 'typeorm';
+import { IsNull, MoreThanOrEqual, Repository } from 'typeorm';
 import { Message, MessageDirection } from './entities/message.entity';
 import { Session } from '../session/entities/session.entity';
 import { resolveSendPacingConfig, type SendPacingConfig } from './send-pacing.config';
@@ -265,8 +265,15 @@ export class SendPacingService {
     // that reconnects would look one day old forever and never leave the first rung of the ramp.
     const ageDays = Math.floor((dayStart.getTime() - startOfUtcDay(session.createdAt).getTime()) / DAY_MS);
     const allowance = this.allowanceForAge(config.warmupSchedule, ageDays);
+    // Backfilled history is not a send: a message the linked phone sent earlier today is stored with its
+    // real time, so without this it would spend the allowance of a session that has sent nothing.
     const sentToday = await this.messageRepository.count({
-      where: { sessionId, direction: MessageDirection.OUTGOING, createdAt: MoreThanOrEqual(dayStart) },
+      where: {
+        sessionId,
+        direction: MessageDirection.OUTGOING,
+        createdAt: MoreThanOrEqual(dayStart),
+        historySynced: IsNull(),
+      },
     });
     // The overall cap is the cheaper check and bounds everything, so it settles before the cold probe.
     this.assertUnderDailyCap(sessionId, dayStart, ageDays, allowance, sentToday);
@@ -680,16 +687,20 @@ export class SendPacingService {
         .where('m.sessionId = :sessionId', { sessionId })
         .andWhere('m.direction = :direction', { direction: MessageDirection.OUTGOING })
         .andWhere('m.createdAt >= :dayStart', { dayStart })
+        // Only the gateway's own sends start a reachout. Backfilled history (the phone's messages) does
+        // not, but it still counts as chat history in the probes below, which deliberately read every row.
+        .andWhere('m.historySynced IS NULL')
         // Identifiers are quoted because the columns really are camelCase (`"chatId"`, not `chat_id`)
         // — there is no snake_case naming strategy on this connection. Unquoted, Postgres would fold
         // them to lowercase and the query would fail at runtime on the very first cold send.
         .andWhere(
           `NOT EXISTS (SELECT 1 FROM "messages" p WHERE p."sessionId" = :sessionId AND p."chatId" IN (${DIALECT_PAIR('m')}) AND p."createdAt" < :dayStart)`,
         )
-        // They wrote first: an incoming row strictly earlier than today's first outgoing one makes
-        // the chat an answered conversation, not a cold start. A tie stays cold (conservative).
+        // They wrote first: an incoming row strictly earlier than today's first outgoing one (backfilled
+        // history excluded, as above) makes the chat an answered conversation, not a cold start. A tie
+        // stays cold (conservative).
         .andWhere(
-          `NOT EXISTS (SELECT 1 FROM "messages" i WHERE i."sessionId" = :sessionId AND i."chatId" IN (${DIALECT_PAIR('m')}) AND i."direction" = :incoming AND i."createdAt" < (SELECT MIN(o."createdAt") FROM "messages" o WHERE o."sessionId" = :sessionId AND o."chatId" IN (${DIALECT_PAIR('m')}) AND o."direction" = :direction AND o."createdAt" >= :dayStart))`,
+          `NOT EXISTS (SELECT 1 FROM "messages" i WHERE i."sessionId" = :sessionId AND i."chatId" IN (${DIALECT_PAIR('m')}) AND i."direction" = :incoming AND i."createdAt" < (SELECT MIN(o."createdAt") FROM "messages" o WHERE o."sessionId" = :sessionId AND o."chatId" IN (${DIALECT_PAIR('m')}) AND o."direction" = :direction AND o."createdAt" >= :dayStart AND o."historySynced" IS NULL))`,
           { incoming: MessageDirection.INCOMING },
         )
         .getRawOne<{ count: string | number }>()

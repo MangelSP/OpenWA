@@ -130,6 +130,18 @@ export class Message {
   @Index()
   status!: MessageStatus;
 
+  /**
+   * True for a row the pre-connection history backfill wrote (message-history-projector.ts), NULL for
+   * every other row, including all rows from before this column existed. A backfilled row is stamped
+   * with WhatsApp's own time, so a message the linked phone sent earlier today lands inside today's
+   * window; send pacing reads this to keep it out of the gateway's daily allowance while it still
+   * counts as chat history. A column and not a `metadata` flag because that count runs on every send
+   * and `metadata` is TEXT that can hold a whole inline media payload, which a filter would have to
+   * read row by row.
+   */
+  @Column({ type: 'boolean', nullable: true })
+  historySynced?: boolean;
+
   // Standalone index for the createdAt-only range predicates of the stats aggregates — the
   // composite above leads with sessionId, so it can't serve them (SQLite needs ANALYZE stats for
   // a skip-scan; Postgres has none). The explicit name matches the migration that creates it on

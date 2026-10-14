@@ -268,6 +268,7 @@ erDiagram
         timestamp createdAt
         varchar mediaPath
         varchar mediaMimetype
+        boolean historySynced
     }
 
     API_KEY {
@@ -535,7 +536,8 @@ CREATE TABLE messages (
     status VARCHAR NOT NULL DEFAULT 'sent',          -- pending | sent | delivered | read | failed
     "createdAt" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     "mediaPath" VARCHAR,                  -- nullable; storage key of the archived media copy
-    "mediaMimetype" VARCHAR               -- nullable; mimetype of that archived copy
+    "mediaMimetype" VARCHAR,              -- nullable; mimetype of that archived copy
+    "historySynced" BOOLEAN               -- nullable; true only for a row the pre-connection history backfill wrote
 );
 
 -- Indexes (declared on the entity). Names TypeORM derives are hashes, not readable slugs —
@@ -557,6 +559,9 @@ CREATE UNIQUE INDEX "UQ_messages_sessionId_waMessageId"
 
 > [!NOTE]
 > There is **no** PostgreSQL RANGE partitioning, `create_messages_partition()` function, or `pg_cron` schedule in OpenWA. `messages` is a single plain table on both backends. The `timestamp` column uses a `bigint→number` value transformer so the REST/SDK/MCP contract returns a JS number on both SQLite and PostgreSQL.
+
+> [!NOTE]
+> `historySynced` is true only for rows the pre-connection history backfill wrote, and NULL for every other row, including all rows from before the column existed. Send pacing reads it to keep what the linked phone sent earlier the same UTC day out of the gateway's daily allowance; the rows still count as chat history.
 
 > [!NOTE]
 > Message rows carry no separate `media`/`ack`/`from_me`/`is_group` columns. Media and other engine-specific details are stored in the `metadata` JSON column; delivery state is the `status` enum and `direction` distinguishes inbound vs. outbound.
@@ -916,7 +921,8 @@ src/database/migrations/           # data connection (pluggable)
 ├── 1787000000000-AddWebhookDeliveryFailurePayload.ts   # webhook_delivery_failures.payload (optional replay copy)
 ├── 1787100000000-AddSendIdempotencyKeys.ts   # send_idempotency_keys (opt-in send retry guard)
 ├── 1787200000000-DeduplicateTerminalWebhookFailures.ts   # one terminal record per webhook and idempotency key
-└── 1790812800000-AddMessageWindowIndexes.ts   # compound timestamp indexes for message-time pagination
+├── 1790812800000-AddMessageWindowIndexes.ts   # compound timestamp indexes for message-time pagination
+└── 1791000000000-AddMessageHistorySynced.ts   # messages.historySynced (marks history-backfilled rows; keeps them out of send pacing's daily count)
 ```
 
 > [!NOTE]

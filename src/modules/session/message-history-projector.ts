@@ -89,6 +89,10 @@ export async function persistHistoryMessages(
           timestamp: m.timestamp,
           status: MessageStatus.SENT,
           metadata,
+          // Marks the row as backfilled rather than sent or received live: send pacing must not count
+          // a message the phone sent earlier today (stamped with its real time, below) as this
+          // gateway's send, though it still counts as history with the chat.
+          historySynced: true,
         });
         if (m.type === 'revoked') Object.assign(row, REVOKED_ROW_PATCH);
         // The chat panel orders by createdAt; stamp the real time so history sorts correctly.
